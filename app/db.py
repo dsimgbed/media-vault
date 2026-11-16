@@ -46,12 +46,27 @@ class Database:
                     telegram_topic_id INTEGER,
                     telegram_msg_id INTEGER,
                     telegram_worker_name TEXT,
+                    part_count INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_media_created_at ON media_items(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_media_type ON media_items(media_type);
                 CREATE INDEX IF NOT EXISTS idx_media_drive ON media_items(drive_name);
+
+                CREATE TABLE IF NOT EXISTS media_parts (
+                    media_id TEXT NOT NULL,
+                    part_index INTEGER NOT NULL,
+                    start_byte INTEGER NOT NULL,
+                    end_byte INTEGER NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    telegram_chat_id TEXT NOT NULL,
+                    telegram_topic_id INTEGER,
+                    telegram_msg_id INTEGER NOT NULL,
+                    telegram_worker_name TEXT,
+                    PRIMARY KEY (media_id, part_index)
+                );
+                CREATE INDEX IF NOT EXISTS idx_media_parts_media_id ON media_parts(media_id);
 
                 CREATE TABLE IF NOT EXISTS ingest_jobs (
                     id TEXT PRIMARY KEY,
@@ -93,6 +108,8 @@ class Database:
                 conn.execute("ALTER TABLE media_items ADD COLUMN telegram_msg_id INTEGER")
             if "telegram_worker_name" not in cols:
                 conn.execute("ALTER TABLE media_items ADD COLUMN telegram_worker_name TEXT")
+            if "part_count" not in cols:
+                conn.execute("ALTER TABLE media_items ADD COLUMN part_count INTEGER NOT NULL DEFAULT 1")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_media_folder ON media_items(folder)")
 
             job_cols = {r["name"] for r in conn.execute("PRAGMA table_info(ingest_jobs)").fetchall()}
@@ -174,8 +191,11 @@ class Database:
         telegram_topic_id: int | None = None,
         telegram_msg_id: int | None = None,
         telegram_worker_name: str | None = None,
+        part_count: int = 1,
+        parts: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         now = utc_now_iso()
+        resolved_part_count = len(parts) if (parts and part_count == 1) else max(1, int(part_count))
         with self._connect() as conn:
             conn.execute(
                 """
@@ -183,8 +203,8 @@ class Database:
                     id, title, filename, folder, media_type, mime_type, size_bytes,
                     drive_name, file_path, thumb_filename, source_origin,
                     source_kind, source_url, telegram_chat_id, telegram_topic_id,
-                    telegram_msg_id, telegram_worker_name, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    telegram_msg_id, telegram_worker_name, part_count, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     media_id,
@@ -204,11 +224,35 @@ class Database:
                     telegram_topic_id,
                     telegram_msg_id,
                     telegram_worker_name,
+                    resolved_part_count,
                     now,
                 ),
             )
+            if parts:
+                for p in parts:
+                    conn.execute(
+                        """
+                        INSERT INTO media_parts (
+                            media_id, part_index, start_byte, end_byte, size_bytes,
+                            telegram_chat_id, telegram_topic_id, telegram_msg_id, telegram_worker_name
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            media_id,
+                            int(p["part_index"]),
+                            int(p["start_byte"]),
+                            int(p["end_byte"]),
+                            int(p["size_bytes"]),
+                            str(p["telegram_chat_id"]),
+                            p.get("telegram_topic_id"),
+                            int(p["telegram_msg_id"]),
+                            p.get("telegram_worker_name"),
+                        ),
+                    )
             row = conn.execute("SELECT * FROM media_items WHERE id = ?", (media_id,)).fetchone()
-            return dict(row)
+            item = dict(row)
+            item["parts"] = self._resolve_parts_for_item(conn, item)
+            return item
 
     def update_media_topic(self, media_id: str, topic_id: int) -> None:
         with self._connect() as conn:
@@ -273,18 +317,58 @@ class Database:
             ).fetchall()
             return [r["folder"] for r in rows if r["folder"]]
 
+    def _get_media_parts_conn(self, conn: sqlite3.Connection, media_id: str) -> list[dict[str, Any]]:
+        rows = conn.execute(
+            "SELECT * FROM media_parts WHERE media_id = ? ORDER BY part_index ASC",
+            (media_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def _resolve_parts_for_item(self, conn: sqlite3.Connection, item: dict[str, Any]) -> list[dict[str, Any]]:
+        parts = self._get_media_parts_conn(conn, item["id"])
+        if parts:
+            return parts
+        if item.get("telegram_chat_id") and item.get("telegram_msg_id"):
+            size_bytes = int(item.get("size_bytes") or 0)
+            return [
+                {
+                    "media_id": item["id"],
+                    "part_index": 0,
+                    "start_byte": 0,
+                    "end_byte": max(0, size_bytes - 1),
+                    "size_bytes": size_bytes,
+                    "telegram_chat_id": item["telegram_chat_id"],
+                    "telegram_topic_id": item.get("telegram_topic_id"),
+                    "telegram_msg_id": int(item["telegram_msg_id"]),
+                    "telegram_worker_name": item.get("telegram_worker_name"),
+                }
+            ]
+        return []
+
+    def get_media_parts(self, media_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            return self._get_media_parts_conn(conn, media_id)
+
     def get_media(self, media_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM media_items WHERE id = ?", (media_id,)).fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            item = dict(row)
+            item["parts"] = self._resolve_parts_for_item(conn, item)
+            return item
 
     def delete_media(self, media_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM media_items WHERE id = ?", (media_id,)).fetchone()
             if not row:
                 return None
+            parts = self._get_media_parts_conn(conn, media_id)
+            conn.execute("DELETE FROM media_parts WHERE media_id = ?", (media_id,))
             conn.execute("DELETE FROM media_items WHERE id = ?", (media_id,))
-            return dict(row)
+            item = dict(row)
+            item["parts"] = parts
+            return item
 
     def get_topic_id(self, chat_id: str, folder_name: str) -> int | None:
         with self._connect() as conn:

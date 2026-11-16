@@ -31,7 +31,8 @@ class Settings(BaseSettings):
     port: int = 8080
     public_base_url: str = "http://localhost:8080"
     web_auth_token: str = ""
-    max_upload_mb: int = 2048
+    max_upload_mb: int = 20480
+    telegram_part_size_mb: int = 1900
 
     data_dir: Path = Path("./data")
     staging_dir: Path = Path("./data/staging")
@@ -68,6 +69,10 @@ class Settings(BaseSettings):
     @property
     def max_upload_bytes(self) -> int:
         return self.max_upload_mb * 1024 * 1024
+
+    @property
+    def telegram_part_size_bytes(self) -> int:
+        return self.telegram_part_size_mb * 1024 * 1024
 
     def get_drives(self) -> list[DriveConfig]:
         raw = json.loads(self.drives_json or "[]")

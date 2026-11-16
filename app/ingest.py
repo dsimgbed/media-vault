@@ -502,6 +502,8 @@ class IngestService:
             telegram_topic_id=mirror_info.get("topic_id") if mirror_info else None,
             telegram_msg_id=mirror_info.get("message_id") if mirror_info else None,
             telegram_worker_name=mirror_info.get("worker_name") if mirror_info else None,
+            part_count=int(mirror_info.get("part_count", 1)) if mirror_info else 1,
+            parts=mirror_info.get("parts") if mirror_info else None,
         )
 
     async def process_url_job(

@@ -4,10 +4,12 @@ import asyncio
 import logging
 import shutil
 import tempfile
+import zipfile
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 from pathlib import Path
+from typing import Any
 
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
@@ -81,6 +83,18 @@ def _iter_file_range(path: Path, start: int, end: int, chunk_size: int = 1024 * 
             yield data
 
 
+def _sanitize_archive_relpath(raw_rel: str, fallback_name: str) -> str:
+    parts = [
+        p.strip()
+        for p in raw_rel.replace("\\", "/").split("/")
+        if p.strip() and p.strip() not in (".", "..")
+    ]
+    if not parts:
+        safe_fallback = Path(fallback_name or "file.bin").name
+        return safe_fallback or "file.bin"
+    return "/".join(parts)
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     cfg = settings or Settings()
     cfg.ensure_dirs()
@@ -129,6 +143,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "default_folder": cfg.default_folder,
             "auth_required": bool(cfg.web_auth_token.strip()),
             "max_upload_mb": cfg.max_upload_mb,
+            "telegram_part_size_mb": cfg.telegram_part_size_mb,
             "ytdlp_cookies_configured": cookies_ok,
             "ytdlp_version": ytdlp_ver,
         }
@@ -279,6 +294,92 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             db.update_job(job_id, status="failed", message=str(exc))
             raise HTTPException(status_code=500, detail=str(exc))
 
+    @app.post("/api/ingest/upload-folder", status_code=201, dependencies=[Depends(require_auth)])
+    async def ingest_upload_folder(
+        files: list[UploadFile] = File(...),
+        relative_paths: list[str] = Form(default=[]),
+        archive_name: str | None = Form(default=None),
+        folder: str | None = Form(default=None),
+        forward_to_telegram: bool = Form(default=True),
+    ):
+        if not files:
+            raise HTTPException(status_code=400, detail="No files provided.")
+
+        raw_archive = (archive_name or "").strip()
+        if not raw_archive and relative_paths:
+            first_rel = relative_paths[0].replace("\\", "/").strip("/")
+            if "/" in first_rel:
+                raw_archive = first_rel.split("/", 1)[0]
+        safe_archive = Path(raw_archive or "folder_archive").name.strip(" .") or "folder_archive"
+        if safe_archive.lower().endswith(".zip"):
+            folder_title = safe_archive[:-4].strip(" .") or "folder_archive"
+            zip_filename = f"{folder_title}.zip"
+        else:
+            folder_title = safe_archive
+            zip_filename = f"{safe_archive}.zip"
+
+        job_id = db.create_job("web", "upload", zip_filename)
+        job_dir = Path(tempfile.mkdtemp(dir=cfg.staging_dir))
+        zip_path = job_dir / zip_filename
+        total_written = 0
+        seen_arcnames: set[str] = set()
+
+        try:
+            db.update_job(
+                job_id,
+                status="downloading",
+                progress=5.0,
+                message=f"Packing {len(files)} file(s) into {zip_filename}...",
+            )
+            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+                for idx, upload_file in enumerate(files):
+                    rel_raw = relative_paths[idx] if idx < len(relative_paths) else (upload_file.filename or f"file_{idx}")
+                    arcname = _sanitize_archive_relpath(rel_raw, upload_file.filename or f"file_{idx}")
+                    if arcname in seen_arcnames:
+                        stem = Path(arcname).stem
+                        suffix = Path(arcname).suffix
+                        parent = Path(arcname).parent
+                        dedup_name = f"{stem}_{idx}{suffix}"
+                        arcname = f"{parent.as_posix()}/{dedup_name}" if parent.as_posix() != "." else dedup_name
+                    seen_arcnames.add(arcname)
+
+                    with zf.open(arcname, "w", force_zip64=True) as z_entry:
+                        while True:
+                            chunk = await upload_file.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            total_written += len(chunk)
+                            if total_written > cfg.max_upload_bytes:
+                                raise HTTPException(
+                                    status_code=413,
+                                    detail=f"Folder archive exceeds {cfg.max_upload_mb} MB limit.",
+                                )
+                            await asyncio.to_thread(z_entry.write, chunk)
+
+            if zip_path.stat().st_size > cfg.max_upload_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Folder archive exceeds {cfg.max_upload_mb} MB limit.",
+                )
+
+            item = await ingest.process_staged_upload_job(
+                job_id,
+                zip_path,
+                source_origin="web",
+                folder=folder,
+                title=folder_title,
+                forward_to_telegram=forward_to_telegram,
+            )
+            return {"job_id": job_id, "item": item}
+        except HTTPException as he:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            db.update_job(job_id, status="failed", message=str(he.detail))
+            raise
+        except Exception as exc:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            db.update_job(job_id, status="failed", message=str(exc))
+            raise HTTPException(status_code=500, detail=str(exc))
+
     @app.get("/api/media", dependencies=[Depends(require_auth)])
     async def list_media(
         media_type: str = Query(default="all"),
@@ -326,12 +427,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         raw_path = (item.get("file_path") or "").strip()
         file_path = Path(raw_path) if raw_path else None
         use_local = bool(file_path and file_path.is_file())
+        parts = item.get("parts") or []
+        is_multipart = not use_local and len(parts) > 1
 
         tg_client = None
         tg_media = None
         if use_local:
             assert file_path is not None
             file_size = file_path.stat().st_size
+        elif is_multipart:
+            file_size = int(item["size_bytes"])
         elif item.get("telegram_chat_id") and item.get("telegram_msg_id"):
             try:
                 tg_client, tg_media = await tg_pool.prepare_stream(
@@ -362,14 +467,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     headers={"Content-Range": f"bytes */{file_size}"},
                     detail="Invalid Range header",
                 )
+        else:
+            start, end = 0, max(0, file_size - 1)
+
+        prefetched_parts: dict[int, tuple[Any, Any]] | None = None
+        if is_multipart and file_size > 0:
+            overlapping = [
+                p for p in sorted(parts, key=lambda x: int(x["part_index"]))
+                if int(p["end_byte"]) >= start and int(p["start_byte"]) <= end and int(p["size_bytes"]) > 0
+            ]
+            if not overlapping:
+                raise HTTPException(status_code=404, detail="Requested range has no matching media parts")
+            first_part = overlapping[0]
+            try:
+                first_stream = await tg_pool.prepare_stream(
+                    first_part["telegram_chat_id"],
+                    int(first_part["telegram_msg_id"]),
+                    worker_name=None,
+                )
+                prefetched_parts = {int(first_part["part_index"]): first_stream}
+            except FileNotFoundError as exc:
+                raise HTTPException(status_code=404, detail=str(exc))
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=f"Telegram stream error: {exc}")
+
+        if range_header:
             content_length = end - start + 1
             headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
             headers["Content-Length"] = str(content_length)
-            body = (
-                _iter_file_range(file_path, start, end)
-                if use_local and file_path is not None
-                else tg_pool.iter_telegram_range(tg_client, tg_media, start, end)
-            )
+            if use_local and file_path is not None:
+                body = _iter_file_range(file_path, start, end)
+            elif is_multipart:
+                body = tg_pool.iter_telegram_multipart_range(parts, start, end, prefetched=prefetched_parts)
+            else:
+                body = tg_pool.iter_telegram_range(tg_client, tg_media, start, end)
             return StreamingResponse(
                 body,
                 status_code=206,
@@ -382,6 +513,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             body = iter([b""])
         elif use_local and file_path is not None:
             body = _iter_file_range(file_path, 0, file_size - 1)
+        elif is_multipart:
+            body = tg_pool.iter_telegram_multipart_range(parts, 0, file_size - 1, prefetched=prefetched_parts)
         else:
             body = tg_pool.iter_telegram_range(tg_client, tg_media, 0, file_size - 1)
 
@@ -407,7 +540,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 except OSError as exc:
                     logger.warning("Could not delete %s: %s", file_path, exc)
 
-        if item.get("telegram_chat_id") and item.get("telegram_msg_id"):
+        parts = item.get("parts") or []
+        if parts:
+            for p in parts:
+                if p.get("telegram_chat_id") and p.get("telegram_msg_id"):
+                    await tg_pool.delete_archive_message(
+                        p["telegram_chat_id"],
+                        int(p["telegram_msg_id"]),
+                        worker_name=p.get("telegram_worker_name"),
+                    )
+        elif item.get("telegram_chat_id") and item.get("telegram_msg_id"):
             await tg_pool.delete_archive_message(
                 item["telegram_chat_id"],
                 int(item["telegram_msg_id"]),
