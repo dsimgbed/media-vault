@@ -289,9 +289,13 @@
         <button type="submit">Send</button>
       </form>
 
-      <div id="dropzone" class="dropzone">
-        <strong>Drop photos, videos, or files here</strong> (or click to choose — up to <span id="maxMbLabel">2048</span> MB)
-        <input id="fileInput" type="file" multiple hidden />
+      <div style="display:flex;gap:10px;align-items:stretch;flex-wrap:wrap;">
+        <div id="dropzone" class="dropzone" style="flex:1;min-width:240px;">
+          <strong>Drop files or folders here</strong> (or click to choose — up to <span id="maxMbLabel">20480</span> MB)
+          <input id="fileInput" type="file" multiple hidden />
+          <input id="folderUploadInput" type="file" webkitdirectory directory multiple hidden />
+        </div>
+        <button type="button" id="selectFolderBtn" class="secondary" style="white-space:nowrap;">Select Folder</button>
       </div>
       <div id="uploadProgress" class="upload-progress">
         <div id="uploadProgressText">Uploading...</div>
@@ -379,6 +383,7 @@
       authRequired: false,
       storageMode: "telegram",
       defaultFolder: "General",
+      maxUploadMb: 20480,
       activeMediaId: null,
       jobPollTimer: null,
       hadActiveJobs: false,
@@ -424,8 +429,9 @@
       state.authRequired = data.auth_required;
       state.storageMode = data.storage_mode || "telegram";
       state.defaultFolder = data.default_folder || "General";
+      state.maxUploadMb = data.max_upload_mb || 20480;
       if (!$("folderInput").value) $("folderInput").value = state.defaultFolder;
-      $("maxMbLabel").textContent = data.max_upload_mb;
+      $("maxMbLabel").textContent = state.maxUploadMb;
       if (data.auth_required && !state.token) {
         $("authBox").style.display = "flex";
       }
@@ -474,10 +480,13 @@
       }
 
       if (data.storage_mode === "telegram") {
+        const capLabel = state.maxUploadMb >= 1024
+          ? `${(state.maxUploadMb / 1024).toFixed(0)} GB`
+          : `${state.maxUploadMb} MB`;
         grid.innerHTML = `
           <div class="drive-card">
-            <div class="drive-head"><span>Telegram Topic Archive</span><span class="pill ok">Active (Up to 2 GB / file)</span></div>
-            <div class="drive-meta">Files are forwarded to your shared Forum Supergroup and removed from local disk after thumbnailing.</div>
+            <div class="drive-head"><span>Telegram Topic Archive</span><span class="pill ok">Multi-Part • Up to ${capLabel} / file</span></div>
+            <div class="drive-meta">Files &gt;1.9 GiB are zero-copy sliced across workers and streamed back as a single unified file.</div>
           </div>`;
         driveSelect.value = prevDrive || "all";
         return;
@@ -574,6 +583,10 @@
           : `<div class="thumb-fallback">${it.media_type}</div>`;
         const typeBadge = it.media_type === "video" ? "▶ Video" : it.media_type;
         const folder = it.folder || state.defaultFolder;
+        const partCount = Number(it.part_count || 1);
+        const partsBadge = partCount > 1
+          ? `<span class="pill ok" style="font-size:0.68rem;padding:1px 6px;">${partCount} Parts • Unified Stream</span>`
+          : "";
         return `
           <article class="card" data-id="${it.id}">
             <div class="thumb-wrap">
@@ -585,7 +598,7 @@
               <div class="card-title" title="${it.filename}">${it.title || it.filename}</div>
               <div class="card-sub">
                 <span>${fmtSize(it.size_bytes)}</span>
-                <span>${it.source_origin.toUpperCase()}</span>
+                <span>${partsBadge || it.source_origin.toUpperCase()}</span>
               </div>
             </div>
           </article>
@@ -622,7 +635,11 @@
         ? ` • <a href="${item.source_url}" target="_blank" rel="noopener" style="color:var(--accent);">Source URL</a>`
         : "";
       const topicInfo = item.telegram_topic_id ? ` • Topic #${item.telegram_topic_id}` : "";
-      $("modalMeta").innerHTML = `${item.drive_name}/${item.folder || state.defaultFolder} • ${fmtSize(item.size_bytes)} • ${item.source_origin}/${item.source_kind}${topicInfo}${srcLink}`;
+      const partCount = Number(item.part_count || (item.parts ? item.parts.length : 1) || 1);
+      const partInfo = partCount > 1
+        ? ` • <span class="pill ok">${partCount} Parts • Unified Stream</span>`
+        : "";
+      $("modalMeta").innerHTML = `${item.drive_name}/${item.folder || state.defaultFolder} • ${fmtSize(item.size_bytes)} • ${item.source_origin}/${item.source_kind}${topicInfo}${partInfo}${srcLink}`;
       $("viewerModal").showModal();
     }
 
@@ -670,6 +687,37 @@
       });
     }
 
+    function uploadFolderFiles(fileEntries, archiveName) {
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        const form = new FormData();
+        form.append("archive_name", archiveName || "folder_archive");
+        form.append("folder", selectedFolder());
+        form.append("forward_to_telegram", shouldForwardToTelegram() ? "true" : "false");
+        for (const entry of fileEntries) {
+          form.append("files", entry.file);
+          form.append("relative_paths", entry.relativePath || entry.file.name);
+        }
+        xhr.open("POST", "/api/ingest/upload-folder");
+        if (state.token) xhr.setRequestHeader("Authorization", `Bearer ${state.token}`);
+
+        $("uploadProgress").style.display = "block";
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) {
+            const pct = Math.round((e.loaded / e.total) * 100);
+            $("uploadProgressBar").style.width = `${pct}%`;
+            $("uploadProgressText").textContent = `Uploading folder ${archiveName} (${fileEntries.length} files) → ${selectedFolder()}: ${pct}% (${fmtSize(e.loaded)} / ${fmtSize(e.total)})`;
+          }
+        };
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) resolve(JSON.parse(xhr.responseText));
+          else reject(new Error(xhr.responseText || `Folder upload failed (${xhr.status})`));
+        };
+        xhr.onerror = () => reject(new Error("Network error during folder upload"));
+        xhr.send(form);
+      });
+    }
+
     async function handleFiles(files) {
       for (const f of files) {
         try {
@@ -677,6 +725,25 @@
         } catch (err) {
           alert(`Failed uploading ${f.name}: ${err.message}`);
         }
+      }
+      $("uploadProgress").style.display = "none";
+      $("uploadProgressBar").style.width = "0%";
+      await refreshAll();
+    }
+
+    async function handleFolderSelection(fileList) {
+      const arr = Array.from(fileList || []);
+      if (!arr.length) return;
+      const firstRel = (arr[0].webkitRelativePath || arr[0].name || "folder_archive").replace(/\\/g, "/");
+      const archiveName = firstRel.includes("/") ? firstRel.split("/")[0] : "folder_archive";
+      const entries = arr.map(f => ({
+        file: f,
+        relativePath: f.webkitRelativePath || f.name,
+      }));
+      try {
+        await uploadFolderFiles(entries, archiveName);
+      } catch (err) {
+        alert(`Failed uploading folder ${archiveName}: ${err.message}`);
       }
       $("uploadProgress").style.display = "none";
       $("uploadProgressBar").style.width = "0%";
@@ -805,14 +872,68 @@
       }
     });
 
+    async function collectEntryFiles(entry, prefix = "") {
+      if (entry.isFile) {
+        const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
+        return [{ file, relativePath: prefix ? `${prefix}/${entry.name}` : entry.name }];
+      }
+      if (entry.isDirectory) {
+        const reader = entry.createReader();
+        const allEntries = [];
+        while (true) {
+          const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+          if (!batch.length) break;
+          allEntries.push(...batch);
+        }
+        const subPrefix = prefix ? `${prefix}/${entry.name}` : entry.name;
+        const collected = [];
+        for (const child of allEntries) {
+          collected.push(...await collectEntryFiles(child, subPrefix));
+        }
+        return collected;
+      }
+      return [];
+    }
+
     const dz = $("dropzone");
     dz.addEventListener("click", () => $("fileInput").click());
+    $("selectFolderBtn").addEventListener("click", () => $("folderUploadInput").click());
     $("fileInput").addEventListener("change", (e) => handleFiles(e.target.files));
+    $("folderUploadInput").addEventListener("change", (e) => handleFolderSelection(e.target.files));
     dz.addEventListener("dragover", (e) => { e.preventDefault(); dz.classList.add("dragover"); });
     dz.addEventListener("dragleave", () => dz.classList.remove("dragover"));
-    dz.addEventListener("drop", (e) => {
+    dz.addEventListener("drop", async (e) => {
       e.preventDefault();
       dz.classList.remove("dragover");
+      const items = e.dataTransfer?.items;
+      if (items && items.length && typeof items[0].webkitGetAsEntry === "function") {
+        const entries = Array.from(items).map(it => it.webkitGetAsEntry()).filter(Boolean);
+        const dirs = entries.filter(ent => ent.isDirectory);
+        const looseFiles = entries.filter(ent => ent.isFile);
+        if (dirs.length) {
+          for (const dir of dirs) {
+            try {
+              const dirFiles = await collectEntryFiles(dir, "");
+              if (dirFiles.length) {
+                await uploadFolderFiles(dirFiles, dir.name);
+              }
+            } catch (err) {
+              alert(`Failed uploading folder ${dir.name}: ${err.message}`);
+            }
+          }
+          if (looseFiles.length) {
+            const resolvedFiles = await Promise.all(
+              looseFiles.map(ent => new Promise((resolve, reject) => ent.file(resolve, reject)))
+            );
+            await handleFiles(resolvedFiles);
+          } else {
+            $("uploadProgress").style.display = "none";
+            $("uploadProgressBar").style.width = "0%";
+            await refreshAll();
+          }
+          return;
+        }
+      }
       handleFiles(e.dataTransfer.files);
     });
 
