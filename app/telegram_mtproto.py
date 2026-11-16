@@ -17,7 +17,7 @@ from telethon.errors import FloodWaitError, RPCError
 
 from app.allocator import DriveAllocator, fmt_size, sanitize_folder
 from app.config import Settings, TelegramApiConfig
-from app.db import Database
+from app.db import Database, normalize_tags
 from app.ingest import IngestService
 
 logger = logging.getLogger(__name__)
@@ -25,6 +25,7 @@ URL_REGEX = re.compile(r"https?://\S+")
 FOLDER_HASH_RE = re.compile(r"(?:^|\s)#([A-Za-z0-9_/-]{1,64})")
 FOLDER_KV_RE = re.compile(r"(?:^|\s)(?:folder|dir):([A-Za-z0-9_./-]{1,64})", re.IGNORECASE)
 FORMAT_KV_RE = re.compile(r"(?:^|\s)(?:format|fmt|q):([A-Za-z0-9_+/\[\]<=.,:-]{1,48})", re.IGNORECASE)
+TAG_KV_RE = re.compile(r"(?:^|\s)(?:tag|tags):([A-Za-z0-9_#,-]{1,128})", re.IGNORECASE)
 
 
 class FileSliceReader(io.RawIOBase):
@@ -131,6 +132,18 @@ def parse_format_from_text(text: str) -> str | None:
         return None
     m = FORMAT_KV_RE.search(text)
     return m.group(1).strip() if m else None
+
+
+def parse_tags_from_text(text: str) -> list[str]:
+    if not text:
+        return []
+    found: list[str] = []
+    for m in TAG_KV_RE.finditer(text):
+        found.extend(normalize_tags(m.group(1)))
+    if FOLDER_KV_RE.search(text):
+        for hm in FOLDER_HASH_RE.finditer(text):
+            found.extend(normalize_tags(hm.group(1)))
+    return normalize_tags(found)
 
 
 def parse_folder_from_text(text: str, fallback: str) -> str:
@@ -290,12 +303,17 @@ class TelegramPool:
         part_size = max(1, int(self.settings.telegram_part_size_bytes))
         progress_cb = payload.get("progress_cb")
 
+        tags = normalize_tags(payload.get("tags"))
+        tags_line = f"Tags: {' '.join(f'#{t}' for t in tags)}" if tags else None
+
         if size_bytes <= part_size:
             caption_lines = [
                 f"**{payload['filename']}**",
                 f"Folder: `{folder}` • Size: {fmt_size(size_bytes)}",
-                f"Gallery: {self._gallery_link(payload['media_id'])}",
             ]
+            if tags_line:
+                caption_lines.append(tags_line)
+            caption_lines.append(f"Gallery: {self._gallery_link(payload['media_id'])}")
             if payload.get("source_url"):
                 caption_lines.append(f"Source: {payload['source_url']}")
             caption = "\n".join(caption_lines)
@@ -418,8 +436,10 @@ class TelegramPool:
             caption_lines = [
                 f"**{payload['filename']}** (Part {part_index + 1}/{total_parts})",
                 f"Folder: `{folder}` • Part Size: {fmt_size(chunk_len)} • Total: {fmt_size(size_bytes)}",
-                f"Gallery: {self._gallery_link(payload['media_id'])}",
             ]
+            if tags_line:
+                caption_lines.append(tags_line)
+            caption_lines.append(f"Gallery: {self._gallery_link(payload['media_id'])}")
             if payload.get("source_url"):
                 caption_lines.append(f"Source: {payload['source_url']}")
             part_caption = "\n".join(caption_lines)
@@ -822,24 +842,26 @@ class TelegramPool:
                     return
                 folder = await self._resolve_group_folder(client, event, text, user_default)
                 fmt_spec = parse_format_from_text(text)
+                tags = parse_tags_from_text(text)
                 for url in urls:
-                    await self._handle_telegram_url(cfg, event, url, folder, format_spec=fmt_spec)
+                    await self._handle_telegram_url(cfg, event, url, folder, format_spec=fmt_spec, tags=tags)
                 return
 
             folder = parse_folder_from_text(text, user_default)
+            tags = parse_tags_from_text(text)
 
             # 1. Direct Telegram media/file upload (up to 2 GB via MTProto)
             if event.message.media and (
                 event.message.photo or event.message.video or event.message.document
             ):
-                await self._handle_telegram_media(cfg, event, folder)
+                await self._handle_telegram_media(cfg, event, folder, tags=tags)
                 return
 
             # 2. URLs in DM text
             if urls:
                 fmt_spec = parse_format_from_text(text)
                 for url in urls:
-                    await self._handle_telegram_url(cfg, event, url, folder, format_spec=fmt_spec)
+                    await self._handle_telegram_url(cfg, event, url, folder, format_spec=fmt_spec, tags=tags)
 
     async def _handle_telegram_url(
         self,
@@ -849,6 +871,7 @@ class TelegramPool:
         folder: str,
         *,
         format_spec: str | None = None,
+        tags: list[str] | None = None,
     ) -> None:
         status_msg = await event.reply(f"[{cfg.name}] Queued → `{folder}`: {url}")
         job_id = self.db.create_job("telegram", "url", url)
@@ -871,6 +894,7 @@ class TelegramPool:
                 url,
                 source_origin="telegram",
                 folder=folder,
+                tags=tags,
                 forward_to_telegram=True,
                 format_spec=format_spec,
                 on_progress=progress_edit,
@@ -889,7 +913,9 @@ class TelegramPool:
         except Exception as exc:
             await status_msg.edit(f"[{cfg.name}] Failed:\n`{exc}`")
 
-    async def _handle_telegram_media(self, cfg: TelegramApiConfig, event, folder: str) -> None:
+    async def _handle_telegram_media(
+        self, cfg: TelegramApiConfig, event, folder: str, *, tags: list[str] | None = None
+    ) -> None:
         filename = _extract_filename(event.message)
         total_size = event.message.file.size if event.message.file else 0
         if total_size > 2 * 1024 * 1024 * 1024:
@@ -931,6 +957,7 @@ class TelegramPool:
                 Path(downloaded),
                 source_origin="telegram",
                 folder=folder,
+                tags=tags,
                 title=Path(filename).stem,
                 forward_to_telegram=True,
                 tg_source={"worker_name": cfg.name, "message": event.message},

@@ -18,7 +18,7 @@ import httpx
 
 from app.allocator import DriveAllocator, fmt_size, sanitize_folder
 from app.config import Settings
-from app.db import Database
+from app.db import Database, normalize_tags
 from app.thumbnails import generate_thumbnail
 
 logger = logging.getLogger(__name__)
@@ -425,6 +425,7 @@ class IngestService:
         local_path: Path,
         *,
         folder: str | None = None,
+        tags: str | list[str] | None = None,
         source_origin: str,
         source_kind: str,
         source_url: str | None = None,
@@ -435,6 +436,7 @@ class IngestService:
     ) -> dict[str, Any]:
         media_id = uuid.uuid4().hex[:12]
         safe_folder = sanitize_folder(folder, self.settings.default_folder)
+        normalized_tags = normalize_tags(tags)
         media_type, mime_type = classify_media(local_path)
         size_bytes = local_path.stat().st_size
         resolved_title = title or local_path.stem
@@ -453,6 +455,7 @@ class IngestService:
                 "title": resolved_title,
                 "filename": local_path.name,
                 "folder": safe_folder,
+                "tags": normalized_tags,
                 "media_type": media_type,
                 "size_bytes": size_bytes,
                 "local_path": local_path,
@@ -489,6 +492,7 @@ class IngestService:
             title=resolved_title,
             filename=final_name,
             folder=safe_folder,
+            tags=normalized_tags,
             media_type=media_type,
             mime_type=mime_type,
             size_bytes=size_bytes,
@@ -513,12 +517,15 @@ class IngestService:
         *,
         source_origin: str,
         folder: str | None = None,
+        tags: str | list[str] | None = None,
+        title: str | None = None,
         forward_to_telegram: bool = True,
         format_spec: str | None = None,
         on_progress: ProgressHook | None = None,
     ) -> list[dict[str, Any]]:
         job_dir = Path(tempfile.mkdtemp(dir=self.settings.staging_dir))
         safe_folder = sanitize_folder(folder, self.settings.default_folder)
+        normalized_tags = normalize_tags(tags)
         uses_tg = self.settings.storage_mode == "telegram" or (
             self.settings.storage_mode == "both" and forward_to_telegram
         )
@@ -570,10 +577,11 @@ class IngestService:
                 item = await self.finalize_staged_file(
                     f,
                     folder=safe_folder,
+                    tags=normalized_tags,
                     source_origin=source_origin,
                     source_kind=kind,
                     source_url=url,
-                    title=f.stem,
+                    title=title or f.stem,
                     forward_to_telegram=forward_to_telegram,
                     progress_cb=report_ul,
                 )
@@ -600,6 +608,7 @@ class IngestService:
         *,
         source_origin: str,
         folder: str | None = None,
+        tags: str | list[str] | None = None,
         title: str | None = None,
         forward_to_telegram: bool = True,
         tg_source: dict[str, Any] | None = None,
@@ -620,6 +629,7 @@ class IngestService:
             item = await self.finalize_staged_file(
                 staged_file,
                 folder=safe_folder,
+                tags=tags,
                 source_origin=source_origin,
                 source_kind="upload",
                 source_url=None,

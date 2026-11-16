@@ -940,6 +940,80 @@ def test_db_migration_and_ui_multipart_markers(tmp_path: Path):
         assert health["telegram_part_size_mb"] == settings.telegram_part_size_mb
 
 
+def test_hashtags_ingest_filter_patch_and_telegram_caption(tmp_path: Path, monkeypatch):
+    from app.db import normalize_tags
+    from app.telegram_mtproto import parse_tags_from_text
+
+    assert normalize_tags("#soap, #HD soap  wrestling!") == ["soap", "hd", "wrestling"]
+    assert parse_tags_from_text("https://x.com/v folder:lesbian #soap #hd") == ["soap", "hd"]
+    assert parse_tags_from_text("https://x.com/v tag:soap,hd") == ["soap", "hd"]
+    assert parse_tags_from_text("https://x.com/v #lesbian") == []
+
+    settings = _make_settings(tmp_path)
+    settings.storage_mode = "both"
+    app = create_app(settings)
+    captured_payloads = []
+
+    async def fake_mirror(payload):
+        captured_payloads.append(payload)
+        return {
+            "chat_id": "-100999",
+            "topic_id": 11,
+            "message_id": 1001,
+            "worker_name": "bot1",
+            "part_count": 1,
+            "parts": [
+                {
+                    "part_index": 0,
+                    "start_byte": 0,
+                    "end_byte": payload["size_bytes"] - 1,
+                    "size_bytes": payload["size_bytes"],
+                    "telegram_chat_id": "-100999",
+                    "telegram_topic_id": 11,
+                    "telegram_msg_id": 1001,
+                    "telegram_worker_name": "bot1",
+                }
+            ],
+        }
+
+    app.state.ingest.mirror_hook = fake_mirror
+
+    with TestClient(app) as client:
+        res1 = client.post(
+            "/api/ingest/upload",
+            files={"file": ("clip1.bin", b"a" * 128, "application/octet-stream")},
+            data={"folder": "lesbian", "tags": "#soap, HD"},
+        )
+        assert res1.status_code == 201
+        item1 = res1.json()["item"]
+        assert item1["folder"] == "lesbian"
+        assert item1["tags"] == ["soap", "hd"]
+        assert captured_payloads[0]["tags"] == ["soap", "hd"]
+
+        res2 = client.post(
+            "/api/ingest/upload",
+            files={"file": ("clip2.bin", b"b" * 128, "application/octet-stream")},
+            data={"folder": "lesbian", "tags": "#soapy"},
+        )
+        assert res2.status_code == 201
+
+        tags_res = client.get("/api/tags").json()
+        assert tags_res["tags"] == ["hd", "soap", "soapy"]
+
+        filtered = client.get("/api/media?tag=soap").json()
+        assert filtered["total"] == 1
+        assert filtered["items"][0]["id"] == item1["id"]
+
+        patched = client.patch(f"/api/media/{item1['id']}/tags", json={"tags": "#soap #archive"}).json()
+        assert patched["tags"] == ["soap", "archive"]
+
+        html = client.get("/").text
+        assert "tagsInput" in html
+        assert "tagFilter" in html
+        assert "modalEditTagsBtn" in html
+
+
+
 
 
 

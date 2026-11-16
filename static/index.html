@@ -211,6 +211,17 @@
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
     .card-sub { font-size: 0.78rem; color: var(--muted); display: flex; justify-content: space-between; }
+    .tag-row { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+    .tag-chip {
+      font-size: 0.7rem;
+      padding: 1px 6px;
+      border-radius: 999px;
+      background: rgba(59, 130, 246, 0.14);
+      color: #93c5fd;
+      border: 1px solid rgba(59, 130, 246, 0.3);
+      cursor: pointer;
+    }
+    .tag-chip:hover { background: rgba(59, 130, 246, 0.28); }
 
     dialog {
       width: min(960px, 95vw);
@@ -267,8 +278,11 @@
       <div class="toolbar-group" style="justify-content:space-between;">
         <div class="toolbar-group">
           <label for="folderInput" style="font-size:0.85rem;color:var(--muted);">Folder / Topic:</label>
-          <input id="folderInput" type="text" list="folderList" placeholder="General" style="width:180px;padding:7px 10px;font-size:0.88rem;" />
+          <input id="folderInput" type="text" list="folderList" placeholder="General" style="width:165px;padding:7px 10px;font-size:0.88rem;" />
           <datalist id="folderList"></datalist>
+          <label for="tagsInput" style="font-size:0.85rem;color:var(--muted);margin-left:6px;">Tags:</label>
+          <input id="tagsInput" type="text" list="tagList" placeholder="#soap, #hd..." style="width:180px;padding:7px 10px;font-size:0.88rem;" />
+          <datalist id="tagList"></datalist>
         </div>
         <label id="tgForwardLabel" style="display:none;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted);cursor:pointer;">
           <input id="tgForwardCheck" type="checkbox" checked />
@@ -307,7 +321,7 @@
 
     <section class="toolbar">
       <div class="toolbar-group">
-        <input id="searchInput" type="text" placeholder="Search title, filename, folder, or URL..." />
+        <input id="searchInput" type="text" placeholder="Search title, filename, folder, tags, or URL..." />
         <select id="typeFilter">
           <option value="all">All types</option>
           <option value="video">Videos</option>
@@ -317,6 +331,9 @@
         </select>
         <select id="folderFilter">
           <option value="all">All folders</option>
+        </select>
+        <select id="tagFilter">
+          <option value="all">All tags</option>
         </select>
         <select id="driveFilter">
           <option value="all">All drives</option>
@@ -341,6 +358,7 @@
     <div class="modal-foot">
       <div id="modalMeta"></div>
       <div class="toolbar-group">
+        <button id="modalEditTagsBtn" type="button" class="secondary">Edit Tags</button>
         <a id="modalDownload" href="#" download><button type="button" class="secondary">Download</button></a>
         <button id="modalDeleteBtn" type="button" class="danger">Delete</button>
       </div>
@@ -469,6 +487,17 @@
       filter.value = prev || "all";
     }
 
+    async function loadTags() {
+      const data = await apiFetch("/api/tags");
+      const list = $("tagList");
+      const filter = $("tagFilter");
+      const prev = filter.value;
+      list.innerHTML = data.tags.map(t => `<option value="#${t}"></option>`).join("");
+      filter.innerHTML = `<option value="all">All tags</option>` +
+        data.tags.map(t => `<option value="${t}">#${t}</option>`).join("");
+      filter.value = prev && (prev === "all" || data.tags.includes(prev)) ? prev : "all";
+    }
+
     async function loadDrives() {
       const data = await apiFetch("/api/drives");
       const grid = $("drivesGrid");
@@ -554,7 +583,7 @@
       state.lastDoneCount = doneCount;
 
       if (newlyFinished || active.length > 0) {
-        await Promise.all([loadMedia(), loadDrives(), loadFolders()]);
+        await Promise.all([loadMedia(), loadDrives(), loadFolders(), loadTags()]);
       }
       scheduleJobPoll(active.length > 0);
     }
@@ -564,6 +593,7 @@
         media_type: $("typeFilter").value,
         drive_name: $("driveFilter").value,
         folder: $("folderFilter").value,
+        tag: $("tagFilter").value,
         q: $("searchInput").value.trim(),
         sort: $("sortSelect").value,
       });
@@ -587,6 +617,9 @@
         const partsBadge = partCount > 1
           ? `<span class="pill ok" style="font-size:0.68rem;padding:1px 6px;">${partCount} Parts • Unified Stream</span>`
           : "";
+        const tagsHtml = (it.tags && it.tags.length)
+          ? `<div class="tag-row">${it.tags.map(t => `<span class="tag-chip" data-tag="${t}">#${t}</span>`).join("")}</div>`
+          : "";
         return `
           <article class="card" data-id="${it.id}">
             <div class="thumb-wrap">
@@ -600,10 +633,19 @@
                 <span>${fmtSize(it.size_bytes)}</span>
                 <span>${partsBadge || it.source_origin.toUpperCase()}</span>
               </div>
+              ${tagsHtml}
             </div>
           </article>
         `;
       }).join("");
+
+      grid.querySelectorAll(".tag-chip").forEach(chip => {
+        chip.addEventListener("click", (e) => {
+          e.stopPropagation();
+          $("tagFilter").value = chip.dataset.tag;
+          loadMedia();
+        });
+      });
 
       grid.querySelectorAll(".card").forEach(el => {
         el.addEventListener("click", () => openViewer(el.dataset.id));
@@ -613,6 +655,7 @@
     async function openViewer(mediaId) {
       const item = await apiFetch(`/api/media/${mediaId}`);
       state.activeMediaId = item.id;
+      state.activeMediaTags = item.tags || [];
       location.hash = `media=${item.id}`;
       $("modalTitle").textContent = item.title || item.filename;
 
@@ -639,7 +682,10 @@
       const partInfo = partCount > 1
         ? ` • <span class="pill ok">${partCount} Parts • Unified Stream</span>`
         : "";
-      $("modalMeta").innerHTML = `${item.drive_name}/${item.folder || state.defaultFolder} • ${fmtSize(item.size_bytes)} • ${item.source_origin}/${item.source_kind}${topicInfo}${partInfo}${srcLink}`;
+      const tagsLine = (item.tags && item.tags.length)
+        ? ` • ${item.tags.map(t => `<span class="tag-chip">#${t}</span>`).join(" ")}`
+        : "";
+      $("modalMeta").innerHTML = `${item.drive_name}/${item.folder || state.defaultFolder} • ${fmtSize(item.size_bytes)} • ${item.source_origin}/${item.source_kind}${topicInfo}${partInfo}${tagsLine}${srcLink}`;
       $("viewerModal").showModal();
     }
 
@@ -656,6 +702,10 @@
       return $("folderInput").value.trim() || state.defaultFolder;
     }
 
+    function selectedTags() {
+      return $("tagsInput").value.trim();
+    }
+
     function shouldForwardToTelegram() {
       return $("tgForwardCheck").checked;
     }
@@ -666,6 +716,7 @@
         const form = new FormData();
         form.append("file", file);
         form.append("folder", selectedFolder());
+        if (selectedTags()) form.append("tags", selectedTags());
         form.append("forward_to_telegram", shouldForwardToTelegram() ? "true" : "false");
         xhr.open("POST", "/api/ingest/upload");
         if (state.token) xhr.setRequestHeader("Authorization", `Bearer ${state.token}`);
@@ -693,6 +744,7 @@
         const form = new FormData();
         form.append("archive_name", archiveName || "folder_archive");
         form.append("folder", selectedFolder());
+        if (selectedTags()) form.append("tags", selectedTags());
         form.append("forward_to_telegram", shouldForwardToTelegram() ? "true" : "false");
         for (const entry of fileEntries) {
           form.append("files", entry.file);
@@ -752,7 +804,7 @@
 
     async function refreshAll() {
       try {
-        await Promise.all([loadDrives(), loadFolders(), loadJobs(), loadMedia()]);
+        await Promise.all([loadDrives(), loadFolders(), loadTags(), loadJobs(), loadMedia()]);
       } catch (err) {
         console.warn(err.message);
       }
@@ -774,6 +826,7 @@
         body: JSON.stringify({
           url,
           folder: selectedFolder(),
+          tags: selectedTags(),
           forward_to_telegram: shouldForwardToTelegram(),
           format_spec: formatSpec || $("formatSelect").value || "best",
         }),
@@ -937,7 +990,7 @@
       handleFiles(e.dataTransfer.files);
     });
 
-    ["typeFilter", "folderFilter", "driveFilter", "sortSelect"].forEach(id => $(id).addEventListener("change", loadMedia));
+    ["typeFilter", "folderFilter", "tagFilter", "driveFilter", "sortSelect"].forEach(id => $(id).addEventListener("change", loadMedia));
     $("searchInput").addEventListener("input", () => {
       clearTimeout(window._searchT);
       window._searchT = setTimeout(loadMedia, 250);
@@ -946,6 +999,19 @@
     $("closeModalBtn").addEventListener("click", closeViewer);
     $("viewerModal").addEventListener("click", (e) => {
       if (e.target === $("viewerModal")) closeViewer();
+    });
+    $("modalEditTagsBtn").addEventListener("click", async () => {
+      if (!state.activeMediaId) return;
+      const current = (state.activeMediaTags || []).map(t => `#${t}`).join(" ");
+      const updated = prompt("Edit tags (space or comma separated):", current);
+      if (updated === null) return;
+      await apiFetch(`/api/media/${state.activeMediaId}/tags`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tags: updated }),
+      });
+      await openViewer(state.activeMediaId);
+      await Promise.all([loadTags(), loadMedia()]);
     });
     $("modalDeleteBtn").addEventListener("click", async () => {
       if (!state.activeMediaId || !confirm("Delete this file from the cloud drive?")) return;

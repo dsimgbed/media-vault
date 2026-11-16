@@ -1,10 +1,26 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+_TAG_TOKEN_RE = re.compile(r"[^a-z0-9_-]+")
+
+
+def normalize_tags(raw: str | list[str] | tuple[str, ...] | None) -> list[str]:
+    if not raw:
+        return []
+    tokens: list[str] = []
+    items = [raw] if isinstance(raw, str) else list(raw)
+    for item in items:
+        for part in re.split(r"[\s,]+", str(item)):
+            cleaned = _TAG_TOKEN_RE.sub("", part.strip().lstrip("#").lower())
+            if cleaned and cleaned not in tokens:
+                tokens.append(cleaned[:48])
+    return tokens
 
 
 def utc_now_iso() -> str:
@@ -33,6 +49,7 @@ class Database:
                     title TEXT NOT NULL,
                     filename TEXT NOT NULL,
                     folder TEXT NOT NULL DEFAULT 'General',
+                    tags TEXT NOT NULL DEFAULT '',
                     media_type TEXT NOT NULL, -- 'video' | 'image' | 'audio' | 'file'
                     mime_type TEXT NOT NULL,
                     size_bytes INTEGER NOT NULL,
@@ -100,6 +117,8 @@ class Database:
             cols = {r["name"] for r in conn.execute("PRAGMA table_info(media_items)").fetchall()}
             if "folder" not in cols:
                 conn.execute("ALTER TABLE media_items ADD COLUMN folder TEXT NOT NULL DEFAULT 'General'")
+            if "tags" not in cols:
+                conn.execute("ALTER TABLE media_items ADD COLUMN tags TEXT NOT NULL DEFAULT ''")
             if "telegram_chat_id" not in cols:
                 conn.execute("ALTER TABLE media_items ADD COLUMN telegram_chat_id TEXT")
             if "telegram_topic_id" not in cols:
@@ -171,6 +190,13 @@ class Database:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    @staticmethod
+    def _hydrate_media(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        item = dict(row)
+        raw_tags = item.get("tags") or ""
+        item["tags"] = normalize_tags(raw_tags) if isinstance(raw_tags, str) else normalize_tags(raw_tags)
+        return item
+
     def insert_media(
         self,
         *,
@@ -187,6 +213,7 @@ class Database:
         source_origin: str,
         source_kind: str,
         source_url: str | None,
+        tags: str | list[str] | None = None,
         telegram_chat_id: str | None = None,
         telegram_topic_id: int | None = None,
         telegram_msg_id: int | None = None,
@@ -196,21 +223,23 @@ class Database:
     ) -> dict[str, Any]:
         now = utc_now_iso()
         resolved_part_count = len(parts) if (parts and part_count == 1) else max(1, int(part_count))
+        normalized_tags = ",".join(normalize_tags(tags))
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO media_items (
-                    id, title, filename, folder, media_type, mime_type, size_bytes,
+                    id, title, filename, folder, tags, media_type, mime_type, size_bytes,
                     drive_name, file_path, thumb_filename, source_origin,
                     source_kind, source_url, telegram_chat_id, telegram_topic_id,
                     telegram_msg_id, telegram_worker_name, part_count, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     media_id,
                     title,
                     filename,
                     folder,
+                    normalized_tags,
                     media_type,
                     mime_type,
                     size_bytes,
@@ -250,7 +279,7 @@ class Database:
                         ),
                     )
             row = conn.execute("SELECT * FROM media_items WHERE id = ?", (media_id,)).fetchone()
-            item = dict(row)
+            item = self._hydrate_media(row)
             item["parts"] = self._resolve_parts_for_item(conn, item)
             return item
 
@@ -261,12 +290,27 @@ class Database:
                 (topic_id, media_id),
             )
 
+    def update_media_tags(self, media_id: str, tags: str | list[str] | None) -> dict[str, Any] | None:
+        normalized = ",".join(normalize_tags(tags))
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE media_items SET tags = ? WHERE id = ?",
+                (normalized, media_id),
+            )
+            row = conn.execute("SELECT * FROM media_items WHERE id = ?", (media_id,)).fetchone()
+            if not row:
+                return None
+            item = self._hydrate_media(row)
+            item["parts"] = self._resolve_parts_for_item(conn, item)
+            return item
+
     def list_media(
         self,
         *,
         media_type: str | None = None,
         drive_name: str | None = None,
         folder: str | None = None,
+        tag: str | None = None,
         q: str | None = None,
         sort: str = "newest",
         limit: int = 60,
@@ -284,12 +328,17 @@ class Database:
         if folder and folder != "all":
             where.append("folder = ?")
             params.append(folder)
+        if tag and tag != "all":
+            clean_tags = normalize_tags(tag)
+            for t in clean_tags:
+                where.append("(',' || COALESCE(tags, '') || ',') LIKE ?")
+                params.append(f"%,{t},%")
         if q:
             where.append(
-                "(title LIKE ? OR filename LIKE ? OR folder LIKE ? OR COALESCE(source_url, '') LIKE ?)"
+                "(title LIKE ? OR filename LIKE ? OR folder LIKE ? OR COALESCE(tags, '') LIKE ? OR COALESCE(source_url, '') LIKE ?)"
             )
             pattern = f"%{q}%"
-            params.extend([pattern, pattern, pattern, pattern])
+            params.extend([pattern, pattern, pattern, pattern, pattern])
 
         where_sql = f"WHERE {' AND '.join(where)}" if where else ""
         order_sql = "ORDER BY size_bytes DESC" if sort == "largest" else "ORDER BY created_at DESC"
@@ -303,7 +352,7 @@ class Database:
                 f"SELECT * FROM media_items {where_sql} {order_sql} LIMIT ? OFFSET ?",
                 [*params, limit, offset],
             ).fetchall()
-            return [dict(r) for r in rows], total
+            return [self._hydrate_media(r) for r in rows], total
 
     def list_folders(self) -> list[str]:
         with self._connect() as conn:
@@ -316,6 +365,16 @@ class Database:
                 """
             ).fetchall()
             return [r["folder"] for r in rows if r["folder"]]
+
+    def list_tags(self) -> list[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT tags FROM media_items WHERE COALESCE(tags, '') != ''"
+            ).fetchall()
+            unique: set[str] = set()
+            for r in rows:
+                unique.update(normalize_tags(r["tags"]))
+            return sorted(unique)
 
     def _get_media_parts_conn(self, conn: sqlite3.Connection, media_id: str) -> list[dict[str, Any]]:
         rows = conn.execute(
@@ -354,7 +413,7 @@ class Database:
             row = conn.execute("SELECT * FROM media_items WHERE id = ?", (media_id,)).fetchone()
             if not row:
                 return None
-            item = dict(row)
+            item = self._hydrate_media(row)
             item["parts"] = self._resolve_parts_for_item(conn, item)
             return item
 
@@ -366,7 +425,7 @@ class Database:
             parts = self._get_media_parts_conn(conn, media_id)
             conn.execute("DELETE FROM media_parts WHERE media_id = ?", (media_id,))
             conn.execute("DELETE FROM media_items WHERE id = ?", (media_id,))
-            item = dict(row)
+            item = self._hydrate_media(row)
             item["parts"] = parts
             return item
 

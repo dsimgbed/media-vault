@@ -34,8 +34,14 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 class UrlIngestRequest(BaseModel):
     url: str
     folder: str | None = None
+    tags: list[str] | str | None = None
+    title: str | None = None
     forward_to_telegram: bool = True
     format_spec: str | None = None
+
+
+class UpdateMediaTagsRequest(BaseModel):
+    tags: list[str] | str = ""
 
 
 class FormatsRequest(BaseModel):
@@ -164,6 +170,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             folders.insert(0, cfg.default_folder)
         return {"folders": folders, "default_folder": cfg.default_folder}
 
+    @app.get("/api/tags", dependencies=[Depends(require_auth)])
+    async def list_tags():
+        return {"tags": db.list_tags()}
+
     @app.get("/api/jobs", dependencies=[Depends(require_auth)])
     async def list_jobs(limit: int = Query(default=25, ge=1, le=100)):
         return {"jobs": db.list_jobs(limit=limit)}
@@ -239,6 +249,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     url,
                     source_origin="web",
                     folder=payload.folder,
+                    tags=payload.tags,
+                    title=payload.title,
                     forward_to_telegram=payload.forward_to_telegram,
                     format_spec=payload.format_spec,
                 )
@@ -253,6 +265,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         file: UploadFile = File(...),
         title: str | None = Form(default=None),
         folder: str | None = Form(default=None),
+        tags: str | None = Form(default=None),
         forward_to_telegram: bool = Form(default=True),
     ):
         raw_name = Path(file.filename or "upload.bin").name
@@ -281,6 +294,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 staged_path,
                 source_origin="web",
                 folder=folder,
+                tags=tags,
                 title=title or Path(raw_name).stem,
                 forward_to_telegram=forward_to_telegram,
             )
@@ -300,6 +314,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         relative_paths: list[str] = Form(default=[]),
         archive_name: str | None = Form(default=None),
         folder: str | None = Form(default=None),
+        tags: str | None = Form(default=None),
         forward_to_telegram: bool = Form(default=True),
     ):
         if not files:
@@ -367,6 +382,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 zip_path,
                 source_origin="web",
                 folder=folder,
+                tags=tags,
                 title=folder_title,
                 forward_to_telegram=forward_to_telegram,
             )
@@ -385,6 +401,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         media_type: str = Query(default="all"),
         drive_name: str = Query(default="all"),
         folder: str = Query(default="all"),
+        tag: str = Query(default="all"),
         q: str = Query(default=""),
         sort: str = Query(default="newest"),
         limit: int = Query(default=60, ge=1, le=200),
@@ -394,6 +411,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             media_type=media_type,
             drive_name=drive_name,
             folder=folder,
+            tag=tag,
             q=q.strip() or None,
             sort=sort,
             limit=limit,
@@ -404,6 +422,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/media/{media_id}", dependencies=[Depends(require_auth)])
     async def get_media_item(media_id: str):
         item = db.get_media(media_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Media item not found")
+        return item
+
+    @app.patch("/api/media/{media_id}/tags", dependencies=[Depends(require_auth)])
+    async def update_media_tags(media_id: str, payload: UpdateMediaTagsRequest):
+        item = db.update_media_tags(media_id, payload.tags)
         if not item:
             raise HTTPException(status_code=404, detail="Media item not found")
         return item
