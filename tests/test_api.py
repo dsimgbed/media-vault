@@ -1013,9 +1013,321 @@ def test_hashtags_ingest_filter_patch_and_telegram_caption(tmp_path: Path, monke
         assert "modalEditTagsBtn" in html
 
 
+def test_telegram_dm_zero_disk_copy_ingest_and_fallback(tmp_path: Path):
+    import asyncio
+    from types import SimpleNamespace
+    from telethon.errors import FloodWaitError
+    from app.config import TelegramApiConfig
+    from app.telegram_mtproto import TelegramPool
+
+    settings = _make_settings(tmp_path, storage_mode="telegram")
+    settings.telegram_archive_chat_id = "-100888999"
+    app = create_app(settings)
+    pool: TelegramPool = app.state.tg_pool
+    db = app.state.db
+
+    thumb_jpg = _sample_jpeg_bytes()
+    fake_media_obj = SimpleNamespace(tag="tg-remote-video")
+
+    class FakeStatusMsg:
+        def __init__(self) -> None:
+            self.edits: list[str] = []
+
+        async def edit(self, text: str) -> None:
+            self.edits.append(text)
+
+    class FakeDmMessage:
+        def __init__(self, *, name: str, size: int, mime_type: str, full_bytes: bytes | None = None, has_thumb: bool = True, photo=None, video=None):
+            self.id = 42
+            self.file = SimpleNamespace(name=name, ext=Path(name).suffix, size=size, mime_type=mime_type)
+            self.media = fake_media_obj
+            self.photo = photo
+            self.video = video
+            self.full_bytes = full_bytes or b""
+            self.has_thumb = has_thumb
+            self.download_calls: list[tuple[str, Any]] = []
+
+        async def download_media(self, file: str | None = None, thumb: Any = None, progress_callback=None):
+            self.download_calls.append((str(file), thumb))
+            assert file is not None
+            out = Path(file)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            if thumb == -1:
+                if not self.has_thumb:
+                    return None
+                out.write_bytes(thumb_jpg)
+                return str(out)
+            out.write_bytes(self.full_bytes)
+            if progress_callback:
+                res = progress_callback(len(self.full_bytes), len(self.full_bytes))
+                if asyncio.iscoroutine(res):
+                    await res
+            return str(out)
+
+    class FakeEvent:
+        def __init__(self, msg: FakeDmMessage) -> None:
+            self.message = msg
+            self.replies: list[FakeStatusMsg] = []
+
+        async def reply(self, text: str):
+            sm = FakeStatusMsg()
+            sm.edits.append(text)
+            self.replies.append(sm)
+            return sm
+
+    class FakeWorker:
+        def __init__(self, name: str, *, raise_flood: bool = False) -> None:
+            self.name = name
+            self.raise_flood = raise_flood
+            self.sent_args: list[tuple[Any, bytes | None]] = []
+
+        async def get_input_entity(self, target):
+            return target
+
+        async def send_file(self, peer, file_arg, **kwargs):
+            if self.raise_flood:
+                fw = FloodWaitError(request=None, capture=15)
+                fw.seconds = 15
+                raise fw
+            disk_bytes = None
+            if isinstance(file_arg, str) and Path(file_arg).is_file():
+                disk_bytes = Path(file_arg).read_bytes()
+            self.sent_args.append((file_arg, disk_bytes))
+            return SimpleNamespace(id=555 if self.name == "bot1" else 666)
+
+    cfg1 = TelegramApiConfig(name="bot1", api_id=1, api_hash="h", bot_token="t1")
+    cfg2 = TelegramApiConfig(name="bot2", api_id=2, api_hash="h", bot_token="t2")
+
+    # 1) Happy path: zero-disk-copy reuses event.message.media, only downloads thumb=-1
+    w1 = FakeWorker("bot1")
+    pool.clients = [(cfg1, w1)]
+    msg_video = FakeDmMessage(name="movie.mp4", size=5_000_000, mime_type="video/mp4", video=object(), has_thumb=True)
+    ev1 = FakeEvent(msg_video)
+    asyncio.run(pool._handle_telegram_media(cfg1, ev1, "General", tags=["clip", "hd"]))
+
+    assert len(msg_video.download_calls) == 1
+    assert msg_video.download_calls[0][1] == -1
+    assert len(w1.sent_args) == 1
+    assert w1.sent_args[0][0] is fake_media_obj
+    assert w1.sent_args[0][1] is None
+
+    items, total = db.list_media()
+    assert total == 1
+    vid_item = items[0]
+    assert vid_item["drive_name"] == "telegram"
+    assert vid_item["file_path"] == ""
+    assert vid_item["size_bytes"] == 5_000_000
+    assert vid_item["telegram_msg_id"] == 555
+    assert vid_item["telegram_worker_name"] == "bot1"
+    assert vid_item["tags"] == ["clip", "hd"]
+    assert vid_item["thumb_filename"] is not None
+    assert (settings.thumbs_dir / vid_item["thumb_filename"]).is_file()
+
+    jobs = db.list_jobs(limit=5)
+    assert jobs[0]["status"] == "done"
+    assert jobs[0]["progress"] == 100.0
+    assert json.loads(jobs[0]["media_ids_json"]) == [vid_item["id"]]
+    assert list(settings.staging_dir.iterdir()) == []
+
+    # 2) Small image without embedded thumb falls back to downloading image for thumbnail, still reuses media
+    w1.sent_args.clear()
+    msg_img = FakeDmMessage(
+        name="photo.jpg",
+        size=len(thumb_jpg),
+        mime_type="image/jpeg",
+        full_bytes=thumb_jpg,
+        has_thumb=False,
+        photo=object(),
+    )
+    ev2 = FakeEvent(msg_img)
+    asyncio.run(pool._handle_telegram_media(cfg1, ev2, "General"))
+    assert [c[1] for c in msg_img.download_calls] == [-1, None]
+    assert w1.sent_args[0][0] is fake_media_obj
+    items2, _ = db.list_media()
+    img_item = items2[0]
+    assert img_item["thumb_filename"] is not None
+    assert (settings.thumbs_dir / img_item["thumb_filename"]).is_file()
+    assert list(settings.staging_dir.iterdir()) == []
+
+    # 3) Fallback when preferred worker hits FloodWait: downloads full file on demand for next worker
+    w1_fail = FakeWorker("bot1", raise_flood=True)
+    w2_ok = FakeWorker("bot2")
+    pool.clients = [(cfg1, w1_fail), (cfg2, w2_ok)]
+    full_payload = b"fallback-payload-" * 100
+    msg_fb = FakeDmMessage(
+        name="fallback.mp4",
+        size=len(full_payload),
+        mime_type="video/mp4",
+        full_bytes=full_payload,
+        has_thumb=True,
+        video=object(),
+    )
+    ev3 = FakeEvent(msg_fb)
+    asyncio.run(pool._handle_telegram_media(cfg1, ev3, "General"))
+
+    assert [c[1] for c in msg_fb.download_calls] == [-1, None]
+    assert pool._cooldown_until.get("bot1", 0) > 0
+    assert len(w2_ok.sent_args) == 1
+    assert isinstance(w2_ok.sent_args[0][0], str)
+    assert w2_ok.sent_args[0][1] == full_payload
+
+    items3, _ = db.list_media()
+    fb_item = items3[0]
+    assert fb_item["telegram_msg_id"] == 666
+    assert fb_item["telegram_worker_name"] == "bot2"
+    assert fb_item["drive_name"] == "telegram"
+    assert fb_item["file_path"] == ""
+    assert list(settings.staging_dir.iterdir()) == []
 
 
+def test_telegram_stream_block_cache_hits_lru_eviction_and_delete(tmp_path: Path):
+    import asyncio
+    from types import SimpleNamespace
+    from app.config import TelegramApiConfig
+    from app.telegram_mtproto import TelegramPool
 
+    # Verify default & aligned tuning settings
+    defaults = Settings(_env_file=None)
+    assert defaults.telegram_stream_chunk_kb == 512
+    assert defaults.telegram_stream_cache_mb == 64
+    assert defaults.telegram_upload_concurrency == 4
+    assert defaults.telegram_stream_chunk_bytes == 512 * 1024
 
+    settings = _make_settings(tmp_path, storage_mode="telegram")
+    settings.telegram_stream_chunk_kb = 512
+    settings.telegram_stream_cache_mb = 1  # 1 MiB = 2 blocks of 512 KiB
+    app = create_app(settings)
+    pool: TelegramPool = app.state.tg_pool
+    db = app.state.db
 
+    block_size = 512 * 1024
+    total_size = 3 * block_size  # 1.5 MiB (3 blocks: B0, B1, B2)
+    payload = bytes((i * 13 + 5) % 256 for i in range(total_size))
 
+    class FakeStreamClient:
+        def __init__(self) -> None:
+            self.iter_download_calls: list[tuple[int, int]] = []
+            self.deleted_ids: list[int] = []
+
+        async def get_input_entity(self, target):
+            return target
+
+        async def get_messages(self, peer, ids: int):
+            return SimpleNamespace(media=SimpleNamespace(file_id=ids))
+
+        def iter_download(self, media, *, offset: int = 0, request_size: int = 524288):
+            self.iter_download_calls.append((offset, request_size))
+
+            async def _gen():
+                pos = offset
+                while pos < len(payload):
+                    end = min(len(payload), pos + request_size)
+                    yield payload[pos:end]
+                    pos = end
+
+            return _gen()
+
+        async def delete_messages(self, peer, ids: list[int]):
+            self.deleted_ids.extend(ids)
+            return [True]
+
+        async def disconnect(self):
+            return None
+
+    sc = FakeStreamClient()
+    pool.clients = [(TelegramApiConfig(name="bot1", api_id=1, api_hash="h", bot_token="t1"), sc)]
+
+    item = db.insert_media(
+        media_id="cache_vid_01",
+        title="Seekable Video",
+        filename="seek.mp4",
+        folder="General",
+        media_type="video",
+        mime_type="video/mp4",
+        size_bytes=total_size,
+        drive_name="telegram",
+        file_path="",
+        thumb_filename=None,
+        source_origin="web",
+        source_kind="upload",
+        source_url=None,
+        telegram_chat_id="-100123456",
+        telegram_topic_id=1,
+        telegram_msg_id=9001,
+        telegram_worker_name="bot1",
+    )
+
+    with TestClient(app) as client:
+        # 1) Initial Range request inside Block 0 fetches Block 0 from Telegram
+        r1 = client.get(f"/api/media/{item['id']}/stream", headers={"Range": "bytes=0-4095"})
+        assert r1.status_code == 206
+        assert r1.content == payload[0:4096]
+        assert len(sc.iter_download_calls) == 1
+        assert sc.iter_download_calls[0] == (0, block_size)
+
+        # 2) Repeated Range request inside Block 0 is served from cache with ZERO iter_download calls
+        r2 = client.get(f"/api/media/{item['id']}/stream", headers={"Range": "bytes=10000-20000"})
+        assert r2.status_code == 206
+        assert r2.content == payload[10000:20001]
+        assert len(sc.iter_download_calls) == 1
+
+        # 3) Request inside Block 1 fetches Block 1 (cache now holds B0 and B1 = 1 MiB full)
+        r3 = client.get(
+            f"/api/media/{item['id']}/stream",
+            headers={"Range": f"bytes={block_size}-{block_size + 2047}"},
+        )
+        assert r3.status_code == 206
+        assert r3.content == payload[block_size : block_size + 2048]
+        assert len(sc.iter_download_calls) == 2
+
+        # 4) Re-read Block 0 (hit -> promotes B0 to MRU, B1 becomes LRU)
+        r4 = client.get(f"/api/media/{item['id']}/stream", headers={"Range": "bytes=500-999"})
+        assert r4.status_code == 206
+        assert r4.content == payload[500:1000]
+        assert len(sc.iter_download_calls) == 2
+
+        # 5) Request Block 2 -> exceeds 1 MiB capacity, evicts LRU (B1); cache now holds [B0, B2]
+        r5 = client.get(
+            f"/api/media/{item['id']}/stream",
+            headers={"Range": f"bytes={2 * block_size}-{2 * block_size + 1023}"},
+        )
+        assert r5.status_code == 206
+        assert r5.content == payload[2 * block_size : 2 * block_size + 1024]
+        assert len(sc.iter_download_calls) == 3
+
+        # 6) Block 0 is still cached (0 new RPCs)
+        r6 = client.get(f"/api/media/{item['id']}/stream", headers={"Range": "bytes=100-199"})
+        assert r6.status_code == 206
+        assert r6.content == payload[100:200]
+        assert len(sc.iter_download_calls) == 3
+
+        # 7) Block 1 was evicted, so requesting Block 1 invokes iter_download again
+        r7 = client.get(
+            f"/api/media/{item['id']}/stream",
+            headers={"Range": f"bytes={block_size + 10}-{block_size + 109}"},
+        )
+        assert r7.status_code == 206
+        assert r7.content == payload[block_size + 10 : block_size + 110]
+        assert len(sc.iter_download_calls) == 4
+        assert len(pool._block_cache) == 2
+
+        # 8) Deleting the media item invalidates its cached blocks
+        del_res = client.delete(f"/api/media/{item['id']}")
+        assert del_res.status_code == 200
+        assert sc.deleted_ids == [9001]
+        assert len(pool._block_cache) == 0
+
+    # Verify cache_mb=0 disables caching cleanly
+    settings.telegram_stream_cache_mb = 0
+    sc.iter_download_calls.clear()
+    media_obj = SimpleNamespace(file_id=9999)
+
+    async def _direct_read():
+        out = bytearray()
+        async for chunk in pool.iter_telegram_range(sc, media_obj, 0, 1023):
+            out.extend(chunk)
+        return bytes(out)
+
+    assert asyncio.run(_direct_read()) == payload[:1024]
+    assert asyncio.run(_direct_read()) == payload[:1024]
+    assert len(sc.iter_download_calls) == 2

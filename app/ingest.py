@@ -420,6 +420,48 @@ class IngestService:
         self.allocator = allocator
         self.mirror_hook: MirrorHook | None = None
 
+    def record_media(
+        self,
+        *,
+        media_id: str,
+        title: str,
+        filename: str,
+        folder: str,
+        tags: str | list[str] | None,
+        media_type: str,
+        mime_type: str,
+        size_bytes: int,
+        drive_name: str,
+        file_path: str,
+        thumb_filename: str | None,
+        source_origin: str,
+        source_kind: str,
+        source_url: str | None,
+        mirror_info: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.db.insert_media(
+            media_id=media_id,
+            title=title,
+            filename=filename,
+            folder=folder,
+            tags=tags,
+            media_type=media_type,
+            mime_type=mime_type,
+            size_bytes=size_bytes,
+            drive_name=drive_name,
+            file_path=file_path,
+            thumb_filename=thumb_filename,
+            source_origin=source_origin,
+            source_kind=source_kind,
+            source_url=source_url,
+            telegram_chat_id=mirror_info.get("chat_id") if mirror_info else None,
+            telegram_topic_id=mirror_info.get("topic_id") if mirror_info else None,
+            telegram_msg_id=mirror_info.get("message_id") if mirror_info else None,
+            telegram_worker_name=mirror_info.get("worker_name") if mirror_info else None,
+            part_count=int(mirror_info.get("part_count", 1)) if mirror_info else 1,
+            parts=mirror_info.get("parts") if mirror_info else None,
+        )
+
     async def finalize_staged_file(
         self,
         local_path: Path,
@@ -487,7 +529,7 @@ class IngestService:
             final_name = final_path.name
             file_path_str = str(final_path)
 
-        return self.db.insert_media(
+        return self.record_media(
             media_id=media_id,
             title=resolved_title,
             filename=final_name,
@@ -502,12 +544,7 @@ class IngestService:
             source_origin=source_origin,
             source_kind=source_kind,
             source_url=source_url,
-            telegram_chat_id=mirror_info.get("chat_id") if mirror_info else None,
-            telegram_topic_id=mirror_info.get("topic_id") if mirror_info else None,
-            telegram_msg_id=mirror_info.get("message_id") if mirror_info else None,
-            telegram_worker_name=mirror_info.get("worker_name") if mirror_info else None,
-            part_count=int(mirror_info.get("part_count", 1)) if mirror_info else 1,
-            parts=mirror_info.get("parts") if mirror_info else None,
+            mirror_info=mirror_info,
         )
 
     async def process_url_job(

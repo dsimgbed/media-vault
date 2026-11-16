@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import math
 import re
 import shutil
 import tempfile
+import threading
 import time
+import uuid
+import weakref
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +23,8 @@ from telethon.errors import FloodWaitError, RPCError
 from app.allocator import DriveAllocator, fmt_size, sanitize_folder
 from app.config import Settings, TelegramApiConfig
 from app.db import Database, normalize_tags
-from app.ingest import IngestService
+from app.ingest import IngestService, classify_media
+from app.thumbnails import generate_thumbnail
 
 logger = logging.getLogger(__name__)
 URL_REGEX = re.compile(r"https?://\S+")
@@ -162,6 +168,129 @@ def parse_folder_from_text(text: str, fallback: str) -> str:
     return fallback
 
 
+class TelegramBlockCache:
+    """Thread-safe bounded LRU block cache for Telegram streaming range chunks."""
+
+    def __init__(self, max_bytes: int, block_size: int = 512 * 1024) -> None:
+        self._max_bytes = max(0, int(max_bytes))
+        self._block_size = max(4096, int(block_size))
+        self._entries: OrderedDict[tuple[Any, int], bytes] = OrderedDict()
+        self._index: dict[Any, dict[int, int]] = {}
+        self._total_bytes = 0
+        self._lock = threading.RLock()
+
+    @property
+    def enabled(self) -> bool:
+        return self._max_bytes > 0
+
+    @property
+    def max_bytes(self) -> int:
+        return self._max_bytes
+
+    @property
+    def block_size(self) -> int:
+        return self._block_size
+
+    @property
+    def total_bytes(self) -> int:
+        with self._lock:
+            return self._total_bytes
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+    def configure(self, max_bytes: int, block_size: int) -> None:
+        max_bytes = max(0, int(max_bytes))
+        block_size = max(4096, int(block_size))
+        with self._lock:
+            self._max_bytes = max_bytes
+            self._block_size = block_size
+            if max_bytes <= 0:
+                self._entries.clear()
+                self._index.clear()
+                self._total_bytes = 0
+                return
+            self._evict_to_limit()
+
+    def _evict_to_limit(self) -> None:
+        while self._total_bytes > self._max_bytes and self._entries:
+            evicted_key, evicted_data = self._entries.popitem(last=False)
+            self._total_bytes -= len(evicted_data)
+            ev_ns, ev_off = evicted_key
+            ns_map = self._index.get(ev_ns)
+            if ns_map is not None:
+                ns_map.pop(ev_off, None)
+                if not ns_map:
+                    self._index.pop(ev_ns, None)
+
+    def get_span(self, cache_ns: Any, cursor: int, end: int) -> bytes | None:
+        if self._max_bytes <= 0 or cursor > end:
+            return None
+        with self._lock:
+            segs = self._index.get(cache_ns)
+            if not segs:
+                return None
+            best_start: int | None = None
+            best_reach = cursor
+            for seg_start, seg_len in segs.items():
+                seg_end = seg_start + seg_len
+                if seg_start <= cursor < seg_end and seg_end > best_reach:
+                    best_start = seg_start
+                    best_reach = seg_end
+            if best_start is None:
+                return None
+            key = (cache_ns, best_start)
+            data = self._entries.get(key)
+            if data is None:
+                return None
+            self._entries.move_to_end(key)
+            rel_start = cursor - best_start
+            rel_end = min(len(data), end - best_start + 1)
+            if rel_end <= rel_start:
+                return None
+            return data[rel_start:rel_end]
+
+    def put(self, cache_ns: Any, offset: int, data: bytes) -> None:
+        if self._max_bytes <= 0 or not data:
+            return
+        if len(data) > self._max_bytes:
+            return
+        off = int(offset)
+        key = (cache_ns, off)
+        with self._lock:
+            existing = self._entries.get(key)
+            if existing is not None:
+                if len(data) <= len(existing):
+                    self._entries.move_to_end(key)
+                    return
+                self._total_bytes -= len(existing)
+            self._entries[key] = data
+            self._entries.move_to_end(key)
+            self._index.setdefault(cache_ns, {})[off] = len(data)
+            self._total_bytes += len(data)
+            self._evict_to_limit()
+
+    def invalidate(self, cache_ns: Any) -> int:
+        with self._lock:
+            segs = self._index.pop(cache_ns, None)
+            if not segs:
+                return 0
+            removed = 0
+            for seg_start in segs:
+                evicted = self._entries.pop((cache_ns, seg_start), None)
+                if evicted is not None:
+                    self._total_bytes -= len(evicted)
+                    removed += 1
+            return removed
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+            self._index.clear()
+            self._total_bytes = 0
+
+
 class TelegramPool:
     def __init__(
         self,
@@ -185,6 +314,11 @@ class TelegramPool:
         self._cooldown_until: dict[str, float] = {}
         self._stream_media_cache: dict[tuple[str, int, str], tuple[float, Any]] = {}
         self._stream_cache_ttl = 300.0
+        self._media_cache_keys: OrderedDict[int, tuple[weakref.ref[Any] | None, tuple[str, int]]] = OrderedDict()
+        self._block_cache = TelegramBlockCache(
+            max_bytes=settings.telegram_stream_cache_bytes,
+            block_size=settings.telegram_stream_chunk_bytes,
+        )
 
         # Wire mirror hook so both Web and Telegram uploads can forward to the shared Forum Supergroup
         self.ingest.mirror_hook = self.mirror_to_archive_topic
@@ -337,8 +471,35 @@ class TelegramPool:
                     peer = await client.get_input_entity(target)
                     topic_id = await self._ensure_topic_id(cfg, chat_key, folder)
 
+                    async def _ensure_local_file() -> Path:
+                        local_path = Path(payload["local_path"])
+                        if local_path.is_file():
+                            return local_path
+                        if tg_source and tg_source.get("message") is not None:
+                            dl_fn = tg_source.get("on_demand_download")
+                            if callable(dl_fn):
+                                downloaded = Path(await dl_fn())
+                            else:
+                                dl_raw = await tg_source["message"].download_media(file=str(local_path))
+                                if not dl_raw:
+                                    raise RuntimeError("On-demand Telegram download fallback returned empty path.")
+                                downloaded = Path(dl_raw)
+                            if not downloaded.is_file():
+                                raise RuntimeError("On-demand Telegram download fallback failed to create file.")
+                            payload["local_path"] = downloaded
+                            return downloaded
+                        raise FileNotFoundError(f"Missing staged file for upload: {local_path}")
+
+                    use_zero_copy_media = bool(
+                        tg_source
+                        and cfg.name == preferred_worker
+                        and getattr(tg_source.get("message"), "media", None) is not None
+                    )
+                    if not use_zero_copy_media:
+                        await _ensure_local_file()
+
                     async def _send_with_topic(tid: int | None):
-                        if tg_source and cfg.name == preferred_worker and getattr(tg_source.get("message"), "media", None):
+                        if use_zero_copy_media:
                             return await client.send_file(
                                 peer,
                                 tg_source["message"].media,
@@ -357,11 +518,22 @@ class TelegramPool:
 
                     try:
                         sent = await _send_with_topic(topic_id)
+                    except FloodWaitError:
+                        raise
                     except RPCError as rpc_err:
                         err_text = str(rpc_err).upper()
                         if topic_id and topic_id != 1 and ("TOPIC" in err_text or "REPLY" in err_text or "THREAD" in err_text):
                             logger.info("Cached topic %s invalid for '%s'; recreating...", topic_id, folder)
                             topic_id = await self._ensure_topic_id(cfg, chat_key, folder, force_recreate=True)
+                            sent = await _send_with_topic(topic_id)
+                        elif use_zero_copy_media and len(self.clients) <= 1:
+                            logger.warning(
+                                "Zero-copy send_file failed on worker '%s' (%s); falling back to disk upload.",
+                                cfg.name,
+                                rpc_err,
+                            )
+                            await _ensure_local_file()
+                            use_zero_copy_media = False
                             sent = await _send_with_topic(topic_id)
                         else:
                             raise
@@ -424,7 +596,11 @@ class TelegramPool:
                     f"Uploading {total_parts} parts to Telegram: {overall_pct:.0f}% ({fmt_size(total_sent)} / {fmt_size(size_bytes)})",
                 )
 
-        sem = asyncio.Semaphore(max(1, len(self.clients)))
+        concurrency = min(
+            total_parts,
+            max(1, len(self.clients) * max(1, int(self.settings.telegram_upload_concurrency))),
+        )
+        sem = asyncio.Semaphore(concurrency)
 
         async def _upload_part(part_index: int) -> dict[str, Any]:
             nonlocal shared_topic_id
@@ -551,6 +727,44 @@ class TelegramPool:
         for k in expired:
             self._stream_media_cache.pop(k, None)
 
+    def _sync_block_cache_limits(self) -> None:
+        self._block_cache.configure(
+            max_bytes=self.settings.telegram_stream_cache_bytes,
+            block_size=self.settings.telegram_stream_chunk_bytes,
+        )
+
+    def _remember_media_key(self, media: Any, chat_id: str, msg_id: int) -> None:
+        ns = (str(chat_id), int(msg_id))
+        obj_id = id(media)
+        try:
+            ref: weakref.ref[Any] | None = weakref.ref(media)
+        except TypeError:
+            ref = None
+        self._media_cache_keys[obj_id] = (ref, ns)
+        self._media_cache_keys.move_to_end(obj_id)
+        while len(self._media_cache_keys) > 1024:
+            self._media_cache_keys.popitem(last=False)
+
+    def _resolve_media_cache_key(self, media: Any, cache_key: Any = None) -> Any:
+        if cache_key is not None:
+            return cache_key
+        entry = self._media_cache_keys.get(id(media))
+        if entry is not None:
+            ref, ns = entry
+            if ref is None or ref() is media:
+                return ns
+        return ("media", id(media))
+
+    def invalidate_stream_cache(self, chat_id: str, msg_id: int) -> None:
+        chat_str = str(chat_id)
+        mid_int = int(msg_id)
+        target_ns = (chat_str, mid_int)
+        self._block_cache.invalidate(target_ns)
+        for key in [k for k in self._stream_media_cache if k[0] == chat_str and k[1] == mid_int]:
+            self._stream_media_cache.pop(key, None)
+        for obj_id in [k for k, (_, ns) in self._media_cache_keys.items() if ns == target_ns]:
+            self._media_cache_keys.pop(obj_id, None)
+
     async def prepare_stream(
         self, chat_id: str, msg_id: int, worker_name: str | None = None
     ) -> tuple[TelegramClient, Any]:
@@ -569,6 +783,7 @@ class TelegramPool:
             cache_key = (str(chat_id), int(msg_id), cfg.name)
             cached = self._stream_media_cache.get(cache_key)
             if cached and now < cached[0]:
+                self._remember_media_key(cached[1], str(chat_id), int(msg_id))
                 return client, cached[1]
 
         last_err: Exception | None = None
@@ -582,6 +797,7 @@ class TelegramPool:
                         time.monotonic() + self._stream_cache_ttl,
                         msg.media,
                     )
+                    self._remember_media_key(msg.media, str(chat_id), int(msg_id))
                     return client, msg.media
             except FloodWaitError as fw:
                 self._cooldown_until[cfg.name] = time.monotonic() + fw.seconds
@@ -595,19 +811,70 @@ class TelegramPool:
             raise RuntimeError(str(last_err))
         raise FileNotFoundError("Media message no longer exists in Telegram archive.")
 
-    @staticmethod
-    async def iter_telegram_range(client: TelegramClient, media: Any, start: int, end: int):
-        remaining = end - start + 1
-        if remaining <= 0:
+    async def iter_telegram_range(
+        self,
+        client: TelegramClient,
+        media: Any,
+        start: int,
+        end: int,
+        *,
+        cache_key: Any = None,
+    ):
+        if end < start:
             return
-        aligned_offset = (start // 4096) * 4096
-        skip = start - aligned_offset
-        iterator = client.iter_download(media, offset=aligned_offset, request_size=524288)
+        self._sync_block_cache_limits()
+        resolved_key = self._resolve_media_cache_key(media, cache_key=cache_key)
+        block_size = self._block_cache.block_size
+        cursor = start
+
+        # Serve any leading consecutive cached blocks directly from memory
+        if self._block_cache.enabled:
+            while cursor <= end:
+                cached_slice = self._block_cache.get_span(resolved_key, cursor, end)
+                if not cached_slice:
+                    break
+                yield cached_slice
+                cursor += len(cached_slice)
+
+        if cursor > end:
+            return
+
+        remaining = end - cursor + 1
+        aligned_offset = (cursor // 4096) * 4096
+        skip = cursor - aligned_offset
+        request_size = self.settings.telegram_stream_chunk_bytes
+        iterator = client.iter_download(media, offset=aligned_offset, request_size=request_size)
+
+        buf_offset = aligned_offset
+        pending = bytearray()
+
+        def _flush_pending_blocks(*, flush_partial: bool = False) -> None:
+            nonlocal buf_offset
+            if not self._block_cache.enabled or not pending:
+                return
+            while len(pending) >= block_size:
+                block = bytes(pending[:block_size])
+                del pending[:block_size]
+                self._block_cache.put(resolved_key, buf_offset, block)
+                buf_offset += block_size
+            if flush_partial and pending:
+                self._block_cache.put(resolved_key, buf_offset, bytes(pending))
+                buf_offset += len(pending)
+                pending.clear()
+
+        errored = False
         try:
             async for chunk in iterator:
                 if remaining <= 0:
                     break
-                data = bytes(chunk)
+                raw = bytes(chunk)
+                if not raw:
+                    continue
+                if self._block_cache.enabled:
+                    pending.extend(raw)
+                    _flush_pending_blocks(flush_partial=False)
+
+                data = raw
                 if skip > 0:
                     if len(data) <= skip:
                         skip -= len(data)
@@ -616,10 +883,16 @@ class TelegramPool:
                     skip = 0
                 if len(data) > remaining:
                     yield data[:remaining]
+                    remaining = 0
                     break
                 remaining -= len(data)
                 yield data
+        except Exception:
+            errored = True
+            raise
         finally:
+            if not errored:
+                _flush_pending_blocks(flush_partial=True)
             close_fn = getattr(iterator, "close", None)
             if callable(close_fn):
                 res = close_fn()
@@ -662,6 +935,7 @@ class TelegramPool:
     async def delete_archive_message(
         self, chat_id: str, msg_id: int, worker_name: str | None = None
     ) -> None:
+        self.invalidate_stream_cache(chat_id, msg_id)
         if not self.clients:
             return
         try:
@@ -913,6 +1187,25 @@ class TelegramPool:
         except Exception as exc:
             await status_msg.edit(f"[{cfg.name}] Failed:\n`{exc}`")
 
+    @staticmethod
+    def _classify_telegram_media(filename: str, message: Any) -> tuple[str, str]:
+        media_type, mime_type = classify_media(Path(filename))
+        msg_mime = getattr(getattr(message, "file", None), "mime_type", None) or ""
+        if media_type == "file" and msg_mime:
+            if msg_mime.startswith("image/"):
+                return "image", msg_mime
+            if msg_mime.startswith("video/"):
+                return "video", msg_mime
+            if msg_mime.startswith("audio/"):
+                return "audio", msg_mime
+            mime_type = msg_mime
+        if media_type == "file":
+            if getattr(message, "photo", None):
+                return "image", msg_mime or "image/jpeg"
+            if getattr(message, "video", None):
+                return "video", msg_mime or "video/mp4"
+        return media_type, mime_type
+
     async def _handle_telegram_media(
         self, cfg: TelegramApiConfig, event, folder: str, *, tags: list[str] | None = None
     ) -> None:
@@ -922,8 +1215,15 @@ class TelegramPool:
             await event.reply("File exceeds 2 GB Telegram bot transfer limit.")
             return
 
+        use_zero_copy = (
+            self.settings.storage_mode == "telegram"
+            and 0 < total_size <= self.settings.telegram_part_size_bytes
+            and bool(self.settings.telegram_archive_chat_id.strip())
+        )
+
+        initial_verb = "Forwarding" if use_zero_copy else "Downloading"
         status_msg = await event.reply(
-            f"[{cfg.name}] Downloading `{filename}` ({fmt_size(total_size)}) → `{folder}`..."
+            f"[{cfg.name}] {initial_verb} `{filename}` ({fmt_size(total_size)}) → `{folder}`..."
         )
         job_id = self.db.create_job("telegram", "upload", filename)
         job_dir = Path(tempfile.mkdtemp(dir=self.settings.staging_dir))
@@ -945,33 +1245,157 @@ class TelegramPool:
                     pass
 
         try:
-            self.db.update_job(job_id, status="downloading", message=f"Downloading {filename} via MTProto...")
-            downloaded = await event.message.download_media(
-                file=str(staged_path),
-                progress_callback=progress_cb,
-            )
-            if not downloaded:
-                raise RuntimeError("Telegram download returned empty path.")
-            item = await self.ingest.process_staged_upload_job(
-                job_id,
-                Path(downloaded),
-                source_origin="telegram",
-                folder=folder,
-                tags=tags,
-                title=Path(filename).stem,
-                forward_to_telegram=True,
-                tg_source={"worker_name": cfg.name, "message": event.message},
-            )
+            if use_zero_copy:
+                safe_folder = sanitize_folder(folder, self.settings.default_folder)
+                normalized_tags = normalize_tags(tags)
+                self.db.update_job(
+                    job_id,
+                    status="allocating",
+                    progress=10.0,
+                    message="Forwarding directly to Telegram archive (zero-copy)...",
+                )
+
+                media_id = uuid.uuid4().hex[:12]
+                media_type, mime_type = self._classify_telegram_media(filename, event.message)
+                thumb_filename: str | None = None
+
+                temp_thumb_path = job_dir / f"{media_id}_thumb.jpg"
+                downloaded_thumb = None
+                try:
+                    downloaded_thumb = await event.message.download_media(
+                        file=str(temp_thumb_path),
+                        thumb=-1,
+                    )
+                except Exception as thumb_exc:
+                    logger.debug("Embedded thumbnail download failed for %s: %s", filename, thumb_exc)
+
+                if downloaded_thumb:
+                    thumb_src = Path(downloaded_thumb)
+                    if thumb_src.is_file() and thumb_src.stat().st_size > 0:
+                        thumb_filename = await generate_thumbnail(
+                            thumb_src, "image", self.settings.thumbs_dir, media_id
+                        )
+
+                if not thumb_filename and media_type == "image" and total_size <= 10 * 1024 * 1024:
+                    dl_img = await event.message.download_media(
+                        file=str(staged_path),
+                        progress_callback=progress_cb,
+                    )
+                    if dl_img and Path(dl_img).is_file():
+                        staged_path = Path(dl_img)
+                        thumb_filename = await generate_thumbnail(
+                            staged_path, "image", self.settings.thumbs_dir, media_id
+                        )
+
+                async def _on_demand_download() -> Path:
+                    if staged_path.is_file():
+                        return staged_path
+                    self.db.update_job(
+                        job_id,
+                        status="downloading",
+                        progress=25.0,
+                        message=f"Downloading {filename} via MTProto (fallback)...",
+                    )
+                    dl_full = await event.message.download_media(
+                        file=str(staged_path),
+                        progress_callback=progress_cb,
+                    )
+                    if not dl_full or not Path(dl_full).is_file():
+                        raise RuntimeError("Telegram download returned empty path.")
+                    nonlocal thumb_filename
+                    dl_p = Path(dl_full)
+                    if not thumb_filename:
+                        thumb_filename = await generate_thumbnail(
+                            dl_p, media_type, self.settings.thumbs_dir, media_id
+                        )
+                    self.db.update_job(
+                        job_id,
+                        status="allocating",
+                        progress=60.0,
+                        message=f"Uploading {filename} to Telegram archive...",
+                    )
+                    return dl_p
+
+                async def _report_ul(pct: float, msg: str) -> None:
+                    overall = 50.0 + (pct / 100.0) * 49.0
+                    self.db.update_job(job_id, status="allocating", progress=overall, message=msg)
+
+                payload = {
+                    "media_id": media_id,
+                    "title": Path(filename).stem,
+                    "filename": filename,
+                    "folder": safe_folder,
+                    "tags": normalized_tags,
+                    "media_type": media_type,
+                    "size_bytes": total_size,
+                    "local_path": staged_path,
+                    "source_url": None,
+                    "tg_source": {
+                        "worker_name": cfg.name,
+                        "message": event.message,
+                        "on_demand_download": _on_demand_download,
+                    },
+                    "progress_cb": _report_ul,
+                }
+                mirror_info = await self.mirror_to_archive_topic(payload)
+                if not mirror_info or not mirror_info.get("message_id"):
+                    raise RuntimeError(
+                        "Telegram storage mode requires TELEGRAM_APIS_JSON and TELEGRAM_ARCHIVE_CHAT_ID to be configured and reachable."
+                    )
+
+                item = self.ingest.record_media(
+                    media_id=media_id,
+                    title=Path(filename).stem,
+                    filename=filename,
+                    folder=safe_folder,
+                    tags=normalized_tags,
+                    media_type=media_type,
+                    mime_type=mime_type,
+                    size_bytes=total_size,
+                    drive_name="telegram",
+                    file_path="",
+                    thumb_filename=thumb_filename,
+                    source_origin="telegram",
+                    source_kind="upload",
+                    source_url=None,
+                    mirror_info=mirror_info,
+                )
+                self.db.update_job(
+                    job_id,
+                    status="done",
+                    progress=100.0,
+                    message=f"Saved to telegram/{safe_folder}",
+                    media_ids_json=json.dumps([item["id"]]),
+                )
+            else:
+                self.db.update_job(job_id, status="downloading", message=f"Downloading {filename} via MTProto...")
+                downloaded = await event.message.download_media(
+                    file=str(staged_path),
+                    progress_callback=progress_cb,
+                )
+                if not downloaded:
+                    raise RuntimeError("Telegram download returned empty path.")
+                item = await self.ingest.process_staged_upload_job(
+                    job_id,
+                    Path(downloaded),
+                    source_origin="telegram",
+                    folder=folder,
+                    tags=tags,
+                    title=Path(filename).stem,
+                    forward_to_telegram=True,
+                    tg_source={"worker_name": cfg.name, "message": event.message},
+                )
+
             topic_note = f" + Topic #{item['telegram_topic_id']}" if item.get("telegram_topic_id") else ""
             await status_msg.edit(
                 f"[{cfg.name}] Saved `{item['filename']}` ({fmt_size(item['size_bytes'])}) → `{item['drive_name']}/{item['folder']}`{topic_note}\n"
                 f"View: {self._gallery_link(item['id'])}"
             )
         except FloodWaitError as fw:
-            shutil.rmtree(job_dir, ignore_errors=True)
             self.db.update_job(job_id, status="failed", message=f"Telegram flood wait: {fw.seconds}s")
             await status_msg.edit(f"[{cfg.name}] Rate limited by Telegram for {fw.seconds}s. Try another worker/bot.")
         except Exception as exc:
-            shutil.rmtree(job_dir, ignore_errors=True)
             self.db.update_job(job_id, status="failed", message=str(exc))
             await status_msg.edit(f"[{cfg.name}] Failed:\n`{exc}`")
+        finally:
+            shutil.rmtree(job_dir, ignore_errors=True)

@@ -46,6 +46,9 @@ class Settings(BaseSettings):
     telegram_apis_json: str = "[]"
     allowed_telegram_user_ids: str = ""
     telegram_archive_chat_id: str = ""
+    telegram_stream_chunk_kb: int = 512
+    telegram_stream_cache_mb: int = 64
+    telegram_upload_concurrency: int = 4
 
     ytdlp_cookies_file: Path = Path("./data/cookies.txt")
     ytdlp_proxy: str = ""
@@ -73,6 +76,16 @@ class Settings(BaseSettings):
     @property
     def telegram_part_size_bytes(self) -> int:
         return self.telegram_part_size_mb * 1024 * 1024
+
+    @property
+    def telegram_stream_chunk_bytes(self) -> int:
+        kb = max(4, min(1024, int(self.telegram_stream_chunk_kb)))
+        aligned_kb = max(4, (kb // 4) * 4)
+        return aligned_kb * 1024
+
+    @property
+    def telegram_stream_cache_bytes(self) -> int:
+        return max(0, int(self.telegram_stream_cache_mb)) * 1024 * 1024
 
     def get_drives(self) -> list[DriveConfig]:
         raw = json.loads(self.drives_json or "[]")
