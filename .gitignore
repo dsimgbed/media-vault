@@ -1,0 +1,27 @@
+# Secrets & local runtime state (NEVER commit)
+.env
+.env.*
+!.env.example
+data/
+*.db
+*.db-wal
+*.db-shm
+*.session
+*.session-journal
+cookies.txt
+
+# Python / virtualenv / caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
