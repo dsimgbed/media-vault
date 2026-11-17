@@ -30,4 +30,11 @@ export const state = {
     drive: null,
     tag: null,
   },
+  cinemaActiveId: null,
+  cinemaActiveItem: null,
+  cinemaAutoNext: true,
+  cinemaLoop: false,
+  cinemaShuffle: false,
+  cinemaTheater: false,
+  cinemaSpeed: 1,
 };

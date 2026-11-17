@@ -6,6 +6,7 @@ import { initTags, loadTags } from "/static/js/features/tags.js";
 import { connectEvents, initJobs, loadJobs } from "/static/js/features/jobs.js";
 import { initUploader } from "/static/js/features/uploader.js";
 import { initGallery, loadMedia } from "/static/js/features/gallery.js";
+import { initCinema } from "/static/js/features/cinema.js";
 import { initViewer, openViewer } from "/static/js/features/viewer.js";
 
 async function refreshMediaData() {
@@ -30,6 +31,7 @@ initTags();
 initUploader();
 initJobs();
 initGallery();
+initCinema();
 initViewer();
 
 on("media:changed", () => {
@@ -38,6 +40,7 @@ on("media:changed", () => {
 
 on("auth:unlocked", () => {
   refreshAll();
+  connectEvents();
 });
 
 on("system:refresh", () => {

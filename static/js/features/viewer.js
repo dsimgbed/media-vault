@@ -302,7 +302,7 @@ export function initViewer() {
       await apiFetch(`/api/media/${deletedId}`, { method: "DELETE" });
       state.selectedIds.delete(deletedId);
       closeViewer();
-      emit("media:changed", { source: "delete" });
+      emit("media:changed", { source: "delete", id: deletedId });
     } catch (err) {
       toast(`Failed deleting media: ${err.message}`, { type: "error" });
     }

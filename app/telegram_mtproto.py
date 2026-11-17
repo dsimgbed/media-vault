@@ -88,10 +88,17 @@ def _is_photo_fallback_error(exc: Exception) -> bool:
     return False
 
 
-def _should_force_document_for_image(local_path: Path, media_type: str | None = None) -> bool:
+def _should_force_document_for_image(
+    local_path: Path,
+    media_type: str | None = None,
+    *,
+    compress_photos: bool = False,
+) -> bool:
     is_img = (media_type == "image") or (local_path.suffix.lower() in IMAGE_EXTS)
     if not is_img or not local_path.is_file():
         return False
+    if not compress_photos:
+        return True
     try:
         file_size = local_path.stat().st_size
     except OSError:
@@ -715,6 +722,7 @@ class TelegramPool:
                             _should_force_document_for_image,
                             Path(payload["local_path"]),
                             payload.get("media_type"),
+                            compress_photos=bool(getattr(self.settings, "telegram_compress_photos", False)),
                         )
 
                     async def _do_send(tid: int | None, send_caption: str, *, force_doc: bool):
@@ -800,6 +808,7 @@ class TelegramPool:
                                 _should_force_document_for_image,
                                 Path(payload["local_path"]),
                                 payload.get("media_type"),
+                                compress_photos=bool(getattr(self.settings, "telegram_compress_photos", False)),
                             )
                             sent = await _send_with_topic(topic_id, caption)
                         else:

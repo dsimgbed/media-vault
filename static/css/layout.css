@@ -105,7 +105,20 @@ main {
   margin: 0 auto;
   padding: 20px;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 18px;
+}
+
+main > * {
+  min-width: 0;
+}
+
+body[data-mode="cinema"] {
+  background: #06080d;
+}
+
+body[data-mode="cinema"] main {
+  max-width: 1440px;
 }
 
 .toolbar {
@@ -121,6 +134,7 @@ main {
   gap: 8px;
   flex-wrap: wrap;
   align-items: center;
+  min-width: 0;
 }
 
 .toolbar-group-wide {
@@ -137,7 +151,8 @@ body[data-mode="uploader"] .mode-cinema-section {
   display: none !important;
 }
 
-body[data-mode="files"] .mode-uploader-section {
+body[data-mode="files"] .mode-uploader-section,
+body[data-mode="files"] .mode-cinema-section:not(.mode-files-section) {
   display: none !important;
 }
 

@@ -13,8 +13,11 @@ export function withToken(url) {
 }
 
 function handleUnauthorized() {
+  state.authRequired = true;
   const box = $("authBox");
   if (box) box.style.display = "flex";
+  const banner = $("authBanner");
+  if (banner) banner.hidden = false;
   emit("auth:required");
 }
 

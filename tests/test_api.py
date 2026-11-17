@@ -3292,6 +3292,7 @@ def test_module1_frontend_modularization_mode_switcher_and_dialogs(tmp_path: Pat
             "js/features/uploader.js",
             "js/features/jobs.js",
             "js/features/gallery.js",
+            "js/features/cinema.js",
             "js/features/viewer.js",
             "js/features/zip-explorer.js",
             "js/features/pwa.js",
@@ -3314,6 +3315,11 @@ def test_module1_frontend_modularization_mode_switcher_and_dialogs(tmp_path: Pat
             "confirmDialog",
             "promptDialog",
             "alertDialog",
+            "authBanner",
+            "cinemaStage",
+            "cinemaVideo",
+            "cinemaQueueList",
+            "cinemaTheaterBtn",
         ):
             assert token in full_ui
 
@@ -3418,7 +3424,8 @@ def test_long_comic_image_forces_document_and_photo_dimension_fallback(tmp_path:
     from app.config import TelegramApiConfig
     from app.telegram_mtproto import TelegramPool, _should_force_document_for_image
 
-    # 1) Proactive image check distinguishes normal photos from long comics / oversized images
+    # 1) Proactive image check forces lossless document uploads by default for all images,
+    #    and still guards long comics / oversized images even when compress_photos=True
     normal_img = tmp_path / "normal.jpg"
     Image.new("RGB", (640, 360), (20, 40, 80)).save(normal_img, "JPEG")
     long_comic = tmp_path / "long_comic.jpeg"
@@ -3430,13 +3437,15 @@ def test_long_comic_image_forces_document_and_photo_dimension_fallback(tmp_path:
     fake_vid = tmp_path / "clip.mp4"
     fake_vid.write_bytes(b"mp4")
 
-    assert _should_force_document_for_image(normal_img, "image") is False
-    assert _should_force_document_for_image(long_comic, "image") is True
-    assert _should_force_document_for_image(wide_strip, "image") is True
-    assert _should_force_document_for_image(oversized_sq, "image") is True
+    assert _should_force_document_for_image(normal_img, "image") is True
+    assert _should_force_document_for_image(normal_img, "image", compress_photos=True) is False
+    assert _should_force_document_for_image(long_comic, "image", compress_photos=True) is True
+    assert _should_force_document_for_image(wide_strip, "image", compress_photos=True) is True
+    assert _should_force_document_for_image(oversized_sq, "image", compress_photos=True) is True
     assert _should_force_document_for_image(fake_vid, "video") is False
 
-    # 2) Long comic is sent proactively with force_document=True on the first attempt
+    # 2) By default (telegram_compress_photos=False), even normal images send with force_document=True
+    #    to prevent Telegram from downscaling/JPEG-recompressing pictures
     settings = _make_settings(tmp_path, storage_mode="telegram")
     settings.telegram_archive_chat_id = "-100999111"
     app = create_app(settings)
@@ -3463,6 +3472,26 @@ def test_long_comic_image_forces_document_and_photo_dimension_fallback(tmp_path:
     w_comic = PhotoAwareWorker("bot1", reject_photo_mode=True)
     pool.clients = [(TelegramApiConfig(name="bot1", api_id=1, api_hash="h", bot_token="t1"), w_comic)]
 
+    normal_lossless_res = asyncio.run(
+        pool.mirror_to_archive_topic(
+            {
+                "media_id": "norm_lossless",
+                "title": "normal_lossless",
+                "filename": normal_img.name,
+                "folder": "General",
+                "tags": [],
+                "media_type": "image",
+                "size_bytes": normal_img.stat().st_size,
+                "local_path": normal_img,
+                "source_url": "https://example.com/normal.jpg",
+            }
+        )
+    )
+    assert normal_lossless_res is not None
+    assert normal_lossless_res["message_id"] == 901
+    assert len(w_comic.calls) == 1
+    assert w_comic.calls[0]["kwargs"].get("force_document") is True
+
     comic_res = asyncio.run(
         pool.mirror_to_archive_topic(
             {
@@ -3479,11 +3508,13 @@ def test_long_comic_image_forces_document_and_photo_dimension_fallback(tmp_path:
         )
     )
     assert comic_res is not None
-    assert comic_res["message_id"] == 901
-    assert len(w_comic.calls) == 1
-    assert w_comic.calls[0]["kwargs"].get("force_document") is True
+    assert comic_res["message_id"] == 902
+    assert len(w_comic.calls) == 2
+    assert w_comic.calls[1]["kwargs"].get("force_document") is True
 
-    # 3) Even if an image passes proactive bounds, PhotoInvalidDimensionsError triggers same-worker force_document=True retry
+    # 3) When telegram_compress_photos=True and an image passes proactive bounds,
+    #    PhotoInvalidDimensionsError still triggers same-worker force_document=True retry
+    settings.telegram_compress_photos = True
     w_fallback = PhotoAwareWorker("bot1", reject_photo_mode=True)
     w_unused = PhotoAwareWorker("bot2", reject_photo_mode=True)
     pool.clients = [
@@ -3567,4 +3598,48 @@ def test_long_comic_image_forces_document_and_photo_dimension_fallback(tmp_path:
         assert stream_res.status_code == 200
         assert int(stream_res.headers["content-length"]) == len(recompressed_bytes)
         assert stream_res.content == recompressed_bytes
+
+
+def test_folder_case_insensitive_filter_and_deduplicated_listing(tmp_path: Path):
+    settings = _make_settings(tmp_path)
+    app = create_app(settings)
+    db = app.state.db
+
+    for mid, folder in (
+        ("f1", "Futa"),
+        ("f2", "Futa"),
+        ("l1", "Lesbian"),
+        ("l2", "lesbian"),
+    ):
+        db.insert_media(
+            media_id=mid,
+            title=mid,
+            filename=f"{mid}.jpg",
+            folder=folder,
+            media_type="image",
+            mime_type="image/jpeg",
+            size_bytes=123,
+            drive_name="telegram",
+            file_path="",
+            thumb_filename=None,
+            source_origin="web",
+            source_kind="upload",
+            source_url=None,
+        )
+
+    db.save_topic_id("-100111222", "Futa", 15)
+    db.save_topic_id("-100111222", "Anime", 22)
+
+    with TestClient(app) as client:
+        folders = client.get("/api/folders").json()["folders"]
+        # Deduplicated case-insensitively, preferring cased media_items folder names
+        assert folders == ["General", "anime", "Futa", "Lesbian"]
+
+        # Lowercase query matches cased items and vice versa
+        futa_lower = client.get("/api/media?folder=futa").json()
+        assert {it["id"] for it in futa_lower["items"]} == {"f1", "f2"}
+
+        lesbian_cased = client.get("/api/media?folder=Lesbian").json()
+        assert {it["id"] for it in lesbian_cased["items"]} == {"l1", "l2"}
+
 

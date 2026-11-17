@@ -22,6 +22,8 @@ import {
 } from "/static/js/features/tags.js";
 
 let galleryNeedsReload = false;
+let galleryLoaded = false;
+let lastLoadError = null;
 
 const MAX_MOBILE_PREVIEWS = 2;
 const activeMobilePreviews = new Set();
@@ -130,6 +132,34 @@ function getEffectiveFilters() {
   };
 }
 
+function hasActiveFilters() {
+  const f = getEffectiveFilters();
+  const mode = getMode();
+  return Boolean(
+    f.q
+    || (mode !== "cinema" && f.media_type !== "all")
+    || (f.folder && f.folder !== "all")
+    || (f.drive_name && f.drive_name !== "all")
+    || (f.tag && f.tag !== "all")
+  );
+}
+
+function resetFilters() {
+  if ($("searchInput")) $("searchInput").value = "";
+  if (getMode() !== "cinema" && $("typeFilter")) {
+    $("typeFilter").value = "all";
+    state.savedTypeFilter = "all";
+  }
+  if ($("folderFilter")) $("folderFilter").value = "all";
+  if ($("driveFilter")) $("driveFilter").value = "all";
+  if ($("sortSelect")) $("sortSelect").value = "newest";
+  state.pendingFilters.folder = null;
+  state.pendingFilters.drive = null;
+  state.pendingFilters.tag = null;
+  setFilterTags([], { notify: false });
+  loadMedia().catch((err) => toast(err.message, { type: "error" }));
+}
+
 function syncFiltersToUrl() {
   const mode = getMode();
   const filters = getEffectiveFilters();
@@ -145,7 +175,7 @@ function syncFiltersToUrl() {
   if (filters.folder && filters.folder !== "all") url.searchParams.set("folder", filters.folder);
   else url.searchParams.delete("folder");
 
-  if (filters.drive && filters.drive !== "all") url.searchParams.set("drive", filters.drive);
+  if (filters.drive_name && filters.drive_name !== "all") url.searchParams.set("drive", filters.drive_name);
   else url.searchParams.delete("drive");
 
   if (filters.sort && filters.sort !== "newest") url.searchParams.set("sort", filters.sort);
@@ -158,6 +188,7 @@ function syncFiltersToUrl() {
 }
 
 function renderCardHtml(it, activeTagSet = new Set(getFilterTags())) {
+  const isCinema = getMode() === "cinema";
   const thumbUrl = it.thumb_filename ? withToken(`/api/media/${it.id}/thumb`) : "";
   const previewAttr = it.media_type === "video" && it.preview_filename
     ? ` data-preview="${escapeHtml(withToken(`/api/media/${it.id}/preview`))}"`
@@ -165,10 +196,39 @@ function renderCardHtml(it, activeTagSet = new Set(getFilterTags())) {
   const thumbHtml = thumbUrl
     ? `<img loading="lazy" src="${escapeHtml(thumbUrl)}" data-thumb="${escapeHtml(thumbUrl)}" alt="${escapeHtml(it.title)}" />`
     : `<div class="thumb-fallback">${escapeHtml(it.media_type)}</div>`;
-  const typeBadge = isZipItem(it) ? "📦 ZIP" : (it.media_type === "video" ? "▶ Video" : it.media_type);
   const folder = it.folder || state.defaultFolder;
   const durTxt = fmtDuration(it.duration_sec);
   const resTxt = fmtResolution(it);
+  const tagsHtml = it.tags && it.tags.length
+    ? `<div class="tag-row">${it.tags.map((t) => `<span class="tag-chip${activeTagSet.has(t) ? " active" : ""}" data-tag="${escapeHtml(t)}">#${escapeHtml(t)}</span>`).join("")}</div>`
+    : "";
+
+  if (isCinema) {
+    const isPlaying = state.cinemaActiveId === it.id;
+    const subLeft = resTxt ? `${escapeHtml(folder)} • ${escapeHtml(resTxt)}` : escapeHtml(folder);
+    return `
+      <article class="card cinema-card${isPlaying ? " is-playing" : ""}" data-id="${escapeHtml(it.id)}"${previewAttr}>
+        <div class="thumb-wrap cinema-thumb-wrap">
+          ${thumbHtml}
+          <span class="cinema-play-overlay" aria-hidden="true">&#9654;</span>
+          <span class="badge-tl">${escapeHtml(folder)}</span>
+          ${resTxt ? `<span class="badge-tr">${escapeHtml(resTxt)}</span>` : ""}
+          ${durTxt ? `<span class="badge-br">${escapeHtml(durTxt)}</span>` : ""}
+          ${isPlaying ? `<span class="badge-bl cinema-playing-pill">Now Playing</span>` : ""}
+        </div>
+        <div class="card-body">
+          <div class="card-title" title="${escapeHtml(it.filename)}">${escapeHtml(it.title || it.filename)}</div>
+          <div class="card-sub">
+            <span>${subLeft}</span>
+            <span>${fmtSize(it.size_bytes)}</span>
+          </div>
+          ${tagsHtml}
+        </div>
+      </article>
+    `;
+  }
+
+  const typeBadge = isZipItem(it) ? "📦 ZIP" : (it.media_type === "video" ? "▶ Video" : it.media_type);
   const trParts = [durTxt, resTxt].filter(Boolean);
   const trBadge = trParts.length
     ? `<span class="badge-tr">${escapeHtml(trParts.join(" • "))}</span>`
@@ -176,9 +236,6 @@ function renderCardHtml(it, activeTagSet = new Set(getFilterTags())) {
   const partCount = Number(it.part_count || 1);
   const partsBadge = partCount > 1
     ? `<span class="pill ok pill-compact">${partCount} Parts • Unified Stream</span>`
-    : "";
-  const tagsHtml = it.tags && it.tags.length
-    ? `<div class="tag-row">${it.tags.map((t) => `<span class="tag-chip${activeTagSet.has(t) ? " active" : ""}" data-tag="${escapeHtml(t)}">#${escapeHtml(t)}</span>`).join("")}</div>`
     : "";
   const isSelected = state.selectedIds.has(it.id);
 
@@ -238,7 +295,15 @@ export function renderGallery({ append = false, appendedItems = [] } = {}) {
     mobilePreviewObserver?.disconnect();
 
     if (!items.length) {
-      grid.innerHTML = `<div class="empty">No media yet. Paste a link, drop a file, or send one to your Telegram bot.</div>`;
+      if (state.authRequired && !state.token) {
+        grid.innerHTML = `<div class="empty"><strong>Vault is locked.</strong> Enter your auth token above to browse files and videos.<div class="empty-actions"><button type="button" class="secondary btn-sm focus-auth-btn">Enter Auth Token</button></div></div>`;
+      } else if (lastLoadError) {
+        grid.innerHTML = `<div class="empty"><strong>Could not load media:</strong> ${escapeHtml(lastLoadError)}<div class="empty-actions"><button type="button" class="secondary btn-sm retry-media-btn">Retry</button></div></div>`;
+      } else if (hasActiveFilters()) {
+        grid.innerHTML = `<div class="empty">No items match your current filters.<div class="empty-actions"><button type="button" class="secondary btn-sm reset-filters-btn">Reset Filters</button></div></div>`;
+      } else {
+        grid.innerHTML = `<div class="empty">No media yet. Paste a link, drop a file, or send one to your Telegram bot.</div>`;
+      }
       updateBulkToolbar();
       return;
     }
@@ -280,6 +345,18 @@ export function renderGallery({ append = false, appendedItems = [] } = {}) {
 
 export async function loadMedia({ append = false } = {}) {
   if (append && state.isLoadingMore) return;
+  if (state.authRequired && !state.token) {
+    galleryLoaded = false;
+    lastLoadError = null;
+    if (!append) {
+      state.mediaItems = [];
+      state.mediaTotal = 0;
+      renderGallery({ append: false });
+      emit("media:loaded", { items: [], total: 0, append: false });
+    }
+    return;
+  }
+
   state.isLoadingMore = true;
   const btn = $("loadMoreBtn");
   if (btn) btn.disabled = true;
@@ -296,6 +373,8 @@ export async function loadMedia({ append = false } = {}) {
       offset: String(offset),
     });
     const data = await apiFetch(`/api/media?${params}`);
+    lastLoadError = null;
+    galleryLoaded = true;
     state.mediaTotal = data.total || 0;
     if (append) {
       const seen = new Set(state.mediaItems.map((x) => x.id));
@@ -306,6 +385,15 @@ export async function loadMedia({ append = false } = {}) {
       state.mediaItems = data.items || [];
       renderGallery({ append: false });
     }
+    emit("media:loaded", { items: state.mediaItems, total: state.mediaTotal, append });
+  } catch (err) {
+    galleryLoaded = false;
+    lastLoadError = err?.message || "Request failed";
+    if (!append) {
+      renderGallery({ append: false });
+      emit("media:loaded", { items: state.mediaItems, total: state.mediaTotal, append: false });
+    }
+    throw err;
   } finally {
     state.isLoadingMore = false;
     if (btn) btn.disabled = false;
@@ -434,6 +522,21 @@ export function initGallery() {
   });
 
   grid?.addEventListener("click", (e) => {
+    if (e.target.closest(".focus-auth-btn")) {
+      const input = $("bannerTokenInput") || $("tokenInput");
+      input?.scrollIntoView({ behavior: "smooth", block: "center" });
+      input?.focus();
+      return;
+    }
+    if (e.target.closest(".retry-media-btn")) {
+      emit("system:refresh");
+      return;
+    }
+    if (e.target.closest(".reset-filters-btn")) {
+      resetFilters();
+      return;
+    }
+
     const clickedCard = e.target.closest(".card");
     if (clickedCard && suppressedCardId && clickedCard.dataset.id === suppressedCardId) {
       suppressedCardId = null;
@@ -485,7 +588,11 @@ export function initGallery() {
       return;
     }
 
-    emit("media:open", { id });
+    if (getMode() === "cinema") {
+      emit("cinema:play", { id });
+    } else {
+      emit("media:open", { id });
+    }
   });
 
   on("tags:filter-changed", () => {
@@ -632,6 +739,36 @@ export function initGallery() {
     }
   });
 
+  on("auth:required", () => {
+    galleryLoaded = false;
+    lastLoadError = null;
+    state.mediaItems = [];
+    state.mediaTotal = 0;
+    renderGallery({ append: false });
+  });
+
+  on("cinema:active-changed", ({ id } = {}) => {
+    if (getMode() !== "cinema") return;
+    grid?.querySelectorAll(".cinema-card").forEach((card) => {
+      const active = Boolean(id && card.dataset.id === id);
+      card.classList.toggle("is-playing", active);
+      const thumb = card.querySelector(".cinema-thumb-wrap");
+      if (!thumb) return;
+      const existing = thumb.querySelector(".cinema-playing-pill");
+      if (active && !existing) {
+        thumb.insertAdjacentHTML("beforeend", `<span class="badge-bl cinema-playing-pill">Now Playing</span>`);
+      } else if (!active && existing) {
+        existing.remove();
+      }
+    });
+  });
+
+  on("cinema:load-more", () => {
+    if (!state.isLoadingMore && state.mediaItems.length < state.mediaTotal) {
+      loadMedia({ append: true }).catch(() => {});
+    }
+  });
+
   onModeChange((mode, prevMode) => {
     updateBulkToolbar();
     if (mode !== "files" && mode !== "cinema") {
@@ -647,7 +784,7 @@ export function initGallery() {
       loadMedia().catch((err) => toast(err.message, { type: "error" }));
     } else if (prevMode === "cinema" && mode === "uploader") {
       galleryNeedsReload = true;
-    } else if (mode === "files" && galleryNeedsReload) {
+    } else if (mode === "files" && (galleryNeedsReload || !galleryLoaded)) {
       galleryNeedsReload = false;
       loadMedia().catch((err) => toast(err.message, { type: "error" }));
     }

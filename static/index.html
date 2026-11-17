@@ -49,7 +49,19 @@
     </div>
   </header>
 
+  <div id="cinemaLightsBackdrop" class="cinema-lights-backdrop" hidden></div>
   <main>
+    <section id="authBanner" class="auth-banner" hidden>
+      <div class="auth-banner-copy">
+        <strong>Vault Locked</strong>
+        <span>Enter your auth token to load files, cinema videos, and jobs.</span>
+      </div>
+      <div class="auth-banner-form">
+        <input id="bannerTokenInput" type="password" placeholder="Enter WEB_AUTH_TOKEN..." autocomplete="current-password" />
+        <button id="bannerSaveTokenBtn" type="button">Unlock</button>
+      </div>
+    </section>
+
     <section id="drivesGrid" class="drives-grid mode-uploader-section"></section>
 
     <section class="ingest-panel mode-uploader-section">
@@ -108,6 +120,49 @@
     </section>
 
     <section id="jobsStrip" class="jobs-strip mode-uploader-section"></section>
+
+    <section id="cinemaStage" class="cinema-stage mode-cinema-section" hidden>
+      <div class="cinema-player-shell">
+        <div id="cinemaViewport" class="cinema-video-box">
+          <video id="cinemaVideo" controls playsinline preload="metadata"></video>
+          <div id="cinemaEmptyOverlay" class="cinema-empty-overlay">
+            <div class="cinema-empty-title">Select a video below to start watching</div>
+          </div>
+        </div>
+        <div class="cinema-now-bar">
+          <div class="cinema-now-info">
+            <div id="cinemaTitle" class="cinema-now-title">Cinema Theater</div>
+            <div id="cinemaMeta" class="cinema-now-meta">Ready to play</div>
+          </div>
+          <div class="cinema-controls">
+            <button id="cinemaPrevBtn" type="button" class="secondary btn-sm" title="Previous (P)">&#9198; Prev</button>
+            <button id="cinemaNextBtn" type="button" class="secondary btn-sm" title="Next (N)">Next &#9197;</button>
+            <button id="cinemaAutoNextBtn" type="button" class="secondary btn-sm is-active" aria-pressed="true" title="Auto-play next video">Auto-Next</button>
+            <button id="cinemaLoopBtn" type="button" class="secondary btn-sm" aria-pressed="false" title="Loop current video">Loop</button>
+            <select id="cinemaSpeedSelect" class="cinema-speed-select" aria-label="Playback speed" title="Playback speed">
+              <option value="0.75">0.75x</option>
+              <option value="1" selected>1x</option>
+              <option value="1.25">1.25x</option>
+              <option value="1.5">1.5x</option>
+              <option value="2">2x</option>
+            </select>
+            <button id="cinemaTheaterBtn" type="button" class="secondary btn-sm" aria-pressed="false" title="Lights Off / Theater Mode (T)">Lights Off</button>
+            <button id="cinemaFullscreenBtn" type="button" class="secondary btn-sm" title="Fullscreen (F)">Fullscreen</button>
+            <button id="cinemaDetailsBtn" type="button" class="secondary btn-sm" title="Edit title, folder, tags or download">Details</button>
+          </div>
+        </div>
+      </div>
+      <aside class="cinema-queue-panel" aria-label="Up Next playlist">
+        <div class="cinema-queue-head">
+          <div class="cinema-queue-title">
+            <strong>Up Next</strong>
+            <span id="cinemaQueueCount" class="small-muted">0 videos</span>
+          </div>
+          <button id="cinemaShuffleBtn" type="button" class="secondary btn-xs" aria-pressed="false">Shuffle</button>
+        </div>
+        <div id="cinemaQueueList" class="cinema-queue-list"></div>
+      </aside>
+    </section>
 
     <section class="toolbar mode-files-section mode-cinema-section">
       <div class="toolbar-group">

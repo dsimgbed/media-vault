@@ -5,9 +5,13 @@ import { $ } from "/static/js/utils.js";
 import { toast } from "/static/js/ui/dialogs.js";
 
 function syncAuthBoxes() {
-  const show = state.authRequired && !state.token;
+  const locked = Boolean(state.authRequired && !state.token);
   const authBox = $("authBox");
-  if (authBox) authBox.style.display = show ? "flex" : "none";
+  if (authBox) authBox.style.display = locked ? "flex" : "none";
+  const banner = $("authBanner");
+  if (banner) banner.hidden = !locked;
+  const mobileBtn = $("mobileSettingsBtn");
+  if (mobileBtn) mobileBtn.classList.toggle("is-locked", locked);
 }
 
 export async function loadHealth() {
@@ -64,10 +68,14 @@ export async function loadHealth() {
 async function handleSaveToken(inputEl) {
   const nextToken = (inputEl?.value || "").trim();
   state.token = nextToken;
-  localStorage.setItem("vault_token", state.token);
-  if ($("tokenInput")) $("tokenInput").value = state.token;
-  if ($("sheetTokenInput")) $("sheetTokenInput").value = state.token;
-  if ($("authBox")) $("authBox").style.display = "none";
+  try {
+    localStorage.setItem("vault_token", state.token);
+  } catch (_) {}
+  for (const id of ["tokenInput", "sheetTokenInput", "bannerTokenInput"]) {
+    const el = $(id);
+    if (el) el.value = state.token;
+  }
+  syncAuthBoxes();
   const sheet = $("systemSheet");
   if (sheet?.open) sheet.close();
   emit("auth:unlocked");
@@ -102,12 +110,20 @@ async function handleUpdateYtdlp() {
 }
 
 export function initSystem() {
-  if ($("sheetTokenInput") && state.token) {
-    $("sheetTokenInput").value = state.token;
+  for (const id of ["tokenInput", "sheetTokenInput", "bannerTokenInput"]) {
+    const el = $(id);
+    if (el && state.token) el.value = state.token;
+    el?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        handleSaveToken(el);
+      }
+    });
   }
 
   $("saveTokenBtn")?.addEventListener("click", () => handleSaveToken($("tokenInput")));
   $("sheetSaveTokenBtn")?.addEventListener("click", () => handleSaveToken($("sheetTokenInput")));
+  $("bannerSaveTokenBtn")?.addEventListener("click", () => handleSaveToken($("bannerTokenInput")));
 
   $("refreshBtn")?.addEventListener("click", () => emit("system:refresh"));
   $("sheetRefreshBtn")?.addEventListener("click", () => {

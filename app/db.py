@@ -810,7 +810,7 @@ class Database:
             base_where.append("drive_name = ?")
             base_params.append(drive_name)
         if folder and folder != "all":
-            base_where.append("folder = ?")
+            base_where.append("LOWER(folder) = LOWER(?)")
             base_params.append(folder)
         if tag and tag != "all":
             clean_tags = normalize_tags(tag)
@@ -868,15 +868,36 @@ class Database:
 
     def list_folders(self) -> list[str]:
         with self._connect() as conn:
-            rows = conn.execute(
+            media_rows = conn.execute(
                 """
-                SELECT DISTINCT folder FROM media_items
-                UNION
-                SELECT DISTINCT folder_name AS folder FROM folder_topics
-                ORDER BY folder ASC
+                SELECT folder, COUNT(*) AS cnt
+                FROM media_items
+                WHERE folder IS NOT NULL AND folder != ''
+                GROUP BY folder
+                ORDER BY cnt DESC, folder ASC
                 """
             ).fetchall()
-            return [r["folder"] for r in rows if r["folder"]]
+            topic_rows = conn.execute(
+                """
+                SELECT DISTINCT folder_name AS folder
+                FROM folder_topics
+                WHERE folder_name IS NOT NULL AND folder_name != ''
+                ORDER BY folder_name ASC
+                """
+            ).fetchall()
+
+            deduped: dict[str, str] = {}
+            for row in media_rows:
+                name = str(row["folder"])
+                key = name.casefold()
+                if key not in deduped:
+                    deduped[key] = name
+            for row in topic_rows:
+                name = str(row["folder"])
+                key = name.casefold()
+                if key not in deduped:
+                    deduped[key] = name
+            return sorted(deduped.values(), key=str.casefold)
 
     def list_tags(self) -> list[str]:
         with self._connect() as conn:

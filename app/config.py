@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     telegram_stream_chunk_kb: int = 512
     telegram_stream_cache_mb: int = 64
     telegram_upload_concurrency: int = 4
+    telegram_compress_photos: bool = False
 
     ytdlp_cookies_file: Path = Path("./data/cookies.txt")
     ytdlp_proxy: str = ""

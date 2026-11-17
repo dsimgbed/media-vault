@@ -28,6 +28,63 @@
     gap: 14px;
   }
 
+  .auth-banner {
+    padding: 12px;
+  }
+
+  .auth-banner-form {
+    max-width: none;
+    width: 100%;
+  }
+
+  .toolbar {
+    align-items: stretch;
+  }
+
+  .toolbar > .toolbar-group {
+    width: 100%;
+  }
+
+  #searchInput {
+    width: 100%;
+    flex: 1 1 100%;
+  }
+
+  #typeFilter,
+  #folderFilter,
+  #driveFilter,
+  #sortSelect {
+    flex: 1 1 calc(50% - 4px);
+    min-width: 0;
+  }
+
+  .cinema-stage {
+    grid-template-columns: 1fr;
+    padding: 10px;
+    gap: 12px;
+    border-radius: 12px;
+  }
+
+  .cinema-now-title {
+    font-size: 0.96rem;
+    white-space: normal;
+  }
+
+  .cinema-controls {
+    width: 100%;
+  }
+
+  .cinema-controls button,
+  .cinema-speed-select {
+    min-height: 36px;
+    padding: 6px 10px;
+    font-size: 0.78rem;
+  }
+
+  .cinema-queue-panel {
+    max-height: 250px;
+  }
+
   button,
   select,
   input[type="text"],

@@ -328,7 +328,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/folders", dependencies=[Depends(require_auth)])
     async def list_folders():
         folders = db.list_folders()
-        if cfg.default_folder not in folders:
+        if not any(f.casefold() == cfg.default_folder.casefold() for f in folders):
             folders.insert(0, cfg.default_folder)
         return {"folders": folders, "default_folder": cfg.default_folder}
 
