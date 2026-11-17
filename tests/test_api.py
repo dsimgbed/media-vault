@@ -3409,3 +3409,162 @@ def test_module1_multi_tag_filtering_and_tag_picker_ui(tmp_path: Path):
         res_combined = client.get("/api/media?tag=soap&tags=4k").json()
         assert [it["id"] for it in res_combined["items"]] == ["m2"]
 
+
+def test_long_comic_image_forces_document_and_photo_dimension_fallback(tmp_path: Path, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from telethon.errors import PhotoInvalidDimensionsError
+    from telethon.tl import types as tg_types
+    from app.config import TelegramApiConfig
+    from app.telegram_mtproto import TelegramPool, _should_force_document_for_image
+
+    # 1) Proactive image check distinguishes normal photos from long comics / oversized images
+    normal_img = tmp_path / "normal.jpg"
+    Image.new("RGB", (640, 360), (20, 40, 80)).save(normal_img, "JPEG")
+    long_comic = tmp_path / "long_comic.jpeg"
+    Image.new("RGB", (800, 25000), (200, 120, 60)).save(long_comic, "JPEG")
+    wide_strip = tmp_path / "wide_strip.png"
+    Image.new("RGB", (12000, 800), (60, 180, 90)).save(wide_strip, "PNG")
+    oversized_sq = tmp_path / "oversized.jpg"
+    Image.new("RGB", (5000, 5000), (90, 90, 90)).save(oversized_sq, "JPEG")
+    fake_vid = tmp_path / "clip.mp4"
+    fake_vid.write_bytes(b"mp4")
+
+    assert _should_force_document_for_image(normal_img, "image") is False
+    assert _should_force_document_for_image(long_comic, "image") is True
+    assert _should_force_document_for_image(wide_strip, "image") is True
+    assert _should_force_document_for_image(oversized_sq, "image") is True
+    assert _should_force_document_for_image(fake_vid, "video") is False
+
+    # 2) Long comic is sent proactively with force_document=True on the first attempt
+    settings = _make_settings(tmp_path, storage_mode="telegram")
+    settings.telegram_archive_chat_id = "-100999111"
+    app = create_app(settings)
+    pool: TelegramPool = app.state.tg_pool
+
+    class PhotoAwareWorker:
+        def __init__(self, name: str, *, reject_photo_mode: bool = False) -> None:
+            self.name = name
+            self.reject_photo_mode = reject_photo_mode
+            self.calls: list[dict] = []
+
+        async def get_input_entity(self, target):
+            return target
+
+        async def send_file(self, peer, file_arg, **kwargs):
+            self.calls.append({"file": file_arg, "kwargs": dict(kwargs)})
+            if self.reject_photo_mode and not kwargs.get("force_document"):
+                raise PhotoInvalidDimensionsError(request=None)
+            return SimpleNamespace(id=900 + len(self.calls))
+
+        async def disconnect(self):
+            return None
+
+    w_comic = PhotoAwareWorker("bot1", reject_photo_mode=True)
+    pool.clients = [(TelegramApiConfig(name="bot1", api_id=1, api_hash="h", bot_token="t1"), w_comic)]
+
+    comic_res = asyncio.run(
+        pool.mirror_to_archive_topic(
+            {
+                "media_id": "comic1",
+                "title": "long_comic",
+                "filename": long_comic.name,
+                "folder": "General",
+                "tags": [],
+                "media_type": "image",
+                "size_bytes": long_comic.stat().st_size,
+                "local_path": long_comic,
+                "source_url": "https://example.com/images/701/comic.jpeg?123",
+            }
+        )
+    )
+    assert comic_res is not None
+    assert comic_res["message_id"] == 901
+    assert len(w_comic.calls) == 1
+    assert w_comic.calls[0]["kwargs"].get("force_document") is True
+
+    # 3) Even if an image passes proactive bounds, PhotoInvalidDimensionsError triggers same-worker force_document=True retry
+    w_fallback = PhotoAwareWorker("bot1", reject_photo_mode=True)
+    w_unused = PhotoAwareWorker("bot2", reject_photo_mode=True)
+    pool.clients = [
+        (TelegramApiConfig(name="bot1", api_id=1, api_hash="h", bot_token="t1"), w_fallback),
+        (TelegramApiConfig(name="bot2", api_id=2, api_hash="h", bot_token="t2"), w_unused),
+    ]
+    pool._rr_index = 0
+
+    fb_res = asyncio.run(
+        pool.mirror_to_archive_topic(
+            {
+                "media_id": "norm1",
+                "title": "normal",
+                "filename": normal_img.name,
+                "folder": "General",
+                "tags": [],
+                "media_type": "image",
+                "size_bytes": normal_img.stat().st_size,
+                "local_path": normal_img,
+                "source_url": "https://example.com/normal.jpg",
+            }
+        )
+    )
+    assert fb_res is not None
+    assert fb_res["worker_name"] == "bot1"
+    assert len(w_fallback.calls) == 2
+    assert w_fallback.calls[0]["kwargs"].get("force_document") is None
+    assert w_fallback.calls[1]["kwargs"].get("force_document") is True
+    assert len(w_unused.calls) == 0
+
+    # 4) Streaming a Telegram MessageMediaPhoto uses Telegram's actual recompressed size for Content-Length
+    recompressed_bytes = b"recompressed-jpeg-payload"
+    tg_photo_media = tg_types.MessageMediaPhoto(
+        photo=tg_types.Photo(
+            id=1,
+            access_hash=2,
+            file_reference=b"",
+            date=0,
+            dc_id=1,
+            sizes=[
+                tg_types.PhotoSizeProgressive(
+                    type="y",
+                    w=640,
+                    h=360,
+                    sizes=[10, len(recompressed_bytes)],
+                )
+            ],
+        )
+    )
+    app.state.db.insert_media(
+        media_id="tgphoto1",
+        title="Photo",
+        filename="photo.jpg",
+        folder="General",
+        media_type="image",
+        mime_type="image/jpeg",
+        size_bytes=50000,  # pre-upload disk size > recompressed Telegram size
+        drive_name="telegram",
+        file_path="",
+        thumb_filename=None,
+        source_origin="web",
+        source_kind="url",
+        source_url="https://example.com/photo.jpg",
+        telegram_chat_id="-100999111",
+        telegram_topic_id=1,
+        telegram_msg_id=42,
+        telegram_worker_name="bot1",
+    )
+
+    async def fake_prepare_stream(chat_id: str, msg_id: int, worker_name: str | None = None):
+        return object(), tg_photo_media
+
+    async def fake_iter_range(_client, _media, start: int, end: int):
+        yield recompressed_bytes[start : end + 1]
+
+    monkeypatch.setattr(pool, "prepare_stream", fake_prepare_stream)
+    monkeypatch.setattr(pool, "iter_telegram_range", fake_iter_range)
+
+    with TestClient(app) as client:
+        stream_res = client.get("/api/media/tgphoto1/stream")
+        assert stream_res.status_code == 200
+        assert int(stream_res.headers["content-length"]) == len(recompressed_bytes)
+        assert stream_res.content == recompressed_bytes
+

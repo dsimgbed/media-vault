@@ -19,17 +19,24 @@ from typing import Any
 import httpx
 from telethon import TelegramClient, events
 from telethon.errors import (
+    ChatSendPhotosForbiddenError,
     EntityBoundsInvalidError,
     FloodWaitError,
+    ImageProcessFailedError,
     MediaCaptionTooLongError,
     MessageTooLongError,
+    PhotoContentTypeInvalidError,
+    PhotoCropSizeSmallError,
+    PhotoExtInvalidError,
+    PhotoInvalidDimensionsError,
+    PhotoSaveFileInvalidError,
     RPCError,
 )
 
 from app.allocator import DriveAllocator, fmt_size, sanitize_folder
 from app.config import Settings, TelegramApiConfig
 from app.db import Database, normalize_tags
-from app.ingest import IngestService, classify_media
+from app.ingest import IMAGE_EXTS, IngestService, classify_media
 from app.thumbnails import generate_thumbnail
 
 logger = logging.getLogger(__name__)
@@ -45,6 +52,71 @@ TELEGRAM_NON_RETRYABLE_CAPTION_ERRORS = (
     MessageTooLongError,
     EntityBoundsInvalidError,
 )
+TELEGRAM_PHOTO_FALLBACK_ERRORS = (
+    PhotoInvalidDimensionsError,
+    ImageProcessFailedError,
+    PhotoExtInvalidError,
+    PhotoContentTypeInvalidError,
+    PhotoSaveFileInvalidError,
+    PhotoCropSizeSmallError,
+    ChatSendPhotosForbiddenError,
+)
+TELEGRAM_PHOTO_MAX_BYTES = 10 * 1024 * 1024
+TELEGRAM_PHOTO_MAX_DIM_SUM = 10000
+TELEGRAM_PHOTO_MAX_SINGLE_DIM = 4096
+TELEGRAM_PHOTO_MAX_ASPECT_RATIO = 5.0
+
+
+def _is_photo_fallback_error(exc: Exception) -> bool:
+    if isinstance(exc, TELEGRAM_PHOTO_FALLBACK_ERRORS):
+        return True
+    if isinstance(exc, RPCError):
+        upper = str(exc).upper()
+        return any(
+            token in upper
+            for token in (
+                "PHOTO_INVALID_DIMENSIONS",
+                "PHOTO DIMENSIONS ARE INVALID",
+                "IMAGE_PROCESS_FAILED",
+                "PHOTO_EXT_INVALID",
+                "PHOTO_CONTENT_TYPE_INVALID",
+                "PHOTO_SAVE_FILE_INVALID",
+                "PHOTO_CROP_SIZE_SMALL",
+                "CHAT_SEND_PHOTOS_FORBIDDEN",
+            )
+        )
+    return False
+
+
+def _should_force_document_for_image(local_path: Path, media_type: str | None = None) -> bool:
+    is_img = (media_type == "image") or (local_path.suffix.lower() in IMAGE_EXTS)
+    if not is_img or not local_path.is_file():
+        return False
+    try:
+        file_size = local_path.stat().st_size
+    except OSError:
+        return False
+    if file_size > TELEGRAM_PHOTO_MAX_BYTES:
+        return True
+    try:
+        from PIL import Image
+
+        with Image.open(local_path) as img:
+            w, h = img.size
+            if getattr(img, "is_animated", False) or getattr(img, "n_frames", 1) > 1:
+                return True
+    except Exception:
+        return True
+
+    if w <= 0 or h <= 0:
+        return True
+    if w > TELEGRAM_PHOTO_MAX_SINGLE_DIM or h > TELEGRAM_PHOTO_MAX_SINGLE_DIM:
+        return True
+    if (w + h) > TELEGRAM_PHOTO_MAX_DIM_SUM:
+        return True
+    if max(w / h, h / w) > TELEGRAM_PHOTO_MAX_ASPECT_RATIO:
+        return True
+    return False
 
 
 def _utf16_len(text: str) -> int:
@@ -637,7 +709,15 @@ class TelegramPool:
                     if not use_zero_copy_media:
                         await _ensure_local_file()
 
-                    async def _send_with_topic(tid: int | None, send_caption: str = caption):
+                    force_document = False
+                    if not use_zero_copy_media:
+                        force_document = await asyncio.to_thread(
+                            _should_force_document_for_image,
+                            Path(payload["local_path"]),
+                            payload.get("media_type"),
+                        )
+
+                    async def _do_send(tid: int | None, send_caption: str, *, force_doc: bool):
                         if use_zero_copy_media:
                             return await client.send_file(
                                 peer,
@@ -646,14 +726,48 @@ class TelegramPool:
                                 reply_to=tid,
                                 supports_streaming=True,
                             )
+                        send_kwargs: dict[str, Any] = {
+                            "caption": send_caption,
+                            "reply_to": tid,
+                            "progress_callback": _tg_upload_progress if progress_cb else None,
+                        }
+                        if force_doc:
+                            send_kwargs["force_document"] = True
+                        else:
+                            send_kwargs["supports_streaming"] = True
                         return await client.send_file(
                             peer,
                             str(payload["local_path"]),
-                            caption=send_caption,
-                            reply_to=tid,
-                            supports_streaming=True,
-                            progress_callback=_tg_upload_progress if progress_cb else None,
+                            **send_kwargs,
                         )
+
+                    async def _send_with_topic(tid: int | None, send_caption: str = caption):
+                        nonlocal use_zero_copy_media, force_document
+                        try:
+                            return await _do_send(tid, send_caption, force_doc=force_document)
+                        except RPCError as photo_err:
+                            if not _is_photo_fallback_error(photo_err):
+                                raise
+                            if use_zero_copy_media:
+                                logger.warning(
+                                    "Zero-copy photo send rejected on worker '%s' (%s); falling back to document upload.",
+                                    cfg.name,
+                                    photo_err,
+                                )
+                                await _ensure_local_file()
+                                use_zero_copy_media = False
+                                force_document = True
+                                return await _do_send(tid, send_caption, force_doc=True)
+                            if not force_document:
+                                logger.warning(
+                                    "Telegram rejected photo '%s' on worker '%s' (%s); retrying as document.",
+                                    payload["filename"],
+                                    cfg.name,
+                                    photo_err,
+                                )
+                                force_document = True
+                                return await _do_send(tid, send_caption, force_doc=True)
+                            raise
 
                     try:
                         sent = await _send_with_topic(topic_id, caption)
@@ -682,6 +796,11 @@ class TelegramPool:
                             )
                             await _ensure_local_file()
                             use_zero_copy_media = False
+                            force_document = await asyncio.to_thread(
+                                _should_force_document_for_image,
+                                Path(payload["local_path"]),
+                                payload.get("media_type"),
+                            )
                             sent = await _send_with_topic(topic_id, caption)
                         else:
                             raise

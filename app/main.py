@@ -234,6 +234,30 @@ def _sanitize_archive_relpath(raw_rel: str, fallback_name: str) -> str:
     return "/".join(parts)
 
 
+def _telegram_media_actual_size(tg_media: Any) -> int | None:
+    if tg_media is None:
+        return None
+    try:
+        from telethon import utils as tg_utils
+        from telethon.tl import types as tg_types
+
+        if isinstance(
+            tg_media,
+            (
+                tg_types.MessageMediaPhoto,
+                tg_types.Photo,
+                tg_types.MessageMediaDocument,
+                tg_types.Document,
+            ),
+        ):
+            info = tg_utils._get_file_info(tg_media)
+            if info.size and int(info.size) > 0:
+                return int(info.size)
+    except Exception:
+        pass
+    return None
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     cfg = settings or Settings()
     cfg.ensure_dirs()
@@ -768,7 +792,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "kind": "telegram",
                 "client": tg_client,
                 "media": tg_media,
-                "size": int(item["size_bytes"]),
+                "size": _telegram_media_actual_size(tg_media) or int(item["size_bytes"]),
             }
 
         raise HTTPException(status_code=404, detail="File missing on drive (drive may be unmounted)")
@@ -1475,7 +1499,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise HTTPException(status_code=404, detail=str(exc))
             except Exception as exc:
                 raise HTTPException(status_code=502, detail=f"Telegram stream error: {exc}")
-            file_size = int(item["size_bytes"])
+            file_size = _telegram_media_actual_size(tg_media) or int(item["size_bytes"])
         else:
             raise HTTPException(status_code=404, detail="File missing on drive (drive may be unmounted)")
 
