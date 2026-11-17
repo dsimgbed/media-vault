@@ -78,7 +78,7 @@
       gap: 12px;
     }
     .url-row { display: flex; gap: 10px; flex-wrap: wrap; }
-    input[type="text"], input[type="password"], select {
+    input[type="text"], input[type="password"], select, textarea {
       background: var(--bg);
       color: var(--text);
       border: 1px solid var(--border);
@@ -86,9 +86,11 @@
       padding: 10px 12px;
       font-size: 0.95rem;
       outline: none;
+      font-family: inherit;
     }
-    input[type="text"]:focus, input[type="password"]:focus, select:focus { border-color: var(--accent); }
-    .url-row input { flex: 1; min-width: 220px; }
+    input[type="text"]:focus, input[type="password"]:focus, select:focus, textarea:focus { border-color: var(--accent); }
+    .url-row input, .url-row textarea { flex: 1; min-width: 220px; }
+    .url-row textarea { resize: vertical; line-height: 1.4; min-height: 40px; max-height: 140px; }
     button {
       background: var(--accent);
       color: white;
@@ -137,6 +139,7 @@
     }
     .bar-done > div { background: var(--ok); }
     .bar-failed > div { background: var(--err); }
+    .bar-cancelled > div { background: var(--muted); }
     .format-list {
       max-height: 55vh;
       overflow-y: auto;
@@ -157,6 +160,7 @@
     .status-tag { font-weight: 600; text-transform: uppercase; font-size: 0.72rem; }
     .status-done { color: var(--ok); }
     .status-failed { color: var(--err); }
+    .status-cancelled { color: var(--muted); }
     .status-downloading, .status-allocating, .status-queued { color: var(--warn); }
 
     .toolbar {
@@ -397,14 +401,24 @@
           <input id="tagsInput" type="text" list="tagList" placeholder="#soap, #hd..." style="width:180px;padding:7px 10px;font-size:0.88rem;" />
           <datalist id="tagList"></datalist>
         </div>
-        <label id="tgForwardLabel" style="display:none;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted);cursor:pointer;">
-          <input id="tgForwardCheck" type="checkbox" checked />
-          Forward to Telegram Topic
-        </label>
+        <div class="toolbar-group" style="gap:14px;">
+          <label style="display:inline-flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted);cursor:pointer;">
+            <input id="expandPlaylistCheck" type="checkbox" />
+            Expand Playlist
+          </label>
+          <label style="display:inline-flex;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted);cursor:pointer;">
+            <input id="forceIngestCheck" type="checkbox" />
+            Force re-ingest
+          </label>
+          <label id="tgForwardLabel" style="display:none;align-items:center;gap:6px;font-size:0.85rem;color:var(--muted);cursor:pointer;">
+            <input id="tgForwardCheck" type="checkbox" checked />
+            Forward to Telegram Topic
+          </label>
+        </div>
       </div>
 
       <form id="urlForm" class="url-row">
-        <input id="urlInput" type="text" placeholder="Paste any video link (yt-dlp) or direct download URL..." required />
+        <textarea id="urlInput" rows="1" placeholder="Paste one or more URLs (one per line) — yt-dlp, playlists, or direct links..." required></textarea>
         <select id="formatSelect" title="Download quality / format" style="max-width:175px;">
           <option value="best">Format: Best MP4</option>
           <option value="1080p">1080p MP4</option>
@@ -786,25 +800,67 @@
       const strip = $("jobsStrip");
       const active = jobs.filter(j => ["queued", "downloading", "allocating"].includes(j.status));
       const doneCount = jobs.filter(j => j.status === "done").length;
-      const shown = jobs.slice(0, 5);
+      const shown = jobs.slice(0, 8);
       strip.innerHTML = shown.map(j => {
-        const pct = Math.max(0, Math.min(100, Math.round(j.progress || (j.status === "done" ? 100 : 0))));
-        const barCls = j.status === "done" ? "bar bar-done" : (j.status === "failed" ? "bar bar-failed" : "bar");
+        const isDone = j.status === "done";
+        const isFailed = j.status === "failed";
+        const isCancelled = j.status === "cancelled";
+        const isActive = ["queued", "downloading", "allocating"].includes(j.status);
+        const pct = Math.max(0, Math.min(100, Math.round(j.progress || (isDone ? 100 : 0))));
+        const barCls = isDone
+          ? "bar bar-done"
+          : (isFailed ? "bar bar-failed" : (isCancelled ? "bar bar-cancelled" : "bar"));
+        const actionBtn = isActive
+          ? `<button type="button" class="danger job-cancel-btn" data-id="${escapeHtml(j.id)}" style="padding:3px 9px;font-size:0.75rem;margin-left:8px;">Cancel</button>`
+          : ((isFailed || isCancelled)
+            ? `<button type="button" class="secondary job-retry-btn" data-id="${escapeHtml(j.id)}" style="padding:3px 9px;font-size:0.75rem;margin-left:8px;">Retry</button>`
+            : "");
         return `
           <div class="job-item">
             <div class="job-head">
-              <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:65%;">
+              <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:58%;">
                 <strong>[${escapeHtml(j.source_origin)}]</strong> ${escapeHtml(j.source_ref)}
               </span>
-              <span>
-                <span class="status-tag status-${escapeHtml(j.status)}">${escapeHtml(j.status)}${j.status !== "done" && j.status !== "failed" ? ` (${pct}%)` : ""}</span>
-                <span style="color:var(--muted);margin-left:8px;">${escapeHtml(j.message || "")}</span>
+              <span style="display:inline-flex;align-items:center;flex-wrap:wrap;gap:4px;">
+                <span class="status-tag status-${escapeHtml(j.status)}">${escapeHtml(j.status)}${(!isDone && !isFailed && !isCancelled) ? ` (${pct}%)` : ""}</span>
+                <span style="color:var(--muted);margin-left:6px;">${escapeHtml(j.message || "")}</span>
+                ${actionBtn}
               </span>
             </div>
             <div class="${barCls}"><div style="width:${pct}%"></div></div>
           </div>
         `;
       }).join("");
+
+      strip.querySelectorAll(".job-cancel-btn").forEach(btn => {
+        btn.addEventListener("click", async () => {
+          btn.disabled = true;
+          try {
+            await apiFetch(`/api/jobs/${encodeURIComponent(btn.dataset.id)}/cancel`, { method: "POST" });
+            await loadJobs();
+          } catch (err) {
+            alert(err.message);
+            btn.disabled = false;
+          }
+        });
+      });
+
+      strip.querySelectorAll(".job-retry-btn").forEach(btn => {
+        btn.addEventListener("click", async () => {
+          btn.disabled = true;
+          try {
+            await apiFetch(`/api/jobs/${encodeURIComponent(btn.dataset.id)}/retry`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ force: shouldForceIngest() }),
+            });
+            await loadJobs();
+          } catch (err) {
+            alert(err.message);
+            btn.disabled = false;
+          }
+        });
+      });
 
       const newlyFinished =
         (state.hadActiveJobs && active.length === 0) ||
@@ -1229,6 +1285,14 @@
       return $("tgForwardCheck").checked;
     }
 
+    function shouldForceIngest() {
+      return Boolean($("forceIngestCheck") && $("forceIngestCheck").checked);
+    }
+
+    function shouldExpandPlaylist() {
+      return Boolean($("expandPlaylistCheck") && $("expandPlaylistCheck").checked);
+    }
+
     function uploadFile(file) {
       return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
@@ -1237,6 +1301,7 @@
         form.append("folder", selectedFolder());
         if (selectedTags()) form.append("tags", selectedTags());
         form.append("forward_to_telegram", shouldForwardToTelegram() ? "true" : "false");
+        form.append("force", shouldForceIngest() ? "true" : "false");
         xhr.open("POST", "/api/ingest/upload");
         if (state.token) xhr.setRequestHeader("Authorization", `Bearer ${state.token}`);
 
@@ -1265,6 +1330,7 @@
         form.append("folder", selectedFolder());
         if (selectedTags()) form.append("tags", selectedTags());
         form.append("forward_to_telegram", shouldForwardToTelegram() ? "true" : "false");
+        form.append("force", shouldForceIngest() ? "true" : "false");
         for (const entry of fileEntries) {
           form.append("files", entry.file);
           form.append("relative_paths", entry.relativePath || entry.file.name);
@@ -1350,11 +1416,27 @@
           tags: selectedTags(),
           forward_to_telegram: shouldForwardToTelegram(),
           format_spec: formatSpec || $("formatSelect").value || "best",
+          expand_playlist: shouldExpandPlaylist(),
+          force: shouldForceIngest(),
         }),
       });
       $("urlInput").value = "";
+      $("urlInput").rows = 1;
       await loadJobs();
     }
+
+    $("urlInput").addEventListener("input", () => {
+      const el = $("urlInput");
+      const lines = el.value.split(/\r?\n/).length;
+      el.rows = Math.max(1, Math.min(4, lines));
+    });
+
+    $("urlInput").addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey && !$("urlInput").value.includes("\n")) {
+        e.preventDefault();
+        $("urlForm").requestSubmit();
+      }
+    });
 
     $("urlForm").addEventListener("submit", async (e) => {
       e.preventDefault();
@@ -1369,7 +1451,7 @@
     });
 
     $("inspectFormatsBtn").addEventListener("click", async () => {
-      const url = $("urlInput").value.trim();
+      const url = $("urlInput").value.split(/\r?\n/).map(s => s.trim()).find(Boolean) || "";
       if (!url) {
         alert("Paste a video URL first to inspect formats.");
         return;

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import logging
+import re
 import shutil
 import struct
 import tempfile
@@ -16,7 +18,7 @@ from importlib.metadata import PackageNotFoundError, version as pkg_version
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -27,6 +29,8 @@ from app.db import Database, normalize_tags
 from app.ingest import (
     IngestService,
     classify_media,
+    expand_ytdlp_playlist,
+    is_direct_download,
     list_ytdlp_formats,
     resolve_format_spec,
     update_ytdlp,
@@ -43,12 +47,31 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 
 class UrlIngestRequest(BaseModel):
-    url: str
+    url: str = ""
+    urls: list[str] | None = None
     folder: str | None = None
     tags: list[str] | str | None = None
     title: str | None = None
     forward_to_telegram: bool = True
     format_spec: str | None = None
+    expand_playlist: bool = False
+    use_playlist_folder: bool = True
+    max_playlist_items: int = 50
+    force: bool = False
+
+
+class PlaylistRequest(BaseModel):
+    url: str
+    max_items: int = 50
+
+
+class CheckDuplicateRequest(BaseModel):
+    url: str | None = None
+    sha256: str | None = None
+
+
+class RetryJobRequest(BaseModel):
+    force: bool = False
 
 
 class UpdateMediaTagsRequest(BaseModel):
@@ -286,6 +309,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Job not found")
         return job
 
+    @app.post("/api/jobs/{job_id}/cancel", dependencies=[Depends(require_auth)])
+    async def cancel_job(job_id: str):
+        try:
+            return await ingest.cancel_job(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+
+    @app.post("/api/jobs/{job_id}/retry", status_code=202, dependencies=[Depends(require_auth)])
+    async def retry_job(
+        job_id: str,
+        force: bool = Query(default=False),
+        payload: RetryJobRequest | None = Body(default=None),
+    ):
+        effective_force = bool(force or (payload.force if payload else False))
+        try:
+            return await ingest.retry_job(job_id, force=effective_force)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+
     @app.get("/api/events", dependencies=[Depends(require_auth)])
     async def stream_events(request: Request):
         async def event_stream():
@@ -349,6 +395,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
+    @app.post("/api/ytdlp/playlist", dependencies=[Depends(require_auth)])
+    async def inspect_ytdlp_playlist(payload: PlaylistRequest):
+        url = payload.url.strip()
+        if not url.startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
+        try:
+            return await expand_ytdlp_playlist(
+                url,
+                cookies_file=cfg.ytdlp_cookies_file,
+                proxy=cfg.ytdlp_proxy,
+                max_items=max(1, min(500, int(payload.max_items))),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
     @app.post("/api/ytdlp/cookies", dependencies=[Depends(require_auth)])
     async def save_ytdlp_cookies(payload: CookiesRequest):
         raw = payload.cookies_text.replace("\r\n", "\n").strip()
@@ -373,31 +434,108 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             cfg.ytdlp_cookies_file.unlink(missing_ok=True)
         return {"deleted": True, "ytdlp_cookies_configured": False}
 
+    @app.post("/api/ingest/check-duplicate", dependencies=[Depends(require_auth)])
+    async def check_duplicate(payload: CheckDuplicateRequest):
+        existing: dict[str, Any] | None = None
+        if payload.sha256:
+            existing = db.find_media_by_sha256(payload.sha256)
+        if not existing and payload.url:
+            existing = db.find_media_by_source_url(payload.url)
+        return {"duplicate": existing is not None, "item": existing}
+
     @app.post("/api/ingest/url", status_code=202, dependencies=[Depends(require_auth)])
     async def ingest_url(payload: UrlIngestRequest):
-        url = payload.url.strip()
-        if not url.startswith(("http://", "https://")):
+        raw_urls: list[str] = []
+        if payload.urls:
+            for item in payload.urls:
+                for line in re.split(r"\r?\n", str(item)):
+                    s = line.strip()
+                    if s and not s.startswith("#"):
+                        raw_urls.append(s)
+        if payload.url:
+            for line in re.split(r"\r?\n", payload.url):
+                s = line.strip()
+                if s and not s.startswith("#"):
+                    raw_urls.append(s)
+
+        if not raw_urls:
             raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
+        for u in raw_urls:
+            if not u.startswith(("http://", "https://")):
+                raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
+
         try:
             resolve_format_spec(payload.format_spec)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
 
-        job_id = db.create_job("web", "url", url)
-        ingest.submit_job(
-            job_id,
-            ingest.process_url_job(
+        base_folder = payload.folder
+        queue_items: list[tuple[str, str | None, str | None]] = []
+        for u in raw_urls:
+            if payload.expand_playlist and not await is_direct_download(u):
+                try:
+                    pl_info = await expand_ytdlp_playlist(
+                        u,
+                        cookies_file=cfg.ytdlp_cookies_file,
+                        proxy=cfg.ytdlp_proxy,
+                        max_items=max(1, min(500, int(payload.max_playlist_items))),
+                    )
+                except Exception as exc:
+                    raise HTTPException(status_code=400, detail=str(exc))
+                if pl_info.get("is_playlist") and pl_info.get("entries"):
+                    pl_title = (pl_info.get("playlist_title") or "").strip()
+                    entry_folder = base_folder
+                    if payload.use_playlist_folder and pl_title:
+                        clean_base = (base_folder or "").strip()
+                        if (
+                            not clean_base
+                            or sanitize_folder(clean_base, cfg.default_folder) == cfg.default_folder
+                        ):
+                            entry_folder = sanitize_folder(pl_title, cfg.default_folder)
+                        else:
+                            entry_folder = sanitize_folder(
+                                f"{clean_base}/{pl_title}", cfg.default_folder
+                            )
+                    for entry in pl_info["entries"]:
+                        queue_items.append((entry["url"], entry.get("title"), entry_folder))
+                    continue
+            queue_items.append((u, payload.title if len(raw_urls) == 1 else None, base_folder))
+
+        job_ids: list[str] = []
+        for target_url, target_title, target_folder in queue_items:
+            job_params = {
+                "url": target_url,
+                "folder": target_folder,
+                "tags": payload.tags,
+                "title": target_title,
+                "forward_to_telegram": payload.forward_to_telegram,
+                "format_spec": payload.format_spec,
+                "force": payload.force,
+                "source_origin": "web",
+            }
+            job_id = db.create_job("web", "url", target_url, params=job_params)
+            ingest.submit_job(
                 job_id,
-                url,
-                source_origin="web",
-                folder=payload.folder,
-                tags=payload.tags,
-                title=payload.title,
-                forward_to_telegram=payload.forward_to_telegram,
-                format_spec=payload.format_spec,
-            ),
-        )
-        return {"job_id": job_id, "status": "queued"}
+                ingest.process_url_job(
+                    job_id,
+                    target_url,
+                    source_origin="web",
+                    folder=target_folder,
+                    tags=payload.tags,
+                    title=target_title,
+                    forward_to_telegram=payload.forward_to_telegram,
+                    format_spec=payload.format_spec,
+                    force=payload.force,
+                ),
+            )
+            job_ids.append(job_id)
+
+        return {
+            "job_id": job_ids[0],
+            "job_ids": job_ids,
+            "count": len(job_ids),
+            "status": "queued",
+        }
 
     @app.post("/api/ingest/upload", status_code=202, dependencies=[Depends(require_auth)])
     async def ingest_upload(
@@ -406,12 +544,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         folder: str | None = Form(default=None),
         tags: str | None = Form(default=None),
         forward_to_telegram: bool = Form(default=True),
+        force: bool = Form(default=False),
     ):
         raw_name = Path(file.filename or "upload.bin").name
-        job_id = db.create_job("web", "upload", raw_name)
+        resolved_title = title or Path(raw_name).stem
+        job_id = db.create_job(
+            "web",
+            "upload",
+            raw_name,
+            params={
+                "folder": folder,
+                "tags": tags,
+                "title": resolved_title,
+                "forward_to_telegram": forward_to_telegram,
+                "force": force,
+                "source_origin": "web",
+            },
+        )
         job_dir = Path(tempfile.mkdtemp(dir=cfg.staging_dir))
         staged_path = job_dir / raw_name
         written = 0
+        hasher = hashlib.sha256()
 
         try:
             db.update_job(job_id, status="downloading", message=f"Receiving {raw_name}...")
@@ -426,6 +579,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             status_code=413,
                             detail=f"File exceeds {cfg.max_upload_mb} MB limit.",
                         )
+                    hasher.update(chunk)
                     await asyncio.to_thread(out.write, chunk)
 
             db.update_job(
@@ -442,8 +596,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     source_origin="web",
                     folder=folder,
                     tags=tags,
-                    title=title or Path(raw_name).stem,
+                    title=resolved_title,
                     forward_to_telegram=forward_to_telegram,
+                    force=force,
+                    precomputed_sha256=hasher.hexdigest(),
                 ),
             )
             return {"job_id": job_id, "status": "queued"}
@@ -464,6 +620,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         folder: str | None = Form(default=None),
         tags: str | None = Form(default=None),
         forward_to_telegram: bool = Form(default=True),
+        force: bool = Form(default=False),
     ):
         if not files:
             raise HTTPException(status_code=400, detail="No files provided.")
@@ -481,7 +638,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             folder_title = safe_archive
             zip_filename = f"{safe_archive}.zip"
 
-        job_id = db.create_job("web", "upload", zip_filename)
+        job_id = db.create_job(
+            "web",
+            "upload",
+            zip_filename,
+            params={
+                "folder": folder,
+                "tags": tags,
+                "title": folder_title,
+                "forward_to_telegram": forward_to_telegram,
+                "force": force,
+                "source_origin": "web",
+            },
+        )
         job_dir = Path(tempfile.mkdtemp(dir=cfg.staging_dir))
         zip_path = job_dir / zip_filename
         total_written = 0
@@ -541,6 +710,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     tags=tags,
                     title=folder_title,
                     forward_to_telegram=forward_to_telegram,
+                    force=force,
                 ),
             )
             return {"job_id": job_id, "status": "queued"}

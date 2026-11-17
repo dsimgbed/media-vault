@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import re
 import sqlite3
 import threading
@@ -10,9 +11,91 @@ from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 _TAG_TOKEN_RE = re.compile(r"[^a-z0-9_-]+")
 _FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]+")
+
+_TRACKING_QUERY_PARAMS = {
+    "si",
+    "feature",
+    "fbclid",
+    "gclid",
+    "igshid",
+    "pp",
+    "_hsenc",
+    "_hsmi",
+    "mc_cid",
+    "mc_eid",
+    "ref",
+    "ref_src",
+    "s",
+    "t",
+}
+_YOUTUBE_PLAYLIST_PARAMS = {"list", "index", "start_radio", "rv"}
+
+
+def normalize_source_url(url: str | None) -> str | None:
+    if not url or not str(url).strip():
+        return None
+    raw = str(url).strip()
+    parts = urlsplit(raw)
+    if not parts.scheme or not parts.netloc:
+        return raw
+
+    scheme = parts.scheme.lower()
+    netloc = parts.netloc.lower()
+    path = parts.path or ""
+
+    if netloc in ("www.youtube.com", "m.youtube.com", "music.youtube.com"):
+        netloc = "youtube.com"
+    elif netloc in ("x.com", "www.x.com"):
+        netloc = "twitter.com"
+
+    if path != "/":
+        path = path.rstrip("/")
+
+    query_pairs = parse_qsl(parts.query, keep_blank_values=True)
+    filtered_params: list[tuple[str, str]] = []
+    for k, v in query_pairs:
+        k_low = k.lower()
+        if k_low.startswith("utm_") or k_low in _TRACKING_QUERY_PARAMS:
+            continue
+        filtered_params.append((k, v))
+
+    if netloc == "youtu.be":
+        segments = [seg for seg in path.split("/") if seg]
+        if len(segments) == 1:
+            vid = segments[0]
+            scheme = "https"
+            netloc = "youtube.com"
+            path = "/watch"
+            filtered_params = [
+                (k, v)
+                for k, v in filtered_params
+                if k.lower() not in _YOUTUBE_PLAYLIST_PARAMS and k.lower() != "v"
+            ]
+            filtered_params.append(("v", vid))
+    elif netloc == "youtube.com":
+        segments = [seg for seg in path.split("/") if seg]
+        if len(segments) == 2 and segments[0] == "shorts":
+            vid = segments[1]
+            scheme = "https"
+            path = "/watch"
+            filtered_params = [
+                (k, v)
+                for k, v in filtered_params
+                if k.lower() not in _YOUTUBE_PLAYLIST_PARAMS and k.lower() != "v"
+            ]
+            filtered_params.append(("v", vid))
+        elif path == "/watch" and any(k.lower() == "v" for k, _ in filtered_params):
+            filtered_params = [
+                (k, v) for k, v in filtered_params if k.lower() not in _YOUTUBE_PLAYLIST_PARAMS
+            ]
+
+    filtered_params.sort(key=lambda kv: (kv[0], kv[1]))
+    query = urlencode(filtered_params, doseq=True)
+    return urlunsplit((scheme, netloc, path, query, ""))
 
 
 def normalize_tags(raw: str | list[str] | tuple[str, ...] | None) -> list[str]:
@@ -135,6 +218,8 @@ class Database:
                     source_origin TEXT NOT NULL, -- 'web' | 'telegram'
                     source_kind TEXT NOT NULL,   -- 'ytdlp' | 'ddl' | 'upload'
                     source_url TEXT,
+                    sha256 TEXT,
+                    normalized_source_url TEXT,
                     telegram_chat_id TEXT,
                     telegram_topic_id INTEGER,
                     telegram_msg_id INTEGER,
@@ -190,10 +275,11 @@ class Database:
                     source_origin TEXT NOT NULL,
                     source_kind TEXT NOT NULL,
                     source_ref TEXT NOT NULL,
-                    status TEXT NOT NULL, -- 'queued' | 'downloading' | 'allocating' | 'done' | 'failed'
+                    status TEXT NOT NULL, -- 'queued' | 'downloading' | 'allocating' | 'done' | 'failed' | 'cancelled'
                     progress REAL NOT NULL DEFAULT 0,
                     message TEXT,
                     media_ids_json TEXT,
+                    params_json TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -219,6 +305,10 @@ class Database:
                 conn.execute("ALTER TABLE media_items ADD COLUMN folder TEXT NOT NULL DEFAULT 'General'")
             if "tags" not in cols:
                 conn.execute("ALTER TABLE media_items ADD COLUMN tags TEXT NOT NULL DEFAULT ''")
+            if "sha256" not in cols:
+                conn.execute("ALTER TABLE media_items ADD COLUMN sha256 TEXT")
+            if "normalized_source_url" not in cols:
+                conn.execute("ALTER TABLE media_items ADD COLUMN normalized_source_url TEXT")
             if "telegram_chat_id" not in cols:
                 conn.execute("ALTER TABLE media_items ADD COLUMN telegram_chat_id TEXT")
             if "telegram_topic_id" not in cols:
@@ -244,10 +334,23 @@ class Database:
             if "preview_filename" not in cols:
                 conn.execute("ALTER TABLE media_items ADD COLUMN preview_filename TEXT")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_media_folder ON media_items(folder)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_media_sha256 ON media_items(sha256)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_media_norm_url ON media_items(normalized_source_url)")
+
+            url_rows = conn.execute(
+                "SELECT id, source_url FROM media_items WHERE source_url IS NOT NULL AND source_url != '' AND normalized_source_url IS NULL"
+            ).fetchall()
+            if url_rows:
+                conn.executemany(
+                    "UPDATE media_items SET normalized_source_url = ? WHERE id = ?",
+                    [(normalize_source_url(r["source_url"]), r["id"]) for r in url_rows],
+                )
 
             job_cols = {r["name"] for r in conn.execute("PRAGMA table_info(ingest_jobs)").fetchall()}
             if "progress" not in job_cols:
                 conn.execute("ALTER TABLE ingest_jobs ADD COLUMN progress REAL NOT NULL DEFAULT 0")
+            if "params_json" not in job_cols:
+                conn.execute("ALTER TABLE ingest_jobs ADD COLUMN params_json TEXT")
 
             # Backfill media_tags for legacy DBs
             tag_rows = conn.execute(
@@ -273,17 +376,25 @@ class Database:
                 """
             )
 
-    def create_job(self, source_origin: str, source_kind: str, source_ref: str) -> str:
+    def create_job(
+        self,
+        source_origin: str,
+        source_kind: str,
+        source_ref: str,
+        *,
+        params: dict[str, Any] | None = None,
+    ) -> str:
         job_id = uuid.uuid4().hex[:12]
         now = utc_now_iso()
+        params_str = json.dumps(params or {})
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO ingest_jobs (
-                    id, source_origin, source_kind, source_ref, status, progress, message, media_ids_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'queued', 0, 'Queued', '[]', ?, ?)
+                    id, source_origin, source_kind, source_ref, status, progress, message, media_ids_json, params_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'queued', 0, 'Queued', '[]', ?, ?, ?)
                 """,
-                (job_id, source_origin, source_kind, source_ref, now, now),
+                (job_id, source_origin, source_kind, source_ref, params_str, now, now),
             )
         self.publish({"type": "job_update", "job_id": job_id, "status": "queued"})
         return job_id
@@ -369,6 +480,7 @@ class Database:
         source_origin: str,
         source_kind: str,
         source_url: str | None,
+        sha256: str | None = None,
         tags: str | list[str] | None = None,
         telegram_chat_id: str | None = None,
         telegram_topic_id: int | None = None,
@@ -388,17 +500,20 @@ class Database:
         resolved_part_count = len(parts) if (parts and part_count == 1) else max(1, int(part_count))
         tag_list = normalize_tags(tags)
         normalized_tags = ",".join(tag_list)
+        normalized_source_url = normalize_source_url(source_url)
+        clean_sha256 = sha256.strip().lower() if sha256 else None
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO media_items (
                     id, title, filename, folder, tags, media_type, mime_type, size_bytes,
                     drive_name, file_path, thumb_filename, source_origin,
-                    source_kind, source_url, telegram_chat_id, telegram_topic_id,
+                    source_kind, source_url, sha256, normalized_source_url,
+                    telegram_chat_id, telegram_topic_id,
                     telegram_msg_id, telegram_worker_name, part_count,
                     duration_sec, width, height, video_codec, audio_codec, fps, preview_filename,
                     created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     media_id,
@@ -415,6 +530,8 @@ class Database:
                     source_origin,
                     source_kind,
                     source_url,
+                    clean_sha256,
+                    normalized_source_url,
                     telegram_chat_id,
                     telegram_topic_id,
                     telegram_msg_id,
@@ -468,6 +585,42 @@ class Database:
             item["parts"] = self._resolve_parts_for_item(conn, item)
         self.publish({"type": "media_update", "media_id": media_id, "action": "insert"})
         return item
+
+    def find_media_by_source_url(self, url: str) -> dict[str, Any] | None:
+        raw = (url or "").strip()
+        norm = normalize_source_url(raw)
+        if not raw and not norm:
+            return None
+        target_norm = norm or raw
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM media_items
+                WHERE normalized_source_url = ? OR source_url = ?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (target_norm, raw),
+            ).fetchone()
+            if not row:
+                return None
+            item = self._hydrate_media(row)
+            item["parts"] = self._resolve_parts_for_item(conn, item)
+            return item
+
+    def find_media_by_sha256(self, sha256: str) -> dict[str, Any] | None:
+        clean = (sha256 or "").strip().lower()
+        if not clean:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM media_items WHERE sha256 = ? ORDER BY created_at DESC LIMIT 1",
+                (clean,),
+            ).fetchone()
+            if not row:
+                return None
+            item = self._hydrate_media(row)
+            item["parts"] = self._resolve_parts_for_item(conn, item)
+            return item
 
     def update_media_topic(self, media_id: str, topic_id: int) -> None:
         with self._connect() as conn:

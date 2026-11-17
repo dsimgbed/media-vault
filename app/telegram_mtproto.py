@@ -38,6 +38,7 @@ FOLDER_HASH_RE = re.compile(r"(?:^|\s)#([A-Za-z0-9_/-]{1,64})")
 FOLDER_KV_RE = re.compile(r"(?:^|\s)(?:folder|dir):([A-Za-z0-9_./-]{1,64})", re.IGNORECASE)
 FORMAT_KV_RE = re.compile(r"(?:^|\s)(?:format|fmt|q):([A-Za-z0-9_+/\[\]<=.,:-]{1,48})", re.IGNORECASE)
 TAG_KV_RE = re.compile(r"(?:^|\s)(?:tag|tags):([A-Za-z0-9_#,-]{1,128})", re.IGNORECASE)
+FORCE_FLAG_RE = re.compile(r"(?:^|\s)(?:--force|force:true|force:1)(?:\s|$)", re.IGNORECASE)
 TELEGRAM_CAPTION_MAX_UTF16 = 1024
 TELEGRAM_NON_RETRYABLE_CAPTION_ERRORS = (
     MediaCaptionTooLongError,
@@ -268,6 +269,12 @@ def parse_format_from_text(text: str) -> str | None:
         return None
     m = FORMAT_KV_RE.search(text)
     return m.group(1).strip() if m else None
+
+
+def parse_force_from_text(text: str) -> bool:
+    if not text:
+        return False
+    return bool(FORCE_FLAG_RE.search(text))
 
 
 def parse_tags_from_text(text: str) -> list[str]:
@@ -1331,8 +1338,10 @@ class TelegramPool:
                 "• Send any URL or photo/video/file up to 2 GB (in DM or in the archive group).\n"
                 "• Specify a folder per message with `#FolderName` or `folder:FolderName` (or post inside a Topic).\n"
                 "• Optional quality: `format:1080p`, `format:720p`, `format:480p`, `format:audio`.\n"
+                "• Bypass duplicate check with `--force` or `force:true`.\n"
                 "• Set sticky folder: `/folder Movies`\n"
-                "• List folders: `/folders` | Status: `/status` | Recent: `/recent`\n\n"
+                "• List folders: `/folders` | Status: `/status` | Recent: `/recent`\n"
+                "• Cancel active job: `/cancel [job_id]` | Retry job: `/retry [job_id]`\n\n"
                 f"Gallery: {self._gallery_link()}"
             )
 
@@ -1404,6 +1413,64 @@ class TelegramPool:
                 )
             await event.reply("\n".join(lines))
 
+        @client.on(events.NewMessage(pattern=r"^/cancel(?:\s+([A-Za-z0-9_-]+))?$"))
+        async def on_cancel(event):
+            if not self._is_authorized(event.sender_id):
+                return
+            if self._is_archive_chat(event.chat_id) and not await self._claim_group_message(event.chat_id, event.id):
+                return
+            target_job_id = (event.pattern_match.group(1) or "").strip()
+            if not target_job_id:
+                jobs = self.db.list_jobs(limit=30)
+                active_job = next(
+                    (j for j in jobs if j.get("status") in ("queued", "downloading", "allocating")),
+                    None,
+                )
+                if not active_job:
+                    await event.reply("No active jobs to cancel.")
+                    return
+                target_job_id = active_job["id"]
+            try:
+                cancelled = await self.ingest.cancel_job(target_job_id)
+                await event.reply(
+                    f"Cancelled job `{cancelled['id']}` ({cancelled['source_ref']})."
+                )
+            except (KeyError, ValueError) as exc:
+                await event.reply(f"Could not cancel job `{target_job_id}`: {exc}")
+
+        @client.on(events.NewMessage(pattern=r"^/retry(?:\s+([A-Za-z0-9_-]+))?$"))
+        async def on_retry(event):
+            if not self._is_authorized(event.sender_id):
+                return
+            if self._is_archive_chat(event.chat_id) and not await self._claim_group_message(event.chat_id, event.id):
+                return
+            target_job_id = (event.pattern_match.group(1) or "").strip()
+            if not target_job_id:
+                jobs = self.db.list_jobs(limit=30)
+                retryable = next(
+                    (
+                        j
+                        for j in jobs
+                        if j.get("status") in ("failed", "cancelled")
+                        and (
+                            j.get("source_kind") == "url"
+                            or str(j.get("source_ref") or "").startswith(("http://", "https://"))
+                        )
+                    ),
+                    None,
+                )
+                if not retryable:
+                    await event.reply("No failed or cancelled URL jobs to retry.")
+                    return
+                target_job_id = retryable["id"]
+            try:
+                retried = await self.ingest.retry_job(target_job_id)
+                await event.reply(
+                    f"Retrying job `{retried['id']}` ({retried['source_ref']})."
+                )
+            except (KeyError, ValueError) as exc:
+                await event.reply(f"Could not retry job `{target_job_id}`: {exc}")
+
         @client.on(events.NewMessage)
         async def on_message(event):
             text = event.raw_text or ""
@@ -1440,8 +1507,11 @@ class TelegramPool:
                 folder = await self._resolve_group_folder(client, event, text, user_default)
                 fmt_spec = parse_format_from_text(text)
                 tags = parse_tags_from_text(text)
+                force = parse_force_from_text(text)
                 for url in urls:
-                    await self._handle_telegram_url(cfg, event, url, folder, format_spec=fmt_spec, tags=tags)
+                    await self._handle_telegram_url(
+                        cfg, event, url, folder, format_spec=fmt_spec, tags=tags, force=force
+                    )
                 return
 
             folder = parse_folder_from_text(text, user_default)
@@ -1457,8 +1527,11 @@ class TelegramPool:
             # 2. URLs in DM text
             if urls:
                 fmt_spec = parse_format_from_text(text)
+                force = parse_force_from_text(text)
                 for url in urls:
-                    await self._handle_telegram_url(cfg, event, url, folder, format_spec=fmt_spec, tags=tags)
+                    await self._handle_telegram_url(
+                        cfg, event, url, folder, format_spec=fmt_spec, tags=tags, force=force
+                    )
 
     async def _handle_telegram_url(
         self,
@@ -1469,10 +1542,23 @@ class TelegramPool:
         *,
         format_spec: str | None = None,
         tags: list[str] | None = None,
+        force: bool = False,
     ) -> None:
         display_url = _truncate_utf16(url, 600)
         status_msg = await event.reply(f"[{cfg.name}] Queued → `{folder}`: {display_url}")
-        job_id = self.db.create_job("telegram", "url", url)
+        job_id = self.db.create_job(
+            "telegram",
+            "url",
+            url,
+            params={
+                "url": url,
+                "folder": folder,
+                "tags": tags,
+                "format_spec": format_spec,
+                "force": force,
+                "source_origin": "telegram",
+            },
+        )
         last_edit = 0.0
 
         async def progress_edit(pct: float, msg: str) -> None:
@@ -1490,24 +1576,42 @@ class TelegramPool:
                 await status_msg.edit(f"[{cfg.name}] Downloading → `{folder}`: {display_url}")
             except Exception:
                 pass
-            items = await self.ingest.process_url_job(
+            task = self.ingest.submit_job(
                 job_id,
-                url,
-                source_origin="telegram",
-                folder=folder,
-                tags=tags,
-                forward_to_telegram=True,
-                format_spec=format_spec,
-                on_progress=progress_edit,
+                self.ingest.process_url_job(
+                    job_id,
+                    url,
+                    source_origin="telegram",
+                    folder=folder,
+                    tags=tags,
+                    forward_to_telegram=True,
+                    format_spec=format_spec,
+                    on_progress=progress_edit,
+                    force=force,
+                ),
             )
-            lines = [f"[{cfg.name}] Saved to `{folder}`:"]
+            items = await task
+            if items is None:
+                job = self.db.get_job(job_id)
+                if job and job.get("status") == "cancelled":
+                    await status_msg.edit(f"[{cfg.name}] Cancelled: {display_url}")
+                    return
+                raise RuntimeError((job.get("message") if job else None) or "Ingest failed")
+
+            if items and all(it.get("deduplicated") for it in items):
+                lines = [f"[{cfg.name}] Skipped (duplicate skipped — send with --force to re-ingest):"]
+            else:
+                lines = [f"[{cfg.name}] Saved to `{folder}`:"]
             for it in items:
                 topic_note = f" + Topic #{it['telegram_topic_id']}" if it.get("telegram_topic_id") else ""
+                dup_note = " (duplicate skipped — send with --force to re-ingest)" if it.get("deduplicated") else ""
                 lines.append(
-                    f"• `{it['filename']}` ({fmt_size(it['size_bytes'])}) → `{it['drive_name']}`{topic_note}\n"
+                    f"• `{it['filename']}` ({fmt_size(it['size_bytes'])}) → `{it['drive_name']}`{topic_note}{dup_note}\n"
                     f"  View: {self._gallery_link(it['id'])}"
                 )
             await status_msg.edit(_truncate_utf16("\n".join(lines), 4000))
+        except asyncio.CancelledError:
+            await status_msg.edit(f"[{cfg.name}] Cancelled: {display_url}")
         except FloodWaitError as fw:
             self.db.update_job(job_id, status="failed", message=f"Telegram flood wait: {fw.seconds}s")
             await status_msg.edit(f"[{cfg.name}] Rate limited by Telegram for {fw.seconds}s. Try another worker/bot.")
