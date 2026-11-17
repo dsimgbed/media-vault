@@ -404,6 +404,9 @@
       maxUploadMb: 20480,
       activeMediaId: null,
       jobPollTimer: null,
+      mediaRefreshTimer: null,
+      sse: null,
+      sseConnected: false,
       hadActiveJobs: false,
       lastDoneCount: -1,
     };
@@ -539,10 +542,19 @@
       driveSelect.value = prevDrive || "all";
     }
 
+    function stopJobPoll() {
+      if (state.jobPollTimer) {
+        clearTimeout(state.jobPollTimer);
+        state.jobPollTimer = null;
+      }
+    }
+
     function scheduleJobPoll(hasActive) {
-      if (state.jobPollTimer) clearTimeout(state.jobPollTimer);
+      stopJobPoll();
+      if (state.sseConnected) return;
       const delay = hasActive ? 1000 : 4000;
       state.jobPollTimer = setTimeout(async () => {
+        if (state.sseConnected) return;
         if (!document.hidden) {
           try { await loadJobs(); } catch (_) {}
         } else {
@@ -551,12 +563,23 @@
       }, delay);
     }
 
-    async function loadJobs() {
-      const data = await apiFetch("/api/jobs?limit=8");
+    function scheduleMediaRefresh() {
+      if (state.mediaRefreshTimer) return;
+      state.mediaRefreshTimer = setTimeout(async () => {
+        state.mediaRefreshTimer = null;
+        try {
+          await Promise.all([loadMedia(), loadDrives(), loadFolders(), loadTags()]);
+        } catch (err) {
+          console.warn(err.message);
+        }
+      }, 150);
+    }
+
+    async function applyJobsList(jobs, { pollIfDisconnected = true } = {}) {
       const strip = $("jobsStrip");
-      const active = data.jobs.filter(j => ["queued", "downloading", "allocating"].includes(j.status));
-      const doneCount = data.jobs.filter(j => j.status === "done").length;
-      const shown = data.jobs.slice(0, 5);
+      const active = jobs.filter(j => ["queued", "downloading", "allocating"].includes(j.status));
+      const doneCount = jobs.filter(j => j.status === "done").length;
+      const shown = jobs.slice(0, 5);
       strip.innerHTML = shown.map(j => {
         const pct = Math.max(0, Math.min(100, Math.round(j.progress || (j.status === "done" ? 100 : 0))));
         const barCls = j.status === "done" ? "bar bar-done" : (j.status === "failed" ? "bar bar-failed" : "bar");
@@ -578,14 +601,73 @@
 
       const newlyFinished =
         (state.hadActiveJobs && active.length === 0) ||
-        (state.lastDoneCount >= 0 && doneCount !== state.lastDoneCount);
+        (state.lastDoneCount >= 0 && doneCount > state.lastDoneCount);
       state.hadActiveJobs = active.length > 0;
       state.lastDoneCount = doneCount;
 
-      if (newlyFinished || active.length > 0) {
+      if (newlyFinished) {
+        if (state.mediaRefreshTimer) {
+          clearTimeout(state.mediaRefreshTimer);
+          state.mediaRefreshTimer = null;
+        }
         await Promise.all([loadMedia(), loadDrives(), loadFolders(), loadTags()]);
       }
-      scheduleJobPoll(active.length > 0);
+      if (pollIfDisconnected && !state.sseConnected) {
+        scheduleJobPoll(active.length > 0);
+      }
+    }
+
+    async function loadJobs() {
+      const data = await apiFetch("/api/jobs?limit=8");
+      await applyJobsList(data.jobs || []);
+    }
+
+    function connectEvents() {
+      if (state.sse) {
+        state.sse.close();
+        state.sse = null;
+      }
+      state.sseConnected = false;
+      if (state.authRequired && !state.token) return;
+      if (typeof EventSource === "undefined") {
+        scheduleJobPoll(state.hadActiveJobs);
+        return;
+      }
+
+      const es = new EventSource(withToken("/api/events"));
+      state.sse = es;
+
+      es.onopen = () => {
+        state.sseConnected = true;
+        stopJobPoll();
+      };
+
+      es.onmessage = async (ev) => {
+        state.sseConnected = true;
+        stopJobPoll();
+        try {
+          const payload = JSON.parse(ev.data);
+          if (payload.type === "connected" || payload.type === "job_update") {
+            if (Array.isArray(payload.jobs)) {
+              await applyJobsList(payload.jobs, { pollIfDisconnected: false });
+            } else {
+              await loadJobs();
+            }
+            if (payload.status === "done") {
+              scheduleMediaRefresh();
+            }
+          } else if (payload.type === "media_update") {
+            scheduleMediaRefresh();
+          }
+        } catch (err) {
+          console.warn("SSE event error:", err);
+        }
+      };
+
+      es.onerror = () => {
+        state.sseConnected = false;
+        scheduleJobPoll(state.hadActiveJobs);
+      };
     }
 
     async function loadMedia() {
@@ -816,6 +898,7 @@
       localStorage.setItem("vault_token", state.token);
       $("authBox").style.display = "none";
       refreshAll();
+      connectEvents();
     });
 
     $("refreshBtn").addEventListener("click", refreshAll);
@@ -1077,6 +1160,7 @@
     (async function init() {
       await loadHealth();
       await refreshAll();
+      connectEvents();
       if (location.hash.startsWith("#media=")) {
         const id = location.hash.slice(7);
         if (id) openViewer(id).catch(() => {});

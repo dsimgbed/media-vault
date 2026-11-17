@@ -101,7 +101,8 @@ def test_upload_thumbnail_gallery_stream_and_delete(tmp_path: Path):
         # Thumbnail generated
         thumb_resp = client.get(f"/api/media/{media_id}/thumb")
         assert thumb_resp.status_code == 200
-        assert thumb_resp.headers["content-type"].startswith("image/jpeg")
+        assert thumb_resp.headers["content-type"].startswith("image/webp")
+        assert thumb_resp.headers["cache-control"] == "public, max-age=31536000, immutable"
 
         # Full stream + Range 206 stream
         full_resp = client.get(f"/api/media/{media_id}/stream")
@@ -1834,5 +1835,403 @@ def test_rar_ddl_detection_caption_truncation_and_no_caption_reupload_loop(tmp_p
     assert mp_res["part_count"] == 2
     assert m1.upload_calls + m2.upload_calls == 2  # uploaded each part only ONCE
     assert any(len(c) <= 200 for c in m1.send_calls + m2.send_calls)
+
+
+def test_persistent_sqlite_connection_pragmas_close_and_reconnect(tmp_path: Path):
+    from app.db import Database
+
+    db_path = tmp_path / "persistent.db"
+    db = Database(db_path)
+
+    with db._connect() as conn1:
+        conn_id_1 = id(conn1)
+        jm = conn1.execute("PRAGMA journal_mode;").fetchone()[0]
+        sync = conn1.execute("PRAGMA synchronous;").fetchone()[0]
+        temp_store = conn1.execute("PRAGMA temp_store;").fetchone()[0]
+        fk = conn1.execute("PRAGMA foreign_keys;").fetchone()[0]
+
+    assert str(jm).lower() == "wal"
+    assert int(sync) == 1  # NORMAL
+    assert int(temp_store) == 2  # MEMORY
+    assert int(fk) == 1  # ON
+
+    with db._connect() as conn2:
+        assert id(conn2) == conn_id_1
+
+    db.close()
+    assert db._conn is None
+
+    # Lazy reconnect after close()
+    jid = db.create_job("web", "url", "https://example.com/after-close")
+    assert db.get_job(jid) is not None
+    assert db._conn is not None
+    db.close()
+
+    # App lifespan calls db.close() cleanly
+    settings = _make_settings(tmp_path)
+    app = create_app(settings)
+    with TestClient(app) as client:
+        assert client.get("/api/health").status_code == 200
+        assert app.state.db._conn is not None
+    assert app.state.db._conn is None
+
+
+def test_normalized_media_tags_table_and_legacy_backfill(tmp_path: Path):
+    import sqlite3
+    from app.db import Database
+
+    db_path = tmp_path / "tags_legacy.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE media_items (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                folder TEXT NOT NULL DEFAULT 'General',
+                tags TEXT NOT NULL DEFAULT '',
+                media_type TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                drive_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                thumb_filename TEXT,
+                source_origin TEXT NOT NULL,
+                source_kind TEXT NOT NULL,
+                source_url TEXT,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO media_items (
+                id, title, filename, folder, tags, media_type, mime_type, size_bytes,
+                drive_name, file_path, thumb_filename, source_origin, source_kind, source_url, created_at
+            ) VALUES (
+                'leg_tag_1', 'Old Item', 'old.jpg', 'Archive', 'soap,hd', 'image', 'image/jpeg', 123,
+                'drive1', '', NULL, 'web', 'upload', NULL, '2026-01-01T00:00:00Z'
+            );
+            """
+        )
+
+    db = Database(db_path)
+    try:
+        # Backfilled on startup
+        with db._connect() as conn:
+            rows = conn.execute(
+                "SELECT tag FROM media_tags WHERE media_id = ? ORDER BY tag ASC",
+                ("leg_tag_1",),
+            ).fetchall()
+        assert [r["tag"] for r in rows] == ["hd", "soap"]
+        assert db.list_tags() == ["hd", "soap"]
+
+        # Insert populates media_tags
+        db.insert_media(
+            media_id="new_tag_2",
+            title="New Item",
+            filename="new.jpg",
+            folder="Archive",
+            media_type="image",
+            mime_type="image/jpeg",
+            size_bytes=456,
+            drive_name="drive1",
+            file_path="",
+            thumb_filename=None,
+            source_origin="web",
+            source_kind="upload",
+            source_url=None,
+            tags="#soap, #soapy, #4k",
+        )
+        assert db.list_tags() == ["4k", "hd", "soap", "soapy"]
+
+        # Tag filtering uses exact normalized tags (soap != soapy)
+        items_soap, total_soap = db.list_media(tag="soap")
+        assert total_soap == 2
+        assert {it["id"] for it in items_soap} == {"leg_tag_1", "new_tag_2"}
+
+        items_multi, total_multi = db.list_media(tag="soap,4k")
+        assert total_multi == 1
+        assert items_multi[0]["id"] == "new_tag_2"
+
+        # Update tags replaces media_tags rows
+        db.update_media_tags("new_tag_2", "#cinema")
+        with db._connect() as conn:
+            new_rows = conn.execute(
+                "SELECT tag FROM media_tags WHERE media_id = ? ORDER BY tag ASC",
+                ("new_tag_2",),
+            ).fetchall()
+        assert [r["tag"] for r in new_rows] == ["cinema"]
+        assert db.list_tags() == ["cinema", "hd", "soap"]
+
+        # Delete removes media_tags rows
+        db.delete_media("leg_tag_1")
+        with db._connect() as conn:
+            rem = conn.execute(
+                "SELECT tag FROM media_tags WHERE media_id = ?",
+                ("leg_tag_1",),
+            ).fetchall()
+        assert rem == []
+        assert db.list_tags() == ["cinema"]
+    finally:
+        db.close()
+
+
+def test_fts5_search_prefix_multitoken_sync_and_legacy_backfill(tmp_path: Path):
+    import sqlite3
+    from app.db import Database
+
+    db_path = tmp_path / "fts_legacy.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE media_items (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                folder TEXT NOT NULL DEFAULT 'General',
+                tags TEXT NOT NULL DEFAULT '',
+                media_type TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                drive_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                thumb_filename TEXT,
+                source_origin TEXT NOT NULL,
+                source_kind TEXT NOT NULL,
+                source_url TEXT,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO media_items (
+                id, title, filename, folder, tags, media_type, mime_type, size_bytes,
+                drive_name, file_path, thumb_filename, source_origin, source_kind, source_url, created_at
+            ) VALUES (
+                'leg_fts_1', 'Golden Horizon', 'sunset.jpg', 'Vacation/2026', 'beach,golden',
+                'image', 'image/jpeg', 500, 'drive1', '', NULL, 'web', 'upload',
+                'https://cdn.example.org/photos/sunset.jpg', '2026-01-01T00:00:00Z'
+            );
+            """
+        )
+
+    db = Database(db_path)
+    try:
+        # Legacy row backfilled into media_fts
+        res_prefix, total_prefix = db.list_media(q="sun")
+        assert total_prefix == 1
+        assert res_prefix[0]["id"] == "leg_fts_1"
+
+        # Insert second item
+        db.insert_media(
+            media_id="fts_2",
+            title="Mountain Hike",
+            filename="alpine-trail_4k.mp4",
+            folder="Trips/Alps",
+            media_type="video",
+            mime_type="video/mp4",
+            size_bytes=9000,
+            drive_name="drive1",
+            file_path="",
+            thumb_filename=None,
+            source_origin="web",
+            source_kind="ytdlp",
+            source_url="https://video.example.net/watch?v=alps99",
+            tags="#nature, #hike",
+        )
+
+        # Multi-token FTS prefix search across title/folder/url/tags
+        res_multi, total_multi = db.list_media(q="mount alps")
+        assert total_multi == 1
+        assert res_multi[0]["id"] == "fts_2"
+
+        res_url, total_url = db.list_media(q="alps99")
+        assert total_url == 1
+        assert res_url[0]["id"] == "fts_2"
+
+        # Mid-word substring fallback via LIKE
+        res_mid, total_mid = db.list_media(q="unset")
+        assert total_mid == 1
+        assert res_mid[0]["id"] == "leg_fts_1"
+
+        # Update tags updates FTS index
+        db.update_media_tags("fts_2", "#glacier")
+        assert db.list_media(q="glaci")[1] == 1
+        assert db.list_media(q="nature")[1] == 0
+
+        # Delete removes from FTS index
+        db.delete_media("fts_2")
+        assert db.list_media(q="glaci")[1] == 0
+        with db._connect() as conn:
+            fts_left = conn.execute(
+                "SELECT media_id FROM media_fts WHERE media_id = ?",
+                ("fts_2",),
+            ).fetchall()
+        assert fts_left == []
+    finally:
+        db.close()
+
+
+def test_webp_thumbnails_video_fallback_and_legacy_jpg_compat(tmp_path: Path, monkeypatch):
+    import asyncio
+    from app.thumbnails import generate_thumbnail
+
+    settings = _make_settings(tmp_path)
+    app = create_app(settings)
+    db = app.state.db
+
+    # 1) Image upload generates .webp thumbnail and serves immutable Cache-Control
+    with TestClient(app) as client:
+        jpg = _sample_jpeg_bytes()
+        resp = client.post(
+            "/api/ingest/upload",
+            files={"file": ("beach_webp.jpg", jpg, "image/jpeg")},
+        )
+        item = _wait_for_upload_item(client, resp)
+        assert item["thumb_filename"] == f"{item['id']}.webp"
+        thumb_file = settings.thumbs_dir / item["thumb_filename"]
+        assert thumb_file.is_file()
+        with Image.open(thumb_file) as im:
+            assert im.format == "WEBP"
+
+        thumb_resp = client.get(f"/api/media/{item['id']}/thumb")
+        assert thumb_resp.status_code == 200
+        assert thumb_resp.headers["content-type"] == "image/webp"
+        assert thumb_resp.headers["cache-control"] == "public, max-age=31536000, immutable"
+
+        # 2) Legacy .jpg thumbnail on disk still served as image/jpeg with immutable Cache-Control
+        legacy_id = "legacy_jpg_thumb"
+        legacy_path = settings.thumbs_dir / f"{legacy_id}.jpg"
+        legacy_path.write_bytes(jpg)
+        db.insert_media(
+            media_id=legacy_id,
+            title="Legacy Thumb",
+            filename="legacy.jpg",
+            folder="General",
+            media_type="image",
+            mime_type="image/jpeg",
+            size_bytes=len(jpg),
+            drive_name="drive1",
+            file_path="",
+            thumb_filename=f"{legacy_id}.jpg",
+            source_origin="web",
+            source_kind="upload",
+            source_url=None,
+        )
+        leg_resp = client.get(f"/api/media/{legacy_id}/thumb")
+        assert leg_resp.status_code == 200
+        assert leg_resp.headers["content-type"] == "image/jpeg"
+        assert leg_resp.headers["cache-control"] == "public, max-age=31536000, immutable"
+
+        # 3) Fallback lookup when thumb_filename points to missing .webp but legacy .jpg exists on disk
+        fallback_id = "legacy_fallback_thumb"
+        (settings.thumbs_dir / f"{fallback_id}.jpg").write_bytes(jpg)
+        db.insert_media(
+            media_id=fallback_id,
+            title="Fallback Thumb",
+            filename="fb.jpg",
+            folder="General",
+            media_type="image",
+            mime_type="image/jpeg",
+            size_bytes=len(jpg),
+            drive_name="drive1",
+            file_path="",
+            thumb_filename=f"{fallback_id}.webp",
+            source_origin="web",
+            source_kind="upload",
+            source_url=None,
+        )
+        fb_resp = client.get(f"/api/media/{fallback_id}/thumb")
+        assert fb_resp.status_code == 200
+        assert fb_resp.headers["content-type"] == "image/jpeg"
+        assert fb_resp.headers["cache-control"] == "public, max-age=31536000, immutable"
+
+    # 4) Video thumbnail falls back to PNG + Pillow WebP when ffmpeg fails libwebp
+    calls: list[tuple[str, ...]] = []
+
+    class FakeProc:
+        def __init__(self, rc: int) -> None:
+            self.returncode = rc
+
+        async def communicate(self):
+            return b"", b""
+
+    async def fake_exec(*args, **kwargs):
+        calls.append(tuple(str(a) for a in args))
+        out_arg = str(args[-1])
+        if out_arg.endswith(".webp"):
+            return FakeProc(1)  # simulate ffmpeg without libwebp
+        # PNG extraction succeeds
+        Image.new("RGB", (320, 180), color=(20, 160, 90)).save(out_arg, format="PNG")
+        return FakeProc(0)
+
+    monkeypatch.setattr("app.thumbnails.shutil.which", lambda _: "/usr/bin/ffmpeg")
+    monkeypatch.setattr("app.thumbnails.asyncio.create_subprocess_exec", fake_exec)
+
+    vid_thumb = asyncio.run(
+        generate_thumbnail(tmp_path / "dummy.mp4", "video", settings.thumbs_dir, "vid_fallback_1")
+    )
+    assert vid_thumb == "vid_fallback_1.webp"
+    assert (settings.thumbs_dir / "vid_fallback_1.webp").is_file()
+    with Image.open(settings.thumbs_dir / "vid_fallback_1.webp") as im:
+        assert im.format == "WEBP"
+    assert any(a.endswith(".tmp.png") for call in calls for a in call)
+
+
+def test_sse_events_endpoint_and_frontend_polling_removed(tmp_path: Path):
+    import threading
+
+    settings = _make_settings(tmp_path, auth_token="sse-secret")
+    app = create_app(settings)
+    db = app.state.db
+
+    with TestClient(app) as client:
+        # Auth enforced on /api/events
+        assert client.get("/api/events").status_code == 401
+
+        # UI HTML uses EventSource on /api/events and does NOT re-fetch gallery on active.length > 0
+        html = client.get("/").text
+        assert 'new EventSource(withToken("/api/events"))' in html
+        assert "if (newlyFinished)" in html
+        assert "newlyFinished || active.length > 0" not in html
+
+        # Trigger live job + media events shortly after SSE stream connects
+        def _emit_events():
+            time.sleep(0.15)
+            jid = db.create_job("web", "url", "https://example.com/sse-test")
+            db.update_job(jid, status="downloading", progress=45.0, message="Downloading...")
+            db.insert_media(
+                media_id="sse_media_1",
+                title="SSE Item",
+                filename="sse.bin",
+                folder="General",
+                media_type="file",
+                mime_type="application/octet-stream",
+                size_bytes=64,
+                drive_name="drive1",
+                file_path="",
+                thumb_filename=None,
+                source_origin="web",
+                source_kind="upload",
+                source_url=None,
+            )
+            db.update_job(jid, status="done", progress=100.0, message="Done")
+
+        emitter = threading.Thread(target=_emit_events, daemon=True)
+        emitter.start()
+
+        received: list[dict] = []
+        with client.stream("GET", "/api/events?token=sse-secret") as resp:
+            assert resp.status_code == 200
+            assert resp.headers["content-type"].startswith("text/event-stream")
+            assert resp.headers["cache-control"] == "no-cache"
+            for line in resp.iter_lines():
+                if line.startswith("data: "):
+                    ev = json.loads(line[6:])
+                    received.append(ev)
+                    if ev.get("type") == "job_update" and ev.get("status") == "done":
+                        break
+
+        emitter.join(timeout=2.0)
+
+        assert received[0]["type"] == "connected"
+        assert received[0]["ok"] is True
+        assert any(e.get("type") == "job_update" and e.get("status") == "downloading" for e in received)
+        assert any(e.get("type") == "media_update" and e.get("media_id") == "sse_media_1" for e in received)
+        assert any(e.get("type") == "job_update" and e.get("status") == "done" for e in received)
 
 

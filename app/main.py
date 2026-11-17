@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shutil
 import tempfile
@@ -120,6 +121,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             await ingest.shutdown()
             await tg_pool.stop()
+            db.close()
 
     app = FastAPI(title="Media Ingest & Gallery", lifespan=lifespan)
     app.state.settings = cfg
@@ -188,6 +190,48 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
         return job
+
+    @app.get("/api/events", dependencies=[Depends(require_auth)])
+    async def stream_events(request: Request):
+        async def event_stream():
+            sub = db.subscribe()
+            _, queue = sub
+            try:
+                yield ": connected\n\n"
+                init_ev = {
+                    "type": "connected",
+                    "ok": True,
+                    "jobs": db.list_jobs(limit=8),
+                }
+                yield f"data: {json.dumps(init_ev)}\n\n"
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        event = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        yield ": keepalive\n\n"
+                        continue
+                    if not isinstance(event, dict) or event.get("type") == "_shutdown":
+                        break
+                    payload = dict(event)
+                    if payload.get("type") == "job_update" and "jobs" not in payload:
+                        payload["jobs"] = db.list_jobs(limit=8)
+                    yield f"data: {json.dumps(payload)}\n\n"
+            except asyncio.CancelledError:
+                pass
+            finally:
+                db.unsubscribe(sub)
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.post("/api/ytdlp/update", dependencies=[Depends(require_auth)])
     async def trigger_ytdlp_update():
@@ -454,12 +498,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/media/{media_id}/thumb", dependencies=[Depends(require_auth)])
     async def get_media_thumb(media_id: str):
         item = db.get_media(media_id)
-        if not item or not item.get("thumb_filename"):
+        if not item:
             raise HTTPException(status_code=404, detail="Thumbnail not found")
-        thumb_path = cfg.thumbs_dir / item["thumb_filename"]
-        if not thumb_path.exists():
-            raise HTTPException(status_code=404, detail="Thumbnail file missing")
-        return FileResponse(thumb_path, media_type="image/jpeg")
+
+        candidates: list[Path] = []
+        if item.get("thumb_filename"):
+            candidates.append(cfg.thumbs_dir / item["thumb_filename"])
+        candidates.extend(
+            [
+                cfg.thumbs_dir / f"{media_id}.webp",
+                cfg.thumbs_dir / f"{media_id}.jpg",
+                cfg.thumbs_dir / f"{media_id}.jpeg",
+                cfg.thumbs_dir / f"{media_id}.png",
+            ]
+        )
+
+        thumb_path = next((p for p in candidates if p.is_file()), None)
+        if thumb_path is None:
+            detail = "Thumbnail not found" if not item.get("thumb_filename") else "Thumbnail file missing"
+            raise HTTPException(status_code=404, detail=detail)
+
+        media_type = {
+            ".webp": "image/webp",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+        }.get(thumb_path.suffix.lower(), "image/webp")
+        return FileResponse(
+            thumb_path,
+            media_type=media_type,
+            headers={"Cache-Control": "public, max-age=31536000, immutable"},
+        )
 
     @app.get("/api/media/{media_id}/stream", dependencies=[Depends(require_auth)])
     async def stream_media(media_id: str, request: Request, download: bool = Query(default=False)):

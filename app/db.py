@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import re
 import sqlite3
+import threading
 import uuid
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 _TAG_TOKEN_RE = re.compile(r"[^a-z0-9_-]+")
+_FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]+")
 
 
 def normalize_tags(raw: str | list[str] | tuple[str, ...] | None) -> list[str]:
@@ -31,14 +36,85 @@ class Database:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._conn: sqlite3.Connection | None = None
+        self._sub_lock = threading.Lock()
+        self._subscribers: set[tuple[asyncio.AbstractEventLoop, asyncio.Queue[dict[str, Any]]]] = set()
         self._init_schema()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA foreign_keys=ON;")
-        return conn
+    def _ensure_conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA temp_store=MEMORY;")
+            conn.execute("PRAGMA foreign_keys=ON;")
+            self._conn = conn
+        return self._conn
+
+    @contextlib.contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        with self._lock:
+            conn = self._ensure_conn()
+            try:
+                yield conn
+                if conn.in_transaction:
+                    conn.commit()
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+
+    @staticmethod
+    def _enqueue_nowait(queue: asyncio.Queue[dict[str, Any]], event: dict[str, Any]) -> None:
+        try:
+            queue.put_nowait(event)
+        except asyncio.QueueFull:
+            pass
+
+    def subscribe(self) -> tuple[asyncio.AbstractEventLoop, asyncio.Queue[dict[str, Any]]]:
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=128)
+        sub = (loop, queue)
+        with self._sub_lock:
+            self._subscribers.add(sub)
+        return sub
+
+    def unsubscribe(self, sub: tuple[asyncio.AbstractEventLoop, asyncio.Queue[dict[str, Any]]]) -> None:
+        with self._sub_lock:
+            self._subscribers.discard(sub)
+
+    def publish(self, event: dict[str, Any]) -> None:
+        with self._sub_lock:
+            subs = list(self._subscribers)
+        for loop, queue in subs:
+            if loop.is_closed():
+                self.unsubscribe((loop, queue))
+                continue
+            try:
+                loop.call_soon_threadsafe(self._enqueue_nowait, queue, event)
+            except RuntimeError:
+                self.unsubscribe((loop, queue))
+
+    def close(self) -> None:
+        with self._sub_lock:
+            subs = list(self._subscribers)
+            self._subscribers.clear()
+        for loop, queue in subs:
+            if not loop.is_closed():
+                try:
+                    loop.call_soon_threadsafe(self._enqueue_nowait, queue, {"type": "_shutdown"})
+                except RuntimeError:
+                    pass
+        with self._lock:
+            if self._conn is not None:
+                try:
+                    if self._conn.in_transaction:
+                        self._conn.commit()
+                finally:
+                    self._conn.close()
+                    self._conn = None
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
@@ -70,6 +146,23 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_media_created_at ON media_items(created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_media_type ON media_items(media_type);
                 CREATE INDEX IF NOT EXISTS idx_media_drive ON media_items(drive_name);
+
+                CREATE TABLE IF NOT EXISTS media_tags (
+                    media_id TEXT NOT NULL,
+                    tag TEXT NOT NULL,
+                    PRIMARY KEY (media_id, tag)
+                );
+                CREATE INDEX IF NOT EXISTS idx_media_tags_tag ON media_tags(tag);
+                CREATE INDEX IF NOT EXISTS idx_media_tags_media_id ON media_tags(media_id);
+
+                CREATE VIRTUAL TABLE IF NOT EXISTS media_fts USING fts5(
+                    media_id UNINDEXED,
+                    title,
+                    filename,
+                    folder,
+                    tags,
+                    source_url
+                );
 
                 CREATE TABLE IF NOT EXISTS media_parts (
                     media_id TEXT NOT NULL,
@@ -135,6 +228,30 @@ class Database:
             if "progress" not in job_cols:
                 conn.execute("ALTER TABLE ingest_jobs ADD COLUMN progress REAL NOT NULL DEFAULT 0")
 
+            # Backfill media_tags for legacy DBs
+            tag_rows = conn.execute(
+                "SELECT id, tags FROM media_items WHERE COALESCE(tags, '') != ''"
+            ).fetchall()
+            tag_pairs: list[tuple[str, str]] = []
+            for r in tag_rows:
+                for t in normalize_tags(r["tags"]):
+                    tag_pairs.append((r["id"], t))
+            if tag_pairs:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO media_tags (media_id, tag) VALUES (?, ?)",
+                    tag_pairs,
+                )
+
+            # Backfill media_fts for legacy DBs
+            conn.execute(
+                """
+                INSERT INTO media_fts (media_id, title, filename, folder, tags, source_url)
+                SELECT m.id, m.title, m.filename, m.folder, COALESCE(m.tags, ''), COALESCE(m.source_url, '')
+                FROM media_items m
+                WHERE NOT EXISTS (SELECT 1 FROM media_fts f WHERE f.media_id = m.id)
+                """
+            )
+
     def create_job(self, source_origin: str, source_kind: str, source_ref: str) -> str:
         job_id = uuid.uuid4().hex[:12]
         now = utc_now_iso()
@@ -147,6 +264,7 @@ class Database:
                 """,
                 (job_id, source_origin, source_kind, source_ref, now, now),
             )
+        self.publish({"type": "job_update", "job_id": job_id, "status": "queued"})
         return job_id
 
     def update_job(
@@ -176,6 +294,7 @@ class Database:
                 f"UPDATE ingest_jobs SET {', '.join(sets)} WHERE id = ?",
                 params,
             )
+        self.publish({"type": "job_update", "job_id": job_id, "status": status})
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
@@ -201,7 +320,10 @@ class Database:
                 """,
                 (message, now),
             )
-            return int(cur.rowcount or 0)
+            count = int(cur.rowcount or 0)
+        if count > 0:
+            self.publish({"type": "job_update", "job_id": "*", "status": "failed"})
+        return count
 
     @staticmethod
     def _hydrate_media(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
@@ -236,7 +358,8 @@ class Database:
     ) -> dict[str, Any]:
         now = utc_now_iso()
         resolved_part_count = len(parts) if (parts and part_count == 1) else max(1, int(part_count))
-        normalized_tags = ",".join(normalize_tags(tags))
+        tag_list = normalize_tags(tags)
+        normalized_tags = ",".join(tag_list)
         with self._connect() as conn:
             conn.execute(
                 """
@@ -270,6 +393,18 @@ class Database:
                     now,
                 ),
             )
+            if tag_list:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO media_tags (media_id, tag) VALUES (?, ?)",
+                    [(media_id, t) for t in tag_list],
+                )
+            conn.execute(
+                """
+                INSERT INTO media_fts (media_id, title, filename, folder, tags, source_url)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (media_id, title, filename, folder, normalized_tags, source_url or ""),
+            )
             if parts:
                 for p in parts:
                     conn.execute(
@@ -294,7 +429,8 @@ class Database:
             row = conn.execute("SELECT * FROM media_items WHERE id = ?", (media_id,)).fetchone()
             item = self._hydrate_media(row)
             item["parts"] = self._resolve_parts_for_item(conn, item)
-            return item
+        self.publish({"type": "media_update", "media_id": media_id, "action": "insert"})
+        return item
 
     def update_media_topic(self, media_id: str, topic_id: int) -> None:
         with self._connect() as conn:
@@ -304,7 +440,8 @@ class Database:
             )
 
     def update_media_tags(self, media_id: str, tags: str | list[str] | None) -> dict[str, Any] | None:
-        normalized = ",".join(normalize_tags(tags))
+        tag_list = normalize_tags(tags)
+        normalized = ",".join(tag_list)
         with self._connect() as conn:
             conn.execute(
                 "UPDATE media_items SET tags = ? WHERE id = ?",
@@ -313,9 +450,31 @@ class Database:
             row = conn.execute("SELECT * FROM media_items WHERE id = ?", (media_id,)).fetchone()
             if not row:
                 return None
+            conn.execute("DELETE FROM media_tags WHERE media_id = ?", (media_id,))
+            if tag_list:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO media_tags (media_id, tag) VALUES (?, ?)",
+                    [(media_id, t) for t in tag_list],
+                )
+            conn.execute("DELETE FROM media_fts WHERE media_id = ?", (media_id,))
+            conn.execute(
+                """
+                INSERT INTO media_fts (media_id, title, filename, folder, tags, source_url)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    media_id,
+                    row["title"],
+                    row["filename"],
+                    row["folder"],
+                    normalized,
+                    row["source_url"] or "",
+                ),
+            )
             item = self._hydrate_media(row)
             item["parts"] = self._resolve_parts_for_item(conn, item)
-            return item
+        self.publish({"type": "media_update", "media_id": media_id, "action": "tags"})
+        return item
 
     def list_media(
         self,
@@ -329,42 +488,70 @@ class Database:
         limit: int = 60,
         offset: int = 0,
     ) -> tuple[list[dict[str, Any]], int]:
-        where = []
-        params: list[Any] = []
+        base_where: list[str] = []
+        base_params: list[Any] = []
 
         if media_type and media_type != "all":
-            where.append("media_type = ?")
-            params.append(media_type)
+            base_where.append("media_type = ?")
+            base_params.append(media_type)
         if drive_name and drive_name != "all":
-            where.append("drive_name = ?")
-            params.append(drive_name)
+            base_where.append("drive_name = ?")
+            base_params.append(drive_name)
         if folder and folder != "all":
-            where.append("folder = ?")
-            params.append(folder)
+            base_where.append("folder = ?")
+            base_params.append(folder)
         if tag and tag != "all":
             clean_tags = normalize_tags(tag)
             for t in clean_tags:
-                where.append("(',' || COALESCE(tags, '') || ',') LIKE ?")
-                params.append(f"%,{t},%")
-        if q:
-            where.append(
-                "(title LIKE ? OR filename LIKE ? OR folder LIKE ? OR COALESCE(tags, '') LIKE ? OR COALESCE(source_url, '') LIKE ?)"
-            )
-            pattern = f"%{q}%"
-            params.extend([pattern, pattern, pattern, pattern, pattern])
+                base_where.append(
+                    "EXISTS (SELECT 1 FROM media_tags mt WHERE mt.media_id = media_items.id AND mt.tag = ?)"
+                )
+                base_params.append(t)
 
-        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
         order_sql = "ORDER BY size_bytes DESC" if sort == "largest" else "ORDER BY created_at DESC"
 
-        with self._connect() as conn:
+        def _run_query(
+            conn: sqlite3.Connection,
+            extra_where: list[str],
+            extra_params: list[Any],
+        ) -> tuple[list[sqlite3.Row], int]:
+            all_where = base_where + extra_where
+            all_params = base_params + extra_params
+            where_sql = f"WHERE {' AND '.join(all_where)}" if all_where else ""
             total = conn.execute(
                 f"SELECT COUNT(*) FROM media_items {where_sql}",
-                params,
+                all_params,
             ).fetchone()[0]
             rows = conn.execute(
                 f"SELECT * FROM media_items {where_sql} {order_sql} LIMIT ? OFFSET ?",
-                [*params, limit, offset],
+                [*all_params, limit, offset],
             ).fetchall()
+            return rows, total
+
+        with self._connect() as conn:
+            if q:
+                tokens = _FTS_TOKEN_RE.findall(q)
+                if tokens:
+                    fts_query = " AND ".join(f'"{tok}"*' for tok in tokens)
+                    rows, total = _run_query(
+                        conn,
+                        ["media_items.id IN (SELECT media_id FROM media_fts WHERE media_fts MATCH ?)"],
+                        [fts_query],
+                    )
+                    if total > 0:
+                        return [self._hydrate_media(r) for r in rows], total
+
+                pattern = f"%{q}%"
+                rows, total = _run_query(
+                    conn,
+                    [
+                        "(title LIKE ? OR filename LIKE ? OR folder LIKE ? OR COALESCE(tags, '') LIKE ? OR COALESCE(source_url, '') LIKE ?)"
+                    ],
+                    [pattern, pattern, pattern, pattern, pattern],
+                )
+                return [self._hydrate_media(r) for r in rows], total
+
+            rows, total = _run_query(conn, [], [])
             return [self._hydrate_media(r) for r in rows], total
 
     def list_folders(self) -> list[str]:
@@ -382,12 +569,9 @@ class Database:
     def list_tags(self) -> list[str]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT DISTINCT tags FROM media_items WHERE COALESCE(tags, '') != ''"
+                "SELECT DISTINCT tag FROM media_tags ORDER BY tag ASC"
             ).fetchall()
-            unique: set[str] = set()
-            for r in rows:
-                unique.update(normalize_tags(r["tags"]))
-            return sorted(unique)
+            return [r["tag"] for r in rows if r["tag"]]
 
     def _get_media_parts_conn(self, conn: sqlite3.Connection, media_id: str) -> list[dict[str, Any]]:
         rows = conn.execute(
@@ -437,10 +621,13 @@ class Database:
                 return None
             parts = self._get_media_parts_conn(conn, media_id)
             conn.execute("DELETE FROM media_parts WHERE media_id = ?", (media_id,))
+            conn.execute("DELETE FROM media_tags WHERE media_id = ?", (media_id,))
+            conn.execute("DELETE FROM media_fts WHERE media_id = ?", (media_id,))
             conn.execute("DELETE FROM media_items WHERE id = ?", (media_id,))
             item = self._hydrate_media(row)
             item["parts"] = parts
-            return item
+        self.publish({"type": "media_update", "media_id": media_id, "action": "delete"})
+        return item
 
     def get_topic_id(self, chat_id: str, folder_name: str) -> int | None:
         with self._connect() as conn:
