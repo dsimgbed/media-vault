@@ -11,7 +11,7 @@ from importlib.metadata import PackageNotFoundError, version as pkg_version
 from pathlib import Path
 from typing import Any
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -109,13 +109,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     allocator = DriveAllocator(cfg)
     ingest = IngestService(cfg, db, allocator)
     tg_pool = TelegramPool(cfg, db, allocator, ingest)
+    ingest.recover_on_startup()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        ingest.recover_on_startup()
         await tg_pool.start()
         try:
             yield
         finally:
+            await ingest.shutdown()
             await tg_pool.stop()
 
     app = FastAPI(title="Media Ingest & Gallery", lifespan=lifespan)
@@ -150,6 +153,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "auth_required": bool(cfg.web_auth_token.strip()),
             "max_upload_mb": cfg.max_upload_mb,
             "telegram_part_size_mb": cfg.telegram_part_size_mb,
+            "ingest_concurrency": cfg.ingest_concurrency,
             "ytdlp_cookies_configured": cookies_ok,
             "ytdlp_version": ytdlp_ver,
         }
@@ -231,7 +235,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"deleted": True, "ytdlp_cookies_configured": False}
 
     @app.post("/api/ingest/url", status_code=202, dependencies=[Depends(require_auth)])
-    async def ingest_url(payload: UrlIngestRequest, background_tasks: BackgroundTasks):
+    async def ingest_url(payload: UrlIngestRequest):
         url = payload.url.strip()
         if not url.startswith(("http://", "https://")):
             raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
@@ -241,26 +245,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc))
 
         job_id = db.create_job("web", "url", url)
-
-        async def runner():
-            try:
-                await ingest.process_url_job(
-                    job_id,
-                    url,
-                    source_origin="web",
-                    folder=payload.folder,
-                    tags=payload.tags,
-                    title=payload.title,
-                    forward_to_telegram=payload.forward_to_telegram,
-                    format_spec=payload.format_spec,
-                )
-            except Exception as exc:
-                logger.warning("URL job %s failed: %s", job_id, exc)
-
-        background_tasks.add_task(runner)
+        ingest.submit_job(
+            job_id,
+            ingest.process_url_job(
+                job_id,
+                url,
+                source_origin="web",
+                folder=payload.folder,
+                tags=payload.tags,
+                title=payload.title,
+                forward_to_telegram=payload.forward_to_telegram,
+                format_spec=payload.format_spec,
+            ),
+        )
         return {"job_id": job_id, "status": "queued"}
 
-    @app.post("/api/ingest/upload", status_code=201, dependencies=[Depends(require_auth)])
+    @app.post("/api/ingest/upload", status_code=202, dependencies=[Depends(require_auth)])
     async def ingest_upload(
         file: UploadFile = File(...),
         title: str | None = Form(default=None),
@@ -289,16 +289,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         )
                     await asyncio.to_thread(out.write, chunk)
 
-            item = await ingest.process_staged_upload_job(
+            db.update_job(
                 job_id,
-                staged_path,
-                source_origin="web",
-                folder=folder,
-                tags=tags,
-                title=title or Path(raw_name).stem,
-                forward_to_telegram=forward_to_telegram,
+                status="queued",
+                progress=50.0,
+                message=f"Staged {raw_name}, queued for processing...",
             )
-            return {"job_id": job_id, "item": item}
+            ingest.submit_job(
+                job_id,
+                ingest.process_staged_upload_job(
+                    job_id,
+                    staged_path,
+                    source_origin="web",
+                    folder=folder,
+                    tags=tags,
+                    title=title or Path(raw_name).stem,
+                    forward_to_telegram=forward_to_telegram,
+                ),
+            )
+            return {"job_id": job_id, "status": "queued"}
         except HTTPException as he:
             shutil.rmtree(job_dir, ignore_errors=True)
             db.update_job(job_id, status="failed", message=str(he.detail))
@@ -308,7 +317,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             db.update_job(job_id, status="failed", message=str(exc))
             raise HTTPException(status_code=500, detail=str(exc))
 
-    @app.post("/api/ingest/upload-folder", status_code=201, dependencies=[Depends(require_auth)])
+    @app.post("/api/ingest/upload-folder", status_code=202, dependencies=[Depends(require_auth)])
     async def ingest_upload_folder(
         files: list[UploadFile] = File(...),
         relative_paths: list[str] = Form(default=[]),
@@ -377,16 +386,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     detail=f"Folder archive exceeds {cfg.max_upload_mb} MB limit.",
                 )
 
-            item = await ingest.process_staged_upload_job(
+            db.update_job(
                 job_id,
-                zip_path,
-                source_origin="web",
-                folder=folder,
-                tags=tags,
-                title=folder_title,
-                forward_to_telegram=forward_to_telegram,
+                status="queued",
+                progress=50.0,
+                message=f"Staged {zip_filename}, queued for processing...",
             )
-            return {"job_id": job_id, "item": item}
+            ingest.submit_job(
+                job_id,
+                ingest.process_staged_upload_job(
+                    job_id,
+                    zip_path,
+                    source_origin="web",
+                    folder=folder,
+                    tags=tags,
+                    title=folder_title,
+                    forward_to_telegram=forward_to_telegram,
+                ),
+            )
+            return {"job_id": job_id, "status": "queued"}
         except HTTPException as he:
             shutil.rmtree(job_dir, ignore_errors=True)
             db.update_job(job_id, status="failed", message=str(he.detail))

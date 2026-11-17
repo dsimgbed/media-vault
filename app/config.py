@@ -52,6 +52,8 @@ class Settings(BaseSettings):
 
     ytdlp_cookies_file: Path = Path("./data/cookies.txt")
     ytdlp_proxy: str = ""
+    ingest_concurrency: int = 3
+    ytdlp_concurrent_fragments: int = 4
 
     @property
     def db_path(self) -> Path:

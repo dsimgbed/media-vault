@@ -18,7 +18,13 @@ from typing import Any
 
 import httpx
 from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError, RPCError
+from telethon.errors import (
+    EntityBoundsInvalidError,
+    FloodWaitError,
+    MediaCaptionTooLongError,
+    MessageTooLongError,
+    RPCError,
+)
 
 from app.allocator import DriveAllocator, fmt_size, sanitize_folder
 from app.config import Settings, TelegramApiConfig
@@ -32,6 +38,130 @@ FOLDER_HASH_RE = re.compile(r"(?:^|\s)#([A-Za-z0-9_/-]{1,64})")
 FOLDER_KV_RE = re.compile(r"(?:^|\s)(?:folder|dir):([A-Za-z0-9_./-]{1,64})", re.IGNORECASE)
 FORMAT_KV_RE = re.compile(r"(?:^|\s)(?:format|fmt|q):([A-Za-z0-9_+/\[\]<=.,:-]{1,48})", re.IGNORECASE)
 TAG_KV_RE = re.compile(r"(?:^|\s)(?:tag|tags):([A-Za-z0-9_#,-]{1,128})", re.IGNORECASE)
+TELEGRAM_CAPTION_MAX_UTF16 = 1024
+TELEGRAM_NON_RETRYABLE_CAPTION_ERRORS = (
+    MediaCaptionTooLongError,
+    MessageTooLongError,
+    EntityBoundsInvalidError,
+)
+
+
+def _utf16_len(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _truncate_utf16(text: str, max_units: int, suffix: str = "...") -> str:
+    if max_units <= 0:
+        return ""
+    if _utf16_len(text) <= max_units:
+        return text
+    suffix_units = _utf16_len(suffix)
+    if max_units <= suffix_units:
+        out: list[str] = []
+        used = 0
+        for ch in text:
+            ch_u = _utf16_len(ch)
+            if used + ch_u > max_units:
+                break
+            out.append(ch)
+            used += ch_u
+        return "".join(out)
+    budget = max_units - suffix_units
+    out = []
+    used = 0
+    for ch in text:
+        ch_u = _utf16_len(ch)
+        if used + ch_u > budget:
+            break
+        out.append(ch)
+        used += ch_u
+    return "".join(out) + suffix
+
+
+def build_archive_caption(
+    *,
+    filename: str,
+    folder: str,
+    size_bytes: int,
+    gallery_link: str,
+    tags: list[str] | None = None,
+    source_url: str | None = None,
+    part_index: int | None = None,
+    total_parts: int | None = None,
+    part_size_bytes: int | None = None,
+    max_len: int = TELEGRAM_CAPTION_MAX_UTF16,
+) -> str:
+    clean_name = " ".join(str(filename or "file").splitlines()).strip() or "file"
+    clean_folder = " ".join(str(folder or "General").splitlines()).strip() or "General"
+    clean_gallery = " ".join(str(gallery_link or "").splitlines()).strip()
+    clean_source = " ".join(str(source_url or "").splitlines()).strip()
+
+    is_multipart = part_index is not None and total_parts is not None
+    part_suffix = f" (Part {part_index + 1}/{total_parts})" if is_multipart else ""
+    meta_suffix = (
+        f" • Part Size: {fmt_size(part_size_bytes or 0)} • Total: {fmt_size(size_bytes)}"
+        if is_multipart
+        else f" • Size: {fmt_size(size_bytes)}"
+    )
+    gallery_line = f"Gallery: {clean_gallery}"
+
+    def _render_core(name_val: str, folder_val: str) -> str:
+        return "\n".join(
+            [
+                f"**{name_val}**{part_suffix}",
+                f"Folder: `{folder_val}`{meta_suffix}",
+                gallery_line,
+            ]
+        )
+
+    if _utf16_len(_render_core(clean_name, clean_folder)) > max_len:
+        overhead = _utf16_len(_render_core("", clean_folder))
+        if max_len - overhead < 24:
+            folder_budget = max(8, _utf16_len(clean_folder) - (overhead + 24 - max_len))
+            clean_folder = _truncate_utf16(clean_folder, folder_budget)
+            overhead = _utf16_len(_render_core("", clean_folder))
+        name_budget = max(1, max_len - overhead)
+        clean_name = _truncate_utf16(clean_name, name_budget)
+
+    lines = [
+        f"**{clean_name}**{part_suffix}",
+        f"Folder: `{clean_folder}`{meta_suffix}",
+    ]
+
+    norm_tags = normalize_tags(tags)
+    if norm_tags:
+        core_len = _utf16_len("\n".join([*lines, gallery_line]))
+        reserve_source = min(_utf16_len(f"\nSource: {clean_source}"), 120) if clean_source else 0
+        tag_budget = max(0, max_len - core_len - 1 - reserve_source)
+        tag_prefix = "Tags: "
+        if tag_budget > _utf16_len(tag_prefix) + 2:
+            kept: list[str] = []
+            used = _utf16_len(tag_prefix)
+            for tag in norm_tags:
+                token = f"#{tag}" if not kept else f" #{tag}"
+                tok_len = _utf16_len(token)
+                if used + tok_len > tag_budget:
+                    break
+                kept.append(token)
+                used += tok_len
+            if kept:
+                lines.append(tag_prefix + "".join(kept))
+
+    lines.append(gallery_line)
+
+    if clean_source:
+        source_prefix = "Source: "
+        used_len = _utf16_len("\n".join(lines))
+        avail = max_len - used_len - 1 - _utf16_len(source_prefix)
+        if _utf16_len(clean_source) <= avail:
+            lines.append(f"{source_prefix}{clean_source}")
+        elif avail >= 16:
+            lines.append(f"{source_prefix}{_truncate_utf16(clean_source, avail)}")
+
+    caption = "\n".join(lines)
+    if _utf16_len(caption) > max_len:
+        caption = _truncate_utf16(caption, max_len)
+    return caption
 
 
 class FileSliceReader(io.RawIOBase):
@@ -438,19 +568,21 @@ class TelegramPool:
         progress_cb = payload.get("progress_cb")
 
         tags = normalize_tags(payload.get("tags"))
-        tags_line = f"Tags: {' '.join(f'#{t}' for t in tags)}" if tags else None
+        gallery_link = self._gallery_link(payload["media_id"])
 
         if size_bytes <= part_size:
-            caption_lines = [
-                f"**{payload['filename']}**",
-                f"Folder: `{folder}` • Size: {fmt_size(size_bytes)}",
-            ]
-            if tags_line:
-                caption_lines.append(tags_line)
-            caption_lines.append(f"Gallery: {self._gallery_link(payload['media_id'])}")
-            if payload.get("source_url"):
-                caption_lines.append(f"Source: {payload['source_url']}")
-            caption = "\n".join(caption_lines)
+            caption = build_archive_caption(
+                filename=payload["filename"],
+                folder=folder,
+                size_bytes=size_bytes,
+                gallery_link=gallery_link,
+                tags=tags,
+                source_url=payload.get("source_url"),
+            )
+            fallback_caption = _truncate_utf16(
+                " ".join(str(payload["filename"] or "file").splitlines()).strip() or "file",
+                120,
+            )
 
             last_err: Exception | None = None
             last_ul_report = 0.0
@@ -498,34 +630,43 @@ class TelegramPool:
                     if not use_zero_copy_media:
                         await _ensure_local_file()
 
-                    async def _send_with_topic(tid: int | None):
+                    async def _send_with_topic(tid: int | None, send_caption: str = caption):
                         if use_zero_copy_media:
                             return await client.send_file(
                                 peer,
                                 tg_source["message"].media,
-                                caption=caption,
+                                caption=send_caption,
                                 reply_to=tid,
                                 supports_streaming=True,
                             )
                         return await client.send_file(
                             peer,
                             str(payload["local_path"]),
-                            caption=caption,
+                            caption=send_caption,
                             reply_to=tid,
                             supports_streaming=True,
                             progress_callback=_tg_upload_progress if progress_cb else None,
                         )
 
                     try:
-                        sent = await _send_with_topic(topic_id)
+                        sent = await _send_with_topic(topic_id, caption)
                     except FloodWaitError:
                         raise
+                    except TELEGRAM_NON_RETRYABLE_CAPTION_ERRORS:
+                        if use_zero_copy_media:
+                            logger.warning(
+                                "Caption rejected on worker '%s'; retrying zero-copy send with compact caption.",
+                                cfg.name,
+                            )
+                            sent = await _send_with_topic(topic_id, fallback_caption)
+                        else:
+                            raise
                     except RPCError as rpc_err:
                         err_text = str(rpc_err).upper()
                         if topic_id and topic_id != 1 and ("TOPIC" in err_text or "REPLY" in err_text or "THREAD" in err_text):
                             logger.info("Cached topic %s invalid for '%s'; recreating...", topic_id, folder)
                             topic_id = await self._ensure_topic_id(cfg, chat_key, folder, force_recreate=True)
-                            sent = await _send_with_topic(topic_id)
+                            sent = await _send_with_topic(topic_id, caption)
                         elif use_zero_copy_media and len(self.clients) <= 1:
                             logger.warning(
                                 "Zero-copy send_file failed on worker '%s' (%s); falling back to disk upload.",
@@ -534,7 +675,7 @@ class TelegramPool:
                             )
                             await _ensure_local_file()
                             use_zero_copy_media = False
-                            sent = await _send_with_topic(topic_id)
+                            sent = await _send_with_topic(topic_id, caption)
                         else:
                             raise
 
@@ -563,6 +704,8 @@ class TelegramPool:
                     self._cooldown_until[cfg.name] = time.monotonic() + fw.seconds
                     logger.warning("Worker '%s' hit FloodWait (%ss) mirroring to topic; trying next worker.", cfg.name, fw.seconds)
                     last_err = fw
+                except TELEGRAM_NON_RETRYABLE_CAPTION_ERRORS:
+                    raise
                 except Exception as exc:
                     logger.warning("Worker '%s' failed mirroring to topic: %s", cfg.name, exc)
                     last_err = exc
@@ -609,16 +752,21 @@ class TelegramPool:
             chunk_len = end_byte - start_byte + 1
             part_name = f"{payload['filename']}.part{part_index + 1:03d}of{total_parts:03d}"
 
-            caption_lines = [
-                f"**{payload['filename']}** (Part {part_index + 1}/{total_parts})",
-                f"Folder: `{folder}` • Part Size: {fmt_size(chunk_len)} • Total: {fmt_size(size_bytes)}",
-            ]
-            if tags_line:
-                caption_lines.append(tags_line)
-            caption_lines.append(f"Gallery: {self._gallery_link(payload['media_id'])}")
-            if payload.get("source_url"):
-                caption_lines.append(f"Source: {payload['source_url']}")
-            part_caption = "\n".join(caption_lines)
+            part_caption = build_archive_caption(
+                filename=payload["filename"],
+                folder=folder,
+                size_bytes=size_bytes,
+                gallery_link=gallery_link,
+                tags=tags,
+                source_url=payload.get("source_url"),
+                part_index=part_index,
+                total_parts=total_parts,
+                part_size_bytes=chunk_len,
+            )
+            fallback_part_caption = _truncate_utf16(
+                f"{' '.join(str(payload['filename'] or 'file').splitlines()).strip() or 'file'} (Part {part_index + 1}/{total_parts})",
+                160,
+            )
 
             async with sem:
                 last_part_err: Exception | None = None
@@ -639,14 +787,26 @@ class TelegramPool:
                             )
 
                         part_topic_id = shared_topic_id
-                        try:
-                            sent = await client.send_file(
+
+                        async def _send_part(tid: int | None, cap: str):
+                            return await client.send_file(
                                 peer,
                                 uploaded_handle,
-                                caption=part_caption,
-                                reply_to=part_topic_id,
+                                caption=cap,
+                                reply_to=tid,
                                 force_document=True,
                             )
+
+                        try:
+                            sent = await _send_part(part_topic_id, part_caption)
+                        except TELEGRAM_NON_RETRYABLE_CAPTION_ERRORS:
+                            logger.warning(
+                                "Caption rejected for part %s/%s on worker '%s'; retrying with compact caption.",
+                                part_index + 1,
+                                total_parts,
+                                cfg.name,
+                            )
+                            sent = await _send_part(part_topic_id, fallback_part_caption)
                         except RPCError as rpc_err:
                             err_text = str(rpc_err).upper()
                             if (
@@ -661,13 +821,10 @@ class TelegramPool:
                                     cfg, chat_key, folder, force_recreate=True
                                 )
                                 shared_topic_id = part_topic_id
-                                sent = await client.send_file(
-                                    peer,
-                                    uploaded_handle,
-                                    caption=part_caption,
-                                    reply_to=part_topic_id,
-                                    force_document=True,
-                                )
+                                try:
+                                    sent = await _send_part(part_topic_id, part_caption)
+                                except TELEGRAM_NON_RETRYABLE_CAPTION_ERRORS:
+                                    sent = await _send_part(part_topic_id, fallback_part_caption)
                             else:
                                 raise
 
@@ -693,6 +850,8 @@ class TelegramPool:
                             total_parts,
                         )
                         last_part_err = fw
+                    except TELEGRAM_NON_RETRYABLE_CAPTION_ERRORS:
+                        raise
                     except Exception as exc:
                         logger.warning(
                             "Worker '%s' failed uploading part %s/%s: %s",
@@ -1147,7 +1306,8 @@ class TelegramPool:
         format_spec: str | None = None,
         tags: list[str] | None = None,
     ) -> None:
-        status_msg = await event.reply(f"[{cfg.name}] Queued → `{folder}`: {url}")
+        display_url = _truncate_utf16(url, 600)
+        status_msg = await event.reply(f"[{cfg.name}] Queued → `{folder}`: {display_url}")
         job_id = self.db.create_job("telegram", "url", url)
         last_edit = 0.0
 
@@ -1162,7 +1322,10 @@ class TelegramPool:
                     pass
 
         try:
-            await status_msg.edit(f"[{cfg.name}] Downloading → `{folder}`: {url}")
+            try:
+                await status_msg.edit(f"[{cfg.name}] Downloading → `{folder}`: {display_url}")
+            except Exception:
+                pass
             items = await self.ingest.process_url_job(
                 job_id,
                 url,
@@ -1180,12 +1343,13 @@ class TelegramPool:
                     f"• `{it['filename']}` ({fmt_size(it['size_bytes'])}) → `{it['drive_name']}`{topic_note}\n"
                     f"  View: {self._gallery_link(it['id'])}"
                 )
-            await status_msg.edit("\n".join(lines))
+            await status_msg.edit(_truncate_utf16("\n".join(lines), 4000))
         except FloodWaitError as fw:
             self.db.update_job(job_id, status="failed", message=f"Telegram flood wait: {fw.seconds}s")
             await status_msg.edit(f"[{cfg.name}] Rate limited by Telegram for {fw.seconds}s. Try another worker/bot.")
         except Exception as exc:
-            await status_msg.edit(f"[{cfg.name}] Failed:\n`{exc}`")
+            err_msg = _truncate_utf16(str(exc), 1500)
+            await status_msg.edit(f"[{cfg.name}] Failed:\n`{err_msg}`")
 
     @staticmethod
     def _classify_telegram_media(filename: str, message: Any) -> tuple[str, str]:
@@ -1396,6 +1560,7 @@ class TelegramPool:
             await status_msg.edit(f"[{cfg.name}] Rate limited by Telegram for {fw.seconds}s. Try another worker/bot.")
         except Exception as exc:
             self.db.update_job(job_id, status="failed", message=str(exc))
-            await status_msg.edit(f"[{cfg.name}] Failed:\n`{exc}`")
+            err_msg = _truncate_utf16(str(exc), 1500)
+            await status_msg.edit(f"[{cfg.name}] Failed:\n`{err_msg}`")
         finally:
             shutil.rmtree(job_dir, ignore_errors=True)

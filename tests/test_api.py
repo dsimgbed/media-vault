@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import time
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -45,6 +46,28 @@ def _sample_jpeg_bytes() -> bytes:
     return buf.getvalue()
 
 
+def _wait_for_upload_item(client: TestClient, resp, *, timeout: float = 5.0) -> dict:
+    assert resp.status_code == 202, resp.text
+    body = resp.json()
+    job_id = body["job_id"]
+    deadline = time.monotonic() + timeout
+    job = None
+    while time.monotonic() < deadline:
+        job_resp = client.get(f"/api/jobs/{job_id}")
+        assert job_resp.status_code == 200
+        job = job_resp.json()
+        if job["status"] in ("done", "failed"):
+            break
+        time.sleep(0.01)
+    assert job is not None
+    assert job["status"] == "done", f"Job {job_id} did not finish cleanly: {job}"
+    media_ids = json.loads(job["media_ids_json"])
+    assert len(media_ids) >= 1
+    media_resp = client.get(f"/api/media/{media_ids[0]}")
+    assert media_resp.status_code == 200
+    return media_resp.json()
+
+
 def test_upload_thumbnail_gallery_stream_and_delete(tmp_path: Path):
     settings = _make_settings(tmp_path)
     app = create_app(settings)
@@ -64,8 +87,7 @@ def test_upload_thumbnail_gallery_stream_and_delete(tmp_path: Path):
             "/api/ingest/upload",
             files={"file": ("sunset.jpg", jpg, "image/jpeg")},
         )
-        assert resp.status_code == 201
-        item = resp.json()["item"]
+        item = _wait_for_upload_item(client, resp)
         media_id = item["id"]
         assert item["drive_name"] == "drive1"
         assert item["media_type"] == "image"
@@ -171,8 +193,7 @@ def test_folder_routing_filtering_and_mirror_hook(tmp_path: Path):
             data={"folder": "../Vacation/2026", "forward_to_telegram": "true"},
             files={"file": ("beach.jpg", jpg, "image/jpeg")},
         )
-        assert resp.status_code == 201
-        item = resp.json()["item"]
+        item = _wait_for_upload_item(client, resp)
         assert item["folder"] == "Vacation/2026"
         assert item["telegram_topic_id"] == 42
         assert item["telegram_msg_id"] == 777
@@ -223,8 +244,7 @@ def test_telegram_only_storage_deletes_local_and_streams_range(tmp_path: Path, m
             data={"folder": "Clips"},
             files={"file": ("clip.jpg", jpg, "image/jpeg")},
         )
-        assert resp.status_code == 201
-        item = resp.json()["item"]
+        item = _wait_for_upload_item(client, resp)
         assert item["drive_name"] == "telegram"
         assert item["file_path"] == ""
         assert item["telegram_topic_id"] == 55
@@ -701,8 +721,7 @@ def test_multipart_upload_streaming_and_delete(tmp_path: Path, monkeypatch):
             data={"folder": "General"},
             files={"file": ("big_archive.bin", payload, "application/octet-stream")},
         )
-        assert resp.status_code == 201
-        item = resp.json()["item"]
+        item = _wait_for_upload_item(client, resp)
         media_id = item["id"]
         assert item["drive_name"] == "telegram"
         assert item["part_count"] == 3
@@ -853,8 +872,7 @@ def test_folder_upload_packs_zip_and_streams_valid_archive(tmp_path: Path):
                 ("files", ("settings.cfg", file_c, "text/plain")),
             ],
         )
-        assert resp.status_code == 201
-        item = resp.json()["item"]
+        item = _wait_for_upload_item(client, resp)
         assert item["filename"] == "ProjectAssets.zip"
         assert item["title"] == "ProjectAssets"
         assert item["folder"] == "Backups"
@@ -928,6 +946,8 @@ def test_db_migration_and_ui_multipart_markers(tmp_path: Path):
     assert default_settings.max_upload_mb == 20480
     assert default_settings.telegram_part_size_mb == 1900
     assert default_settings.telegram_part_size_bytes == 1900 * 1024 * 1024
+    assert default_settings.ingest_concurrency == 3
+    assert default_settings.ytdlp_concurrent_fragments == 4
 
     settings = _make_settings(tmp_path)
     app = create_app(settings)
@@ -938,6 +958,7 @@ def test_db_migration_and_ui_multipart_markers(tmp_path: Path):
         health = client.get("/api/health").json()
         assert health["max_upload_mb"] == settings.max_upload_mb
         assert health["telegram_part_size_mb"] == settings.telegram_part_size_mb
+        assert health["ingest_concurrency"] == settings.ingest_concurrency
 
 
 def test_hashtags_ingest_filter_patch_and_telegram_caption(tmp_path: Path, monkeypatch):
@@ -984,8 +1005,7 @@ def test_hashtags_ingest_filter_patch_and_telegram_caption(tmp_path: Path, monke
             files={"file": ("clip1.bin", b"a" * 128, "application/octet-stream")},
             data={"folder": "lesbian", "tags": "#soap, HD"},
         )
-        assert res1.status_code == 201
-        item1 = res1.json()["item"]
+        item1 = _wait_for_upload_item(client, res1)
         assert item1["folder"] == "lesbian"
         assert item1["tags"] == ["soap", "hd"]
         assert captured_payloads[0]["tags"] == ["soap", "hd"]
@@ -995,7 +1015,7 @@ def test_hashtags_ingest_filter_patch_and_telegram_caption(tmp_path: Path, monke
             files={"file": ("clip2.bin", b"b" * 128, "application/octet-stream")},
             data={"folder": "lesbian", "tags": "#soapy"},
         )
-        assert res2.status_code == 201
+        _wait_for_upload_item(client, res2)
 
         tags_res = client.get("/api/tags").json()
         assert tags_res["tags"] == ["hd", "soap", "soapy"]
@@ -1331,3 +1351,488 @@ def test_telegram_stream_block_cache_hits_lru_eviction_and_delete(tmp_path: Path
     assert asyncio.run(_direct_read()) == payload[:1024]
     assert asyncio.run(_direct_read()) == payload[:1024]
     assert len(sc.iter_download_calls) == 2
+
+
+def test_decoupled_202_upload_and_folder_upload_with_background_mirror_and_413(tmp_path: Path):
+    import asyncio
+    import threading
+
+    settings = _make_settings(tmp_path, storage_mode="telegram")
+    app = create_app(settings)
+
+    mirror_started = threading.Event()
+    mirror_release = threading.Event()
+    mirror_calls: list[str] = []
+
+    async def blocking_mirror(payload: dict) -> dict:
+        mirror_calls.append(payload["filename"])
+        mirror_started.set()
+        while not mirror_release.is_set():
+            await asyncio.sleep(0.01)
+        cb = payload.get("progress_cb")
+        if cb:
+            await cb(75.0, "Uploading to Telegram: 75%")
+        return {
+            "chat_id": "-100123",
+            "topic_id": 1,
+            "message_id": 100 + len(mirror_calls),
+            "worker_name": "bot1",
+        }
+
+    app.state.ingest.mirror_hook = blocking_mirror
+    jpg = _sample_jpeg_bytes()
+
+    with TestClient(app) as client:
+        # 1) Single file upload returns 202 immediately while mirror_hook is still blocked
+        resp = client.post(
+            "/api/ingest/upload",
+            data={"folder": "General"},
+            files={"file": ("async_photo.jpg", jpg, "image/jpeg")},
+        )
+        assert resp.status_code == 202
+        body = resp.json()
+        assert body["status"] == "queued"
+        job_id = body["job_id"]
+
+        assert mirror_started.wait(timeout=2.0)
+        mid_job = client.get(f"/api/jobs/{job_id}").json()
+        assert mid_job["status"] == "allocating"
+
+        # Release mirror_hook -> job transitions to done
+        mirror_release.set()
+        item = _wait_for_upload_item(client, resp)
+        assert item["filename"] == "async_photo.jpg"
+        assert item["telegram_msg_id"] == 101
+
+        # 2) Folder upload also returns 202 immediately while mirror_hook is blocked
+        mirror_started.clear()
+        mirror_release.clear()
+        folder_resp = client.post(
+            "/api/ingest/upload-folder",
+            data={"archive_name": "AsyncBundle", "relative_paths": ["AsyncBundle/a.bin"]},
+            files=[("files", ("a.bin", b"hello-bundle" * 10, "application/octet-stream"))],
+        )
+        assert folder_resp.status_code == 202
+        f_body = folder_resp.json()
+        assert f_body["status"] == "queued"
+        f_job_id = f_body["job_id"]
+
+        assert mirror_started.wait(timeout=2.0)
+        f_mid_job = client.get(f"/api/jobs/{f_job_id}").json()
+        assert f_mid_job["status"] == "allocating"
+
+        mirror_release.set()
+        f_item = _wait_for_upload_item(client, folder_resp)
+        assert f_item["filename"] == "AsyncBundle.zip"
+        assert f_item["telegram_msg_id"] == 102
+
+        # 3) 413 payload-too-large fails synchronously and cleans staging_dir
+        settings.max_upload_mb = 0
+        too_big = client.post(
+            "/api/ingest/upload",
+            files={"file": ("too_big.bin", b"12345", "application/octet-stream")},
+        )
+        assert too_big.status_code == 413
+        assert list(settings.staging_dir.iterdir()) == []
+
+        too_big_folder = client.post(
+            "/api/ingest/upload-folder",
+            data={"archive_name": "TooBigFolder", "relative_paths": ["TooBigFolder/x.bin"]},
+            files=[("files", ("x.bin", b"12345", "application/octet-stream"))],
+        )
+        assert too_big_folder.status_code == 413
+        assert list(settings.staging_dir.iterdir()) == []
+
+
+def test_bounded_concurrency_url_job_queue(tmp_path: Path, monkeypatch):
+    import asyncio
+    import threading
+
+    settings = _make_settings(tmp_path, storage_mode="drives")
+    settings.ingest_concurrency = 2
+    app = create_app(settings)
+    db = app.state.db
+
+    active_lock = threading.Lock()
+    active_count = 0
+    max_seen_active = 0
+    two_running = threading.Event()
+    release_gate = threading.Event()
+
+    async def fake_is_ddl(url: str) -> bool:
+        return False
+
+    async def fake_ytdlp(
+        url: str,
+        job_dir: Path,
+        *,
+        cookies_file=None,
+        proxy: str = "",
+        format_spec=None,
+        concurrent_fragments: int = 4,
+        on_progress=None,
+    ):
+        nonlocal active_count, max_seen_active
+        with active_lock:
+            active_count += 1
+            max_seen_active = max(max_seen_active, active_count)
+            if active_count == 2:
+                two_running.set()
+        try:
+            while not release_gate.is_set():
+                await asyncio.sleep(0.01)
+            out_file = job_dir / f"{url.rsplit('/', 1)[-1]}.mp4"
+            out_file.write_bytes(b"fake-video-bytes")
+            return [out_file]
+        finally:
+            with active_lock:
+                active_count -= 1
+
+    monkeypatch.setattr("app.ingest.is_direct_download", fake_is_ddl)
+    monkeypatch.setattr("app.ingest._download_ytdlp", fake_ytdlp)
+
+    with TestClient(app) as client:
+        job_ids = []
+        for idx in range(4):
+            res = client.post("/api/ingest/url", json={"url": f"https://example.com/vid_{idx}"})
+            assert res.status_code == 202
+            job_ids.append(res.json()["job_id"])
+
+        assert two_running.wait(timeout=2.0)
+        # Allow a moment for jobs to settle at the semaphore
+        deadline = time.monotonic() + 2.0
+        statuses = []
+        while time.monotonic() < deadline:
+            statuses = [client.get(f"/api/jobs/{jid}").json()["status"] for jid in job_ids]
+            if statuses.count("downloading") == 2 and statuses.count("queued") == 2:
+                break
+            time.sleep(0.01)
+
+        assert statuses.count("downloading") == 2
+        assert statuses.count("queued") == 2
+        assert max_seen_active <= 2
+
+        release_gate.set()
+
+        finish_deadline = time.monotonic() + 5.0
+        while time.monotonic() < finish_deadline:
+            statuses = [client.get(f"/api/jobs/{jid}").json()["status"] for jid in job_ids]
+            if all(s == "done" for s in statuses):
+                break
+            time.sleep(0.01)
+
+        assert all(s == "done" for s in statuses)
+        assert max_seen_active == 2
+        assert len(db.list_media()[0]) == 4
+
+
+def test_startup_crash_recovery_marks_stuck_jobs_and_cleans_staging(tmp_path: Path):
+    from app.db import Database
+
+    settings = _make_settings(tmp_path, storage_mode="drives")
+    settings.ensure_dirs()
+    db = Database(settings.db_path)
+
+    j_queued = db.create_job("web", "url", "https://example.com/1")
+    j_downloading = db.create_job("web", "url", "https://example.com/2")
+    db.update_job(j_downloading, status="downloading", progress=30.0, message="Downloading...")
+    j_allocating = db.create_job("web", "upload", "file.bin")
+    db.update_job(j_allocating, status="allocating", progress=75.0, message="Allocating...")
+    j_done = db.create_job("web", "upload", "ok.bin")
+    db.update_job(j_done, status="done", progress=100.0, message="Done")
+
+    orphan_dir = settings.staging_dir / "orphan_tmp"
+    orphan_dir.mkdir(parents=True, exist_ok=True)
+    (orphan_dir / "partial.part").write_bytes(b"partial")
+    orphan_file = settings.staging_dir / "stray.tmp"
+    orphan_file.write_bytes(b"stray")
+
+    app = create_app(settings)
+    with TestClient(app) as client:
+        for jid in (j_queued, j_downloading, j_allocating):
+            job = client.get(f"/api/jobs/{jid}").json()
+            assert job["status"] == "failed"
+            assert job["message"] == "Interrupted by server restart"
+
+        done_job = client.get(f"/api/jobs/{j_done}").json()
+        assert done_job["status"] == "done"
+        assert done_job["message"] == "Done"
+        assert list(settings.staging_dir.iterdir()) == []
+
+
+def test_subprocess_streaming_chunk_splitting_and_ytdlp_flags(tmp_path: Path, monkeypatch):
+    import asyncio
+    from app.ingest import _download_ytdlp, _run_subprocess_streaming
+
+    class FakeStdout:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self._chunks = list(chunks)
+
+        async def read(self, n: int) -> bytes:
+            if self._chunks:
+                return self._chunks.pop(0)
+            return b""
+
+    class FakeProc:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self.stdout = FakeStdout(chunks)
+            self.returncode = 0
+
+        async def wait(self) -> int:
+            return self.returncode
+
+    # Mix \r, \n, and \r\n across chunk boundaries + >80 lines total to verify deque cap
+    chunks = [
+        b"line_000\r",
+        b"\nline_001\rline_002\npa",
+        b"rtial_003\r\n",
+    ]
+    for i in range(4, 100):
+        chunks.append(f"line_{i:03d}\n".encode())
+    chunks.append(b"final_trailing_no_newline")
+
+    async def fake_exec(*args, **kwargs):
+        return FakeProc(chunks)
+
+    monkeypatch.setattr("app.ingest.asyncio.create_subprocess_exec", fake_exec)
+
+    seen_lines: list[str] = []
+
+    async def on_line(line: str) -> None:
+        seen_lines.append(line)
+
+    rc, tail = asyncio.run(_run_subprocess_streaming("dummy-cmd", on_line=on_line))
+    assert rc == 0
+    assert seen_lines[0] == "line_000"
+    assert seen_lines[1] == "line_001"
+    assert seen_lines[2] == "line_002"
+    assert seen_lines[3] == "partial_003"
+    assert seen_lines[-1] == "final_trailing_no_newline"
+    assert len(seen_lines) == 101
+    assert len(tail) == 80
+    assert tail == seen_lines[-80:]
+
+    # Verify _download_ytdlp passes --concurrent-fragments and faststart postprocessor-args for video only
+    recorded_args: list[tuple[str, ...]] = []
+
+    async def fake_streaming(*args: str, on_line=None):
+        recorded_args.append(args)
+        paths_idx = list(args).index("--paths")
+        out_dir = Path(args[paths_idx + 1])
+        (out_dir / "out.mp4").write_bytes(b"data")
+        return 0, []
+
+    monkeypatch.setattr("app.ingest._run_subprocess_streaming", fake_streaming)
+
+    vid_dir = tmp_path / "vid"
+    vid_dir.mkdir()
+    asyncio.run(
+        _download_ytdlp(
+            "https://example.com/watch?v=123",
+            vid_dir,
+            format_spec="720p",
+            concurrent_fragments=6,
+        )
+    )
+    vid_args = list(recorded_args[0])
+    cf_idx = vid_args.index("--concurrent-fragments")
+    assert vid_args[cf_idx + 1] == "6"
+    pp_idx = vid_args.index("--postprocessor-args")
+    assert vid_args[pp_idx + 1] == "Merger+ffmpeg:-movflags +faststart"
+
+    aud_dir = tmp_path / "aud"
+    aud_dir.mkdir()
+    asyncio.run(
+        _download_ytdlp(
+            "https://example.com/watch?v=123",
+            aud_dir,
+            format_spec="audio",
+            concurrent_fragments=3,
+        )
+    )
+    aud_args = list(recorded_args[1])
+    cf_idx_a = aud_args.index("--concurrent-fragments")
+    assert aud_args[cf_idx_a + 1] == "3"
+    assert "Merger+ffmpeg:-movflags +faststart" not in aud_args
+
+
+def test_rar_ddl_detection_caption_truncation_and_no_caption_reupload_loop(tmp_path: Path):
+    import asyncio
+    from types import SimpleNamespace
+    from telethon.errors import MediaCaptionTooLongError
+    from app.config import TelegramApiConfig
+    from app.ingest import is_direct_download
+    from app.telegram_mtproto import (
+        TELEGRAM_CAPTION_MAX_UTF16,
+        TelegramPool,
+        _utf16_len,
+        build_archive_caption,
+    )
+
+    # 1) .rar URLs are treated as direct downloads without needing HEAD
+    rar_url = (
+        "https://cdn.discordapp.com/attachments/111111111111111111/222222222222222222/"
+        "archive_release.rar?ex=673b0000&is=6739ae00&hm=" + ("a" * 1200)
+    )
+    assert asyncio.run(is_direct_download(rar_url)) is True
+
+    # 2) build_archive_caption keeps normal captions intact and caps oversized ones at <= 1024 UTF-16 units
+    short_cap = build_archive_caption(
+        filename="archive.rar",
+        folder="General",
+        size_bytes=2048,
+        gallery_link="http://localhost:8080/#media=abc123",
+        tags=["rar", "backup"],
+        source_url="https://cdn.discordapp.com/attachments/1/2/archive.rar",
+    )
+    assert "**archive.rar**" in short_cap
+    assert "Tags: #rar #backup" in short_cap
+    assert "Source: https://cdn.discordapp.com/attachments/1/2/archive.rar" in short_cap
+
+    long_cap = build_archive_caption(
+        filename="🎬_" + ("very_long_archive_name_" * 12) + ".rar",
+        folder="Discord/Archives",
+        size_bytes=50 * 1024 * 1024,
+        gallery_link="http://localhost:8080/#media=abc123def456",
+        tags=[f"tag{i}" for i in range(40)],
+        source_url=rar_url,
+    )
+    assert _utf16_len(long_cap) <= TELEGRAM_CAPTION_MAX_UTF16
+    assert "Gallery: http://localhost:8080/#media=abc123def456" in long_cap
+    assert "Source: https://cdn.discordapp.com/" in long_cap
+
+    long_part_cap = build_archive_caption(
+        filename="big_archive.rar",
+        folder="General",
+        size_bytes=3 * 1024 * 1024,
+        gallery_link="http://localhost:8080/#media=mp123",
+        tags=["archive"],
+        source_url=rar_url,
+        part_index=0,
+        total_parts=3,
+        part_size_bytes=1024 * 1024,
+    )
+    assert _utf16_len(long_part_cap) <= TELEGRAM_CAPTION_MAX_UTF16
+    assert "(Part 1/3)" in long_part_cap
+
+    # 3) Single-part mirror_to_archive_topic with long Discord .rar URL succeeds on first worker
+    settings = _make_settings(tmp_path, storage_mode="telegram")
+    settings.telegram_archive_chat_id = "-100999888"
+    app = create_app(settings)
+    pool: TelegramPool = app.state.tg_pool
+
+    staged_rar = tmp_path / "archive_release.rar"
+    staged_rar.write_bytes(b"Rar!\x1a\x07\x01\x00" + b"x" * 1024)
+
+    class RecordingWorker:
+        def __init__(self, name: str, *, fail_caption: bool = False) -> None:
+            self.name = name
+            self.fail_caption = fail_caption
+            self.send_calls: list[str] = []
+            self.upload_calls = 0
+
+        async def get_input_entity(self, target):
+            return target
+
+        async def upload_file(self, reader, *, file_size: int, file_name: str, progress_callback=None):
+            self.upload_calls += 1
+            while reader.read(65536):
+                pass
+            return SimpleNamespace(file_name=file_name, file_size=file_size)
+
+        async def send_file(self, peer, file_arg, *, caption: str = "", **_):
+            self.send_calls.append(caption)
+            if self.fail_caption and len(caption) > 200:
+                raise MediaCaptionTooLongError(request=None)
+            if self.fail_caption and not isinstance(file_arg, SimpleNamespace):
+                raise MediaCaptionTooLongError(request=None)
+            return SimpleNamespace(id=700 + len(self.send_calls))
+
+    w1 = RecordingWorker("bot1")
+    w2 = RecordingWorker("bot2")
+    pool.clients = [
+        (TelegramApiConfig(name="bot1", api_id=1, api_hash="h", bot_token="t1"), w1),
+        (TelegramApiConfig(name="bot2", api_id=2, api_hash="h", bot_token="t2"), w2),
+    ]
+
+    res = asyncio.run(
+        pool.mirror_to_archive_topic(
+            {
+                "media_id": "rar001",
+                "title": "archive_release",
+                "filename": staged_rar.name,
+                "folder": "General",
+                "tags": ["discord"],
+                "media_type": "file",
+                "size_bytes": staged_rar.stat().st_size,
+                "local_path": staged_rar,
+                "source_url": rar_url,
+            }
+        )
+    )
+    assert res is not None
+    assert res["worker_name"] == "bot1"
+    assert len(w1.send_calls) == 1
+    assert len(w2.send_calls) == 0
+    assert _utf16_len(w1.send_calls[0]) <= TELEGRAM_CAPTION_MAX_UTF16
+
+    # 4) If MediaCaptionTooLongError ever occurs on single-part disk send_file, it does NOT retry across remaining workers
+    f1 = RecordingWorker("bot1", fail_caption=True)
+    f2 = RecordingWorker("bot2", fail_caption=True)
+    pool.clients = [
+        (TelegramApiConfig(name="bot1", api_id=1, api_hash="h", bot_token="t1"), f1),
+        (TelegramApiConfig(name="bot2", api_id=2, api_hash="h", bot_token="t2"), f2),
+    ]
+    try:
+        asyncio.run(
+            pool.mirror_to_archive_topic(
+                {
+                    "media_id": "rar002",
+                    "title": "archive_release",
+                    "filename": staged_rar.name,
+                    "folder": "General",
+                    "tags": [],
+                    "media_type": "file",
+                    "size_bytes": staged_rar.stat().st_size,
+                    "local_path": staged_rar,
+                    "source_url": rar_url,
+                }
+            )
+        )
+        assert False, "Expected MediaCaptionTooLongError"
+    except MediaCaptionTooLongError:
+        pass
+    assert len(f1.send_calls) + len(f2.send_calls) == 1
+
+    # 5) On multi-part upload, if send_file rejects caption, it reuses uploaded_handle with compact caption without re-uploading
+    settings.telegram_part_size_mb = 1
+    big_rar = tmp_path / "big_release.rar"
+    big_rar.write_bytes(b"R" * (1024 * 1024 + 512))
+
+    m1 = RecordingWorker("bot1", fail_caption=True)
+    m2 = RecordingWorker("bot2", fail_caption=True)
+    pool.clients = [
+        (TelegramApiConfig(name="bot1", api_id=1, api_hash="h", bot_token="t1"), m1),
+        (TelegramApiConfig(name="bot2", api_id=2, api_hash="h", bot_token="t2"), m2),
+    ]
+    mp_res = asyncio.run(
+        pool.mirror_to_archive_topic(
+            {
+                "media_id": "rar003",
+                "title": "big_release",
+                "filename": big_rar.name,
+                "folder": "General",
+                "tags": [],
+                "media_type": "file",
+                "size_bytes": big_rar.stat().st_size,
+                "local_path": big_rar,
+                "source_url": rar_url,
+            }
+        )
+    )
+    assert mp_res is not None
+    assert mp_res["part_count"] == 2
+    assert m1.upload_calls + m2.upload_calls == 2  # uploaded each part only ONCE
+    assert any(len(c) <= 200 for c in m1.send_calls + m2.send_calls)
+
+

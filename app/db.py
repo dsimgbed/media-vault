@@ -190,6 +190,19 @@ class Database:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def recover_interrupted_jobs(self, message: str = "Interrupted by server restart") -> int:
+        now = utc_now_iso()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE ingest_jobs
+                SET status = 'failed', message = ?, updated_at = ?
+                WHERE status IN ('queued', 'downloading', 'allocating')
+                """,
+                (message, now),
+            )
+            return int(cur.rowcount or 0)
+
     @staticmethod
     def _hydrate_media(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         item = dict(row)

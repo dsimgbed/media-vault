@@ -774,6 +774,7 @@
       for (const f of files) {
         try {
           await uploadFile(f);
+          loadJobs().catch(() => {});
         } catch (err) {
           alert(`Failed uploading ${f.name}: ${err.message}`);
         }
