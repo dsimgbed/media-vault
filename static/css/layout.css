@@ -1,0 +1,152 @@
+header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: rgba(13, 17, 23, 0.92);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--border);
+  padding: 12px 20px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.brand {
+  font-weight: 700;
+  font-size: 1.1rem;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.brand-title {
+  white-space: nowrap;
+}
+
+.header-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.auth-box {
+  display: none;
+  gap: 6px;
+  align-items: center;
+}
+
+.mobile-settings-btn {
+  display: none;
+}
+
+.mode-tabs {
+  display: inline-flex;
+  align-items: center;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 3px;
+  gap: 3px;
+}
+
+.mode-tab {
+  background: transparent;
+  color: var(--muted);
+  border: none;
+  border-radius: 7px;
+  padding: 6px 12px;
+  font-size: 0.84rem;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.mode-tab:hover {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.mode-tab[aria-selected="true"] {
+  background: var(--accent);
+  color: #fff;
+}
+
+.mode-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--warn);
+  color: #0d1117;
+  font-size: 0.7rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.mode-badge[hidden] {
+  display: none;
+}
+
+.bottom-nav {
+  display: none;
+}
+
+main {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 20px;
+  display: grid;
+  gap: 18px;
+}
+
+.toolbar {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.toolbar-group {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.toolbar-group-wide {
+  justify-content: space-between;
+}
+
+.toolbar-checks {
+  gap: 14px;
+}
+
+/* Mode-based section visibility */
+body[data-mode="uploader"] .mode-files-section,
+body[data-mode="uploader"] .mode-cinema-section {
+  display: none !important;
+}
+
+body[data-mode="files"] .mode-uploader-section {
+  display: none !important;
+}
+
+body[data-mode="cinema"] .mode-uploader-section {
+  display: none !important;
+}
+
+body[data-mode="cinema"] #typeFilter,
+body[data-mode="cinema"] #selectModeBtn,
+body[data-mode="cinema"] #bulkToolbar {
+  display: none !important;
+}

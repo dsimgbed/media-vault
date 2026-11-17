@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import logging
+import mimetypes
 import re
 import shutil
 import struct
@@ -17,9 +18,10 @@ from dataclasses import asdict
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlencode
 
 from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -44,6 +46,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+
+mimetypes.add_type("text/javascript", ".js")
+mimetypes.add_type("text/javascript", ".mjs")
+mimetypes.add_type("application/manifest+json", ".webmanifest")
+mimetypes.add_type("image/svg+xml", ".svg")
+
+
+class RevalidatingStaticFiles(StaticFiles):
+    def file_response(self, *args: Any, **kwargs: Any) -> Response:
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 class UrlIngestRequest(BaseModel):
@@ -295,8 +309,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"folders": folders, "default_folder": cfg.default_folder}
 
     @app.get("/api/tags", dependencies=[Depends(require_auth)])
-    async def list_tags():
-        return {"tags": db.list_tags()}
+    async def list_tags(
+        q: str = Query(default=""),
+        limit: int | None = Query(default=None, ge=1, le=5000),
+    ):
+        return {"tags": db.list_tag_counts(q=q.strip() or None, limit=limit)}
 
     @app.get("/api/jobs", dependencies=[Depends(require_auth)])
     async def list_jobs(limit: int = Query(default=25, ge=1, le=100)):
@@ -1096,16 +1113,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         drive_name: str = Query(default="all"),
         folder: str = Query(default="all"),
         tag: str = Query(default="all"),
+        tags: str = Query(default=""),
         q: str = Query(default=""),
         sort: str = Query(default="newest"),
         limit: int = Query(default=60, ge=1, le=200),
         offset: int = Query(default=0, ge=0),
     ):
+        effective_tag = tag
+        if tags.strip():
+            effective_tag = f"{tag},{tags}" if (tag and tag != "all") else tags
         items, total = db.list_media(
             media_type=media_type,
             drive_name=drive_name,
             folder=folder,
-            tag=tag,
+            tag=effective_tag,
             q=q.strip() or None,
             sort=sort,
             limit=limit,
@@ -1539,14 +1560,88 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"deleted": True, "id": media_id}
 
     if STATIC_DIR.exists():
-        app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+        app.mount("/static", RevalidatingStaticFiles(directory=str(STATIC_DIR)), name="static")
+
+    @app.get("/sw.js")
+    async def service_worker():
+        sw_file = STATIC_DIR / "sw.js"
+        if not sw_file.is_file():
+            raise HTTPException(status_code=404, detail="Service worker not found")
+        return FileResponse(
+            sw_file,
+            media_type="text/javascript",
+            headers={
+                "Cache-Control": "no-cache",
+                "Service-Worker-Allowed": "/",
+            },
+        )
+
+    @app.get("/manifest.webmanifest")
+    async def web_manifest():
+        manifest_file = STATIC_DIR / "manifest.webmanifest"
+        if not manifest_file.is_file():
+            raise HTTPException(status_code=404, detail="Manifest not found")
+        return FileResponse(
+            manifest_file,
+            media_type="application/manifest+json",
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    @app.get("/manifest.json")
+    async def web_manifest_json():
+        manifest_file = STATIC_DIR / "manifest.json"
+        if not manifest_file.is_file():
+            manifest_file = STATIC_DIR / "manifest.webmanifest"
+        if not manifest_file.is_file():
+            raise HTTPException(status_code=404, detail="Manifest not found")
+        return FileResponse(
+            manifest_file,
+            media_type="application/manifest+json",
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    @app.get("/favicon.ico")
+    async def favicon():
+        icon_file = STATIC_DIR / "icons" / "icon-192.png"
+        if not icon_file.is_file():
+            raise HTTPException(status_code=404, detail="Favicon not found")
+        return FileResponse(
+            icon_file,
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    @app.api_route("/share-target", methods=["GET", "POST"])
+    async def share_target_fallback(request: Request):
+        # Fallback only reached when the PWA service worker did not intercept an
+        # Android share. Unauthenticated, so it must not read the request body
+        # or ingest anything — only redirect into the uploader mode.
+        if request.method == "POST":
+            return RedirectResponse(url="/?mode=uploader&share=fallback", status_code=303)
+        params: list[tuple[str, str]] = [("mode", "uploader")]
+        shared_pairs = [
+            (key, val)
+            for key in ("url", "text", "title")
+            if (val := request.query_params.get(key)) is not None and val != ""
+        ]
+        if shared_pairs:
+            params.append(("shared", "1"))
+            params.extend(shared_pairs)
+        return RedirectResponse(url=f"/?{urlencode(params)}", status_code=303)
 
     @app.get("/", response_class=HTMLResponse)
     async def index():
         index_file = STATIC_DIR / "index.html"
         if not index_file.exists():
-            return HTMLResponse("<h1>Static UI missing</h1>", status_code=404)
-        return HTMLResponse(index_file.read_text(encoding="utf-8"))
+            return HTMLResponse(
+                "<h1>Static UI missing</h1>",
+                status_code=404,
+                headers={"Cache-Control": "no-cache"},
+            )
+        return HTMLResponse(
+            index_file.read_text(encoding="utf-8"),
+            headers={"Cache-Control": "no-cache"},
+        )
 
     return app
 

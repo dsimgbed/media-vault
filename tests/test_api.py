@@ -83,6 +83,28 @@ def _wait_for_job(client: TestClient, job_id: str, *, timeout: float = 5.0) -> d
     return job
 
 
+STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+
+
+def _static_asset_paths(*suffixes: str) -> list[Path]:
+    exts = suffixes or (".js", ".css")
+    return sorted(p for p in STATIC_DIR.rglob("*") if p.is_file() and p.suffix in exts)
+
+
+def _ui_source(client: TestClient) -> str:
+    """Return the full shipped UI source: the `/` shell plus every JS/CSS asset,
+    each fetched over HTTP through the `/static` mount (so serving is verified too)."""
+    index = client.get("/")
+    assert index.status_code == 200
+    chunks = [index.text]
+    for path in _static_asset_paths(".js", ".css"):
+        rel = path.relative_to(STATIC_DIR).as_posix()
+        res = client.get(f"/static/{rel}")
+        assert res.status_code == 200, rel
+        chunks.append(f"\n/* ---- {rel} ---- */\n{res.text}")
+    return "\n".join(chunks)
+
+
 def test_upload_thumbnail_gallery_stream_and_delete(tmp_path: Path):
     settings = _make_settings(tmp_path)
     app = create_app(settings)
@@ -968,7 +990,7 @@ def test_db_migration_and_ui_multipart_markers(tmp_path: Path):
     settings = _make_settings(tmp_path)
     app = create_app(settings)
     with TestClient(app) as client:
-        html = client.get("/").text
+        html = _ui_source(client)
         assert "folderUploadInput" in html
         assert "Unified Stream" in html
         health = client.get("/api/health").json()
@@ -1034,7 +1056,11 @@ def test_hashtags_ingest_filter_patch_and_telegram_caption(tmp_path: Path, monke
         _wait_for_upload_item(client, res2)
 
         tags_res = client.get("/api/tags").json()
-        assert tags_res["tags"] == ["hd", "soap", "soapy"]
+        assert tags_res["tags"] == [
+            {"name": "hd", "count": 1},
+            {"name": "soap", "count": 1},
+            {"name": "soapy", "count": 1},
+        ]
 
         filtered = client.get("/api/media?tag=soap").json()
         assert filtered["total"] == 1
@@ -1043,7 +1069,7 @@ def test_hashtags_ingest_filter_patch_and_telegram_caption(tmp_path: Path, monke
         patched = client.patch(f"/api/media/{item1['id']}/tags", json={"tags": "#soap #archive"}).json()
         assert patched["tags"] == ["soap", "archive"]
 
-        html = client.get("/").text
+        html = _ui_source(client)
         assert "tagsInput" in html
         assert "tagFilter" in html
         assert "modalEditTagsBtn" in html
@@ -2199,7 +2225,7 @@ def test_sse_events_endpoint_and_frontend_polling_removed(tmp_path: Path):
         assert client.get("/api/events").status_code == 401
 
         # UI HTML uses EventSource on /api/events and does NOT re-fetch gallery on active.length > 0
-        html = client.get("/").text
+        html = _ui_source(client)
         assert 'new EventSource(withToken("/api/events"))' in html
         assert "if (newlyFinished)" in html
         assert "newlyFinished || active.length > 0" not in html
@@ -2747,7 +2773,7 @@ def test_pagination_bulk_actions_and_2a_frontend_hooks(tmp_path: Path):
 
     with TestClient(app) as client:
         # UI HTML exposes all 2.A hooks
-        html = client.get("/").text
+        html = _ui_source(client)
         for hook in (
             "badge-tr",
             "mouseenter",
@@ -3118,7 +3144,7 @@ def test_job_cancel_retry_telegram_force_and_ui_hooks(tmp_path: Path, monkeypatc
 
     with TestClient(app) as client:
         # Check 2.B frontend hooks in index.html
-        html = client.get("/").text
+        html = _ui_source(client)
         for hook in (
             "expandPlaylistCheck",
             "forceIngestCheck",
@@ -3155,4 +3181,231 @@ def test_job_cancel_retry_telegram_force_and_ui_hooks(tmp_path: Path, monkeypatc
 
 
 
+
+
+
+def _insert_tagged_media(db, media_id: str, tags: str) -> None:
+    db.insert_media(
+        media_id=media_id,
+        title=f"Item {media_id}",
+        filename=f"{media_id}.jpg",
+        folder="Archive",
+        media_type="image",
+        mime_type="image/jpeg",
+        size_bytes=100,
+        drive_name="drive1",
+        file_path="",
+        thumb_filename=None,
+        source_origin="web",
+        source_kind="upload",
+        source_url=None,
+        tags=tags,
+    )
+
+
+def test_tag_counts_frequency_sorted_query_limit_and_auth(tmp_path: Path):
+    settings = _make_settings(tmp_path, auth_token="tag-secret")
+    app = create_app(settings)
+    db = app.state.db
+
+    _insert_tagged_media(db, "m1", "#soap #hd a_b")
+    _insert_tagged_media(db, "m2", "#soap #4k axb")
+    _insert_tagged_media(db, "m3", "#soap #hd #soapy")
+
+    # Backwards-compatible name list is unchanged (alphabetical names)
+    assert db.list_tags() == ["4k", "a_b", "axb", "hd", "soap", "soapy"]
+
+    # Frequency-sorted counts, ties broken alphabetically
+    assert db.list_tag_counts() == [
+        {"name": "soap", "count": 3},
+        {"name": "hd", "count": 2},
+        {"name": "4k", "count": 1},
+        {"name": "a_b", "count": 1},
+        {"name": "axb", "count": 1},
+        {"name": "soapy", "count": 1},
+    ]
+    # q is normalized like tags (#, case) and matched as a substring
+    assert [t["name"] for t in db.list_tag_counts(q="#SOA")] == ["soap", "soapy"]
+    assert [t["name"] for t in db.list_tag_counts(q="oap")] == ["soap", "soapy"]
+    # LIKE wildcards in q are escaped: "_" only matches a literal underscore
+    assert [t["name"] for t in db.list_tag_counts(q="a_b")] == ["a_b"]
+    # q that normalizes to nothing means "no filter"
+    assert len(db.list_tag_counts(q="%%")) == 6
+    assert db.list_tag_counts(limit=2) == [
+        {"name": "soap", "count": 3},
+        {"name": "hd", "count": 2},
+    ]
+
+    with TestClient(app) as client:
+        assert client.get("/api/tags").status_code == 401
+        auth = {"Authorization": "Bearer tag-secret"}
+        body = client.get("/api/tags", headers=auth).json()
+        assert body["tags"][0] == {"name": "soap", "count": 3}
+        assert [t["name"] for t in body["tags"]] == ["soap", "hd", "4k", "a_b", "axb", "soapy"]
+
+        q_body = client.get("/api/tags?q=soa&limit=1&token=tag-secret").json()
+        assert q_body["tags"] == [{"name": "soap", "count": 3}]
+        assert client.get("/api/tags?limit=0", headers=auth).status_code == 422
+
+        # Counts track edits and deletes
+        client.patch("/api/media/m3/tags", headers=auth, json={"tags": ["hd"]})
+        db.delete_media("m2")
+        after = client.get("/api/tags", headers=auth).json()["tags"]
+        assert after == [
+            {"name": "hd", "count": 2},
+            {"name": "a_b", "count": 1},
+            {"name": "soap", "count": 1},
+        ]
+
+
+def test_module1_frontend_modularization_mode_switcher_and_dialogs(tmp_path: Path):
+    settings = _make_settings(tmp_path)
+    app = create_app(settings)
+
+    index_file = STATIC_DIR / "index.html"
+    assert index_file.is_file()
+    assert len(index_file.read_text(encoding="utf-8").splitlines()) < 350
+
+    with TestClient(app) as client:
+        index_res = client.get("/")
+        assert index_res.status_code == 200
+        assert index_res.headers.get("cache-control") == "no-cache"
+        assert '<script type="module" src="/static/js/main.js"></script>' in index_res.text
+
+        for css_rel in ("css/base.css", "css/layout.css", "css/components.css", "css/mobile.css"):
+            res = client.get(f"/static/{css_rel}")
+            assert res.status_code == 200, css_rel
+            assert res.headers.get("cache-control") == "no-cache"
+
+        for js_rel in (
+            "js/main.js",
+            "js/state.js",
+            "js/api.js",
+            "js/bus.js",
+            "js/mode.js",
+            "js/utils.js",
+            "js/ui/dialogs.js",
+            "js/ui/tag-picker.js",
+            "js/features/system.js",
+            "js/features/drives.js",
+            "js/features/tags.js",
+            "js/features/uploader.js",
+            "js/features/jobs.js",
+            "js/features/gallery.js",
+            "js/features/viewer.js",
+            "js/features/zip-explorer.js",
+            "js/features/pwa.js",
+        ):
+            res = client.get(f"/static/{js_rel}")
+            assert res.status_code == 200, js_rel
+            assert "javascript" in res.headers.get("content-type", "")
+            assert res.headers.get("cache-control") == "no-cache"
+            for forbidden in ("window.alert(", "window.confirm(", "window.prompt("):
+                assert forbidden not in res.text, f"{forbidden} found in {js_rel}"
+
+        full_ui = _ui_source(client)
+        for token in (
+            'data-mode-target="uploader"',
+            'data-mode-target="files"',
+            'data-mode-target="cinema"',
+            "vault_mode",
+            "bottom-nav",
+            "@media (max-width: 768px)",
+            "confirmDialog",
+            "promptDialog",
+            "alertDialog",
+        ):
+            assert token in full_ui
+
+
+def test_module1_pwa_manifest_service_worker_share_target_and_mobile_ux(tmp_path: Path):
+    settings = _make_settings(tmp_path, auth_token="pwa-secret")
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        for manifest_path in ("/manifest.webmanifest", "/manifest.json"):
+            m_res = client.get(manifest_path)
+            assert m_res.status_code == 200
+            assert "application/manifest+json" in m_res.headers.get("content-type", "")
+            manifest = m_res.json()
+            assert manifest["display"] == "standalone"
+            assert manifest["share_target"]["action"] == "/share-target"
+            assert manifest["share_target"]["method"] == "POST"
+            assert manifest["share_target"]["enctype"] == "multipart/form-data"
+            assert any(i["sizes"] == "192x192" for i in manifest["icons"])
+            assert any(i["sizes"] == "512x512" for i in manifest["icons"])
+
+        sw_res = client.get("/sw.js")
+        assert sw_res.status_code == 200
+        assert sw_res.headers.get("service-worker-allowed") == "/"
+        assert sw_res.headers.get("cache-control") == "no-cache"
+        assert "/share-target" in sw_res.text
+        assert 'url.pathname.startsWith("/api/")' in sw_res.text
+        assert 'event.request.headers.has("range")' in sw_res.text
+
+        for asset in (
+            "/favicon.ico",
+            "/static/icons/icon-192.png",
+            "/static/icons/icon-512.png",
+            "/static/icons/icon.svg",
+        ):
+            icon_res = client.get(asset)
+            assert icon_res.status_code == 200, asset
+            assert len(icon_res.content) > 100
+
+        # Share target fallback routes must not bypass auth or ingest unauthenticated data
+        get_share = client.get(
+            "/share-target?url=https://example.com/watch?v=1&title=Clip",
+            follow_redirects=False,
+        )
+        assert get_share.status_code == 303
+        assert "mode=uploader" in get_share.headers["location"]
+        assert "shared=1" in get_share.headers["location"]
+        assert "example.com" in get_share.headers["location"]
+
+        post_share = client.post(
+            "/share-target",
+            data={"url": "https://example.com/v.mp4", "title": "Shared"},
+            follow_redirects=False,
+        )
+        assert post_share.status_code == 303
+        assert post_share.headers["location"] == "/?mode=uploader&share=fallback"
+        assert app.state.db.list_jobs() == []
+
+        full_ui = _ui_source(client)
+        for hook in (
+            "mediaSession",
+            "MediaMetadata",
+            "previoustrack",
+            "nexttrack",
+            "(hover: none)",
+            "ingestTagPicker",
+            "tagFilterPicker",
+            "openTagEditorDialog",
+            "openBulkTagDialog",
+        ):
+            assert hook in full_ui
+
+
+def test_module1_multi_tag_filtering_and_tag_picker_ui(tmp_path: Path):
+    settings = _make_settings(tmp_path)
+    app = create_app(settings)
+    db = app.state.db
+
+    _insert_tagged_media(db, "m1", "#soap #hd #clip")
+    _insert_tagged_media(db, "m2", "#soap #4k")
+    _insert_tagged_media(db, "m3", "#hd #archive")
+
+    with TestClient(app) as client:
+        res_single = client.get("/api/media?tag=soap").json()
+        assert {it["id"] for it in res_single["items"]} == {"m1", "m2"}
+
+        res_multi_tag = client.get("/api/media?tag=soap,hd").json()
+        assert [it["id"] for it in res_multi_tag["items"]] == ["m1"]
+
+        res_multi_tags_alias = client.get("/api/media?tags=soap,hd").json()
+        assert [it["id"] for it in res_multi_tags_alias["items"]] == ["m1"]
+
+        res_combined = client.get("/api/media?tag=soap&tags=4k").json()
+        assert [it["id"] for it in res_combined["items"]] == ["m2"]
 

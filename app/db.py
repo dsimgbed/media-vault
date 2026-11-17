@@ -885,6 +885,30 @@ class Database:
             ).fetchall()
             return [r["tag"] for r in rows if r["tag"]]
 
+    def list_tag_counts(self, q: str | None = None, limit: int | None = None) -> list[dict[str, Any]]:
+        norm_q = _TAG_TOKEN_RE.sub("", str(q).strip().lstrip("#").lower()) if q is not None else ""
+        where_clauses = ["tag != ''"]
+        params: list[Any] = []
+        if norm_q:
+            escaped_q = norm_q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            where_clauses.append("tag LIKE ? ESCAPE '\\'")
+            params.append(f"%{escaped_q}%")
+
+        sql = (
+            "SELECT tag, COUNT(*) AS count "
+            "FROM media_tags "
+            f"WHERE {' AND '.join(where_clauses)} "
+            "GROUP BY tag "
+            "ORDER BY count DESC, tag ASC"
+        )
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            return [{"name": r["tag"], "count": int(r["count"])} for r in rows if r["tag"]]
+
     def _get_media_parts_conn(self, conn: sqlite3.Connection, media_id: str) -> list[dict[str, Any]]:
         rows = conn.execute(
             "SELECT * FROM media_parts WHERE media_id = ? ORDER BY part_index ASC",
