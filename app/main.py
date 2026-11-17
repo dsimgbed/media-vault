@@ -1,26 +1,36 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import shutil
+import struct
 import tempfile
+import uuid
 import zipfile
+import zlib
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from app.allocator import DriveAllocator
+from app.allocator import DriveAllocator, sanitize_folder
 from app.config import Settings
-from app.db import Database
-from app.ingest import IngestService, list_ytdlp_formats, resolve_format_spec, update_ytdlp
+from app.db import Database, normalize_tags
+from app.ingest import (
+    IngestService,
+    classify_media,
+    list_ytdlp_formats,
+    resolve_format_spec,
+    update_ytdlp,
+)
 from app.telegram_mtproto import TelegramPool
 
 logging.basicConfig(
@@ -45,12 +55,97 @@ class UpdateMediaTagsRequest(BaseModel):
     tags: list[str] | str = ""
 
 
+class UpdateMediaRequest(BaseModel):
+    title: str | None = None
+    folder: str | None = None
+    tags: list[str] | str | None = None
+
+
+class BulkMediaIdsRequest(BaseModel):
+    media_ids: list[str]
+
+
+class BulkMoveRequest(BaseModel):
+    media_ids: list[str]
+    folder: str
+
+
+class BulkTagsRequest(BaseModel):
+    media_ids: list[str]
+    tags: list[str] | str = ""
+    mode: Literal["add", "remove", "replace"] = "add"
+
+
 class FormatsRequest(BaseModel):
     url: str
 
 
 class CookiesRequest(BaseModel):
     cookies_text: str
+
+
+class _NeedEarlierOffset(Exception):
+    def __init__(self, needed_offset: int) -> None:
+        super().__init__(f"Need offset {needed_offset}")
+        self.needed_offset = needed_offset
+
+
+class _TailBackedZipIO(io.RawIOBase):
+    """Seekable read-only stream backed by a tail buffer [tail_start, total_size)."""
+
+    def __init__(self, total_size: int, tail_start: int, tail_bytes: bytes) -> None:
+        super().__init__()
+        self._size = max(0, int(total_size))
+        self._tail_start = max(0, int(tail_start))
+        self._buf = tail_bytes
+        self._pos = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def writable(self) -> bool:
+        return False
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        if whence == io.SEEK_SET:
+            new_pos = int(offset)
+        elif whence == io.SEEK_CUR:
+            new_pos = self._pos + int(offset)
+        elif whence == io.SEEK_END:
+            new_pos = self._size + int(offset)
+        else:
+            raise ValueError(f"Unsupported whence: {whence}")
+        if new_pos < 0:
+            raise ValueError("Negative seek position")
+        self._pos = new_pos
+        return self._pos
+
+    def read(self, size: int = -1) -> bytes:
+        if self._pos >= self._size:
+            return b""
+        if self._pos < self._tail_start:
+            raise _NeedEarlierOffset(self._pos)
+        rel = self._pos - self._tail_start
+        if rel >= len(self._buf):
+            return b""
+        if size is None or size < 0:
+            chunk = self._buf[rel:]
+        else:
+            chunk = self._buf[rel : rel + int(size)]
+        self._pos += len(chunk)
+        return chunk
+
+    def readinto(self, b) -> int:
+        data = self.read(len(b))
+        n = len(data)
+        b[:n] = data
+        return n
 
 
 def _parse_range_header(range_header: str, file_size: int) -> tuple[int, int]:
@@ -458,6 +553,373 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             db.update_job(job_id, status="failed", message=str(exc))
             raise HTTPException(status_code=500, detail=str(exc))
 
+    zip_cache: dict[str, list[dict[str, Any]]] = {}
+    app.state.zip_cache = zip_cache
+
+    async def _resolve_media_source(item: dict[str, Any]) -> dict[str, Any]:
+        raw_path = (item.get("file_path") or "").strip()
+        file_path = Path(raw_path) if raw_path else None
+        if file_path and file_path.is_file():
+            return {"kind": "local", "path": file_path, "size": file_path.stat().st_size}
+
+        parts = item.get("parts") or []
+        if len(parts) > 1:
+            return {"kind": "multipart", "parts": parts, "size": int(item["size_bytes"])}
+
+        if item.get("telegram_chat_id") and item.get("telegram_msg_id"):
+            try:
+                tg_client, tg_media = await tg_pool.prepare_stream(
+                    item["telegram_chat_id"],
+                    int(item["telegram_msg_id"]),
+                    worker_name=item.get("telegram_worker_name"),
+                )
+            except FileNotFoundError as exc:
+                raise HTTPException(status_code=404, detail=str(exc))
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=f"Telegram stream error: {exc}")
+            return {
+                "kind": "telegram",
+                "client": tg_client,
+                "media": tg_media,
+                "size": int(item["size_bytes"]),
+            }
+
+        raise HTTPException(status_code=404, detail="File missing on drive (drive may be unmounted)")
+
+    async def _prefetch_multipart_first(
+        source: dict[str, Any], start: int, end: int
+    ) -> dict[int, tuple[Any, Any]] | None:
+        if source["kind"] != "multipart" or source["size"] <= 0 or end < start:
+            return None
+        parts = source["parts"]
+        overlapping = [
+            p
+            for p in sorted(parts, key=lambda x: int(x["part_index"]))
+            if int(p["end_byte"]) >= start and int(p["start_byte"]) <= end and int(p["size_bytes"]) > 0
+        ]
+        if not overlapping:
+            raise HTTPException(status_code=404, detail="Requested range has no matching media parts")
+        first_part = overlapping[0]
+        try:
+            first_stream = await tg_pool.prepare_stream(
+                first_part["telegram_chat_id"],
+                int(first_part["telegram_msg_id"]),
+                worker_name=None,
+            )
+            return {int(first_part["part_index"]): first_stream}
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Telegram stream error: {exc}")
+
+    async def _read_source_range(source: dict[str, Any], start: int, end: int) -> bytes:
+        if end < start:
+            return b""
+        if source["kind"] == "local":
+            path: Path = source["path"]
+
+            def _read_slice() -> bytes:
+                with path.open("rb") as f:
+                    f.seek(start)
+                    return f.read(end - start + 1)
+
+            return await asyncio.to_thread(_read_slice)
+
+        buf = bytearray()
+        if source["kind"] == "multipart":
+            async for chunk in tg_pool.iter_telegram_multipart_range(source["parts"], start, end):
+                buf.extend(chunk)
+        else:
+            async for chunk in tg_pool.iter_telegram_range(
+                source["client"], source["media"], start, end
+            ):
+                buf.extend(chunk)
+        return bytes(buf)
+
+    def _iter_source_range(
+        source: dict[str, Any],
+        start: int,
+        end: int,
+        prefetched: dict[int, tuple[Any, Any]] | None = None,
+    ):
+        if end < start:
+            return iter([b""])
+        if source["kind"] == "local":
+            return _iter_file_range(source["path"], start, end)
+        if source["kind"] == "multipart":
+            return tg_pool.iter_telegram_multipart_range(
+                source["parts"], start, end, prefetched=prefetched
+            )
+        return tg_pool.iter_telegram_range(source["client"], source["media"], start, end)
+
+    async def _get_zip_entries(
+        item: dict[str, Any], source: dict[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
+        media_id = item["id"]
+        cached = zip_cache.get(media_id)
+        if cached is not None:
+            return cached
+
+        if source is None:
+            source = await _resolve_media_source(item)
+
+        file_size = int(source["size"])
+        if file_size < 22:
+            raise HTTPException(status_code=400, detail="Not a valid ZIP archive")
+
+        tail_len = min(file_size, 131072)
+        tail_start = file_size - tail_len
+        tail_bytes = await _read_source_range(source, tail_start, file_size - 1)
+
+        for _ in range(6):
+            try:
+                stream = _TailBackedZipIO(file_size, tail_start, tail_bytes)
+                with zipfile.ZipFile(stream, "r") as zf:
+                    entries: list[dict[str, Any]] = []
+                    for info in zf.infolist():
+                        if info.is_dir() or info.filename.endswith("/"):
+                            continue
+                        entry_path = info.filename
+                        entry_name = Path(entry_path).name or entry_path
+                        mtype, mime = classify_media(Path(entry_name))
+                        entries.append(
+                            {
+                                "path": entry_path,
+                                "name": entry_name,
+                                "size_bytes": int(info.file_size),
+                                "compress_size": int(info.compress_size),
+                                "compress_type": int(info.compress_type),
+                                "header_offset": int(info.header_offset),
+                                "media_type": mtype,
+                                "mime_type": mime,
+                            }
+                        )
+                    zip_cache[media_id] = entries
+                    return entries
+            except _NeedEarlierOffset as need:
+                new_start = max(0, min(need.needed_offset, tail_start))
+                if new_start >= tail_start or (file_size - new_start) > 64 * 1024 * 1024:
+                    raise HTTPException(
+                        status_code=400, detail="ZIP Central Directory is too large or invalid"
+                    )
+                prefix = await _read_source_range(source, new_start, tail_start - 1)
+                tail_bytes = prefix + tail_bytes
+                tail_start = new_start
+            except zipfile.BadZipFile:
+                raise HTTPException(status_code=400, detail="Not a valid ZIP archive")
+
+        raise HTTPException(status_code=400, detail="Could not parse ZIP Central Directory")
+
+    async def _delete_media_item(media_id: str) -> dict[str, Any] | None:
+        item = db.delete_media(media_id)
+        if not item:
+            return None
+        zip_cache.pop(media_id, None)
+
+        raw_path = (item.get("file_path") or "").strip()
+        if raw_path:
+            file_path = Path(raw_path)
+            if file_path.is_file():
+                try:
+                    file_path.unlink()
+                except OSError as exc:
+                    logger.warning("Could not delete %s: %s", file_path, exc)
+
+        parts = item.get("parts") or []
+        if parts:
+            for p in parts:
+                if p.get("telegram_chat_id") and p.get("telegram_msg_id"):
+                    await tg_pool.delete_archive_message(
+                        p["telegram_chat_id"],
+                        int(p["telegram_msg_id"]),
+                        worker_name=p.get("telegram_worker_name"),
+                    )
+        elif item.get("telegram_chat_id") and item.get("telegram_msg_id"):
+            await tg_pool.delete_archive_message(
+                item["telegram_chat_id"],
+                int(item["telegram_msg_id"]),
+                worker_name=item.get("telegram_worker_name"),
+            )
+
+        if item.get("thumb_filename"):
+            thumb_path = cfg.thumbs_dir / item["thumb_filename"]
+            if thumb_path.exists():
+                thumb_path.unlink(missing_ok=True)
+
+        preview_candidates = [cfg.thumbs_dir / f"{media_id}_preview.webp"]
+        if item.get("preview_filename"):
+            preview_candidates.append(cfg.thumbs_dir / item["preview_filename"])
+        for preview_path in preview_candidates:
+            if preview_path.exists():
+                preview_path.unlink(missing_ok=True)
+
+        return item
+
+    async def _move_or_rename_media_item(
+        item: dict[str, Any],
+        *,
+        title: str | None = None,
+        folder: str | None = None,
+        tags: list[str] | str | None = None,
+    ) -> dict[str, Any]:
+        media_id = item["id"]
+        new_title = title.strip() if isinstance(title, str) and title.strip() else None
+        safe_folder = (
+            sanitize_folder(folder, cfg.default_folder)
+            if folder is not None
+            else item["folder"]
+        )
+
+        new_file_path: str | None = None
+        new_filename: str | None = None
+        tg_updates: dict[str, Any] = {}
+
+        if safe_folder != item["folder"]:
+            raw_path = (item.get("file_path") or "").strip()
+            if raw_path:
+                src_path = Path(raw_path)
+                if src_path.is_file():
+                    drive_root: Path | None = None
+                    for d in cfg.get_drives():
+                        if d.name == item.get("drive_name"):
+                            drive_root = Path(d.path)
+                            break
+                    if drive_root is None:
+                        old_parts = [
+                            p
+                            for p in str(item.get("folder") or "").replace("\\", "/").split("/")
+                            if p
+                        ]
+                        cand = src_path.parent
+                        if old_parts and len(src_path.parents) > len(old_parts):
+                            if list(src_path.parent.parts[-len(old_parts) :]) == old_parts:
+                                cand = src_path.parents[len(old_parts)]
+                        drive_root = cand
+
+                    dest_dir = drive_root / safe_folder
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    dest_path = dest_dir / src_path.name
+                    if dest_path.exists() and dest_path.resolve() != src_path.resolve():
+                        dest_path = (
+                            dest_dir / f"{src_path.stem}_{uuid.uuid4().hex[:6]}{src_path.suffix}"
+                        )
+                    if dest_path.resolve() != src_path.resolve():
+                        await asyncio.to_thread(shutil.move, str(src_path), str(dest_path))
+                    new_file_path = str(dest_path)
+                    new_filename = dest_path.name
+
+            if item.get("telegram_chat_id"):
+                try:
+                    effective_tags = (
+                        normalize_tags(tags)
+                        if tags is not None
+                        else normalize_tags(item.get("tags"))
+                    )
+                    migrated = await tg_pool.migrate_media_topic(
+                        item,
+                        safe_folder,
+                        new_title=new_title or item["title"],
+                        new_tags=effective_tags,
+                    )
+                    if migrated:
+                        tg_updates = {
+                            "telegram_chat_id": migrated["chat_id"],
+                            "telegram_topic_id": migrated["topic_id"],
+                            "telegram_msg_id": migrated["message_id"],
+                            "telegram_worker_name": migrated["worker_name"],
+                            "part_count": migrated["part_count"],
+                            "parts": migrated["parts"],
+                        }
+                except Exception as exc:
+                    logger.warning("Telegram topic migration failed for %s: %s", media_id, exc)
+
+        updated = db.update_media(
+            media_id,
+            title=new_title,
+            filename=new_filename,
+            folder=safe_folder if folder is not None else None,
+            file_path=new_file_path,
+            tags=tags,
+            **tg_updates,
+        )
+        if not updated:
+            raise HTTPException(status_code=404, detail="Media item not found")
+        return updated
+
+    async def _build_bulk_download_response(media_ids: list[str]) -> StreamingResponse:
+        cleaned_ids = list(dict.fromkeys(mid.strip() for mid in media_ids if mid and mid.strip()))
+        if not cleaned_ids:
+            raise HTTPException(status_code=400, detail="No media IDs provided")
+
+        resolved: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for mid in cleaned_ids:
+            item = db.get_media(mid)
+            if not item:
+                continue
+            src = await _resolve_media_source(item)
+            resolved.append((item, src))
+
+        if not resolved:
+            raise HTTPException(status_code=404, detail="No matching media items found")
+
+        spooled = tempfile.SpooledTemporaryFile(max_size=32 * 1024 * 1024)
+        used_names: set[str] = set()
+        try:
+            with zipfile.ZipFile(
+                spooled, "w", compression=zipfile.ZIP_STORED, allowZip64=True
+            ) as zf:
+                for idx, (item, src) in enumerate(resolved):
+                    raw_name = Path(item.get("filename") or f"{item['id']}.bin").name
+                    arcname = raw_name
+                    if arcname in used_names:
+                        p = Path(raw_name)
+                        arcname = f"{p.stem}_{idx + 1}_{item['id'][:6]}{p.suffix}"
+                    used_names.add(arcname)
+
+                    with zf.open(arcname, "w", force_zip64=True) as z_entry:
+                        size = int(src["size"])
+                        if size > 0:
+                            if src["kind"] == "local":
+                                for chunk in _iter_file_range(src["path"], 0, size - 1):
+                                    await asyncio.to_thread(z_entry.write, chunk)
+                            elif src["kind"] == "multipart":
+                                prefetched = await _prefetch_multipart_first(src, 0, size - 1)
+                                async for chunk in tg_pool.iter_telegram_multipart_range(
+                                    src["parts"], 0, size - 1, prefetched=prefetched
+                                ):
+                                    await asyncio.to_thread(z_entry.write, chunk)
+                            else:
+                                async for chunk in tg_pool.iter_telegram_range(
+                                    src["client"], src["media"], 0, size - 1
+                                ):
+                                    await asyncio.to_thread(z_entry.write, chunk)
+
+            spooled.seek(0, io.SEEK_END)
+            bundle_size = spooled.tell()
+            spooled.seek(0)
+        except Exception:
+            spooled.close()
+            raise
+
+        def _iter_bundle():
+            try:
+                while True:
+                    chunk = spooled.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                spooled.close()
+
+        return StreamingResponse(
+            _iter_bundle(),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": 'attachment; filename="media_bundle.zip"',
+                "Content-Length": str(bundle_size),
+            },
+        )
+
     @app.get("/api/media", dependencies=[Depends(require_auth)])
     async def list_media(
         media_type: str = Query(default="all"),
@@ -481,12 +943,74 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         return {"items": items, "total": total}
 
+    @app.post("/api/media/bulk/delete", dependencies=[Depends(require_auth)])
+    async def bulk_delete_media(payload: BulkMediaIdsRequest):
+        deleted_ids: list[str] = []
+        for mid in dict.fromkeys(m.strip() for m in payload.media_ids if m and m.strip()):
+            removed = await _delete_media_item(mid)
+            if removed:
+                deleted_ids.append(mid)
+        return {"deleted": len(deleted_ids), "ids": deleted_ids}
+
+    @app.post("/api/media/bulk/move", dependencies=[Depends(require_auth)])
+    async def bulk_move_media(payload: BulkMoveRequest):
+        safe_folder = sanitize_folder(payload.folder, cfg.default_folder)
+        updated_items: list[dict[str, Any]] = []
+        for mid in dict.fromkeys(m.strip() for m in payload.media_ids if m and m.strip()):
+            item = db.get_media(mid)
+            if not item:
+                continue
+            updated = await _move_or_rename_media_item(item, folder=safe_folder)
+            updated_items.append(updated)
+        return {"moved": len(updated_items), "folder": safe_folder, "items": updated_items}
+
+    @app.post("/api/media/bulk/tags", dependencies=[Depends(require_auth)])
+    async def bulk_tags_media(payload: BulkTagsRequest):
+        incoming = normalize_tags(payload.tags)
+        remove_set = set(incoming)
+        updated_items: list[dict[str, Any]] = []
+        for mid in dict.fromkeys(m.strip() for m in payload.media_ids if m and m.strip()):
+            item = db.get_media(mid)
+            if not item:
+                continue
+            existing = normalize_tags(item.get("tags"))
+            if payload.mode == "replace":
+                next_tags = incoming
+            elif payload.mode == "remove":
+                next_tags = [t for t in existing if t not in remove_set]
+            else:
+                next_tags = normalize_tags([*existing, *incoming])
+            updated = db.update_media_tags(mid, next_tags)
+            if updated:
+                updated_items.append(updated)
+        return {"updated": len(updated_items), "items": updated_items}
+
+    @app.get("/api/media/bulk/download", dependencies=[Depends(require_auth)])
+    async def bulk_download_media_get(ids: str = Query(...)):
+        return await _build_bulk_download_response(ids.split(","))
+
+    @app.post("/api/media/bulk/download", dependencies=[Depends(require_auth)])
+    async def bulk_download_media_post(payload: BulkMediaIdsRequest):
+        return await _build_bulk_download_response(payload.media_ids)
+
     @app.get("/api/media/{media_id}", dependencies=[Depends(require_auth)])
     async def get_media_item(media_id: str):
         item = db.get_media(media_id)
         if not item:
             raise HTTPException(status_code=404, detail="Media item not found")
         return item
+
+    @app.patch("/api/media/{media_id}", dependencies=[Depends(require_auth)])
+    async def patch_media_item(media_id: str, payload: UpdateMediaRequest):
+        item = db.get_media(media_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Media item not found")
+        return await _move_or_rename_media_item(
+            item,
+            title=payload.title,
+            folder=payload.folder,
+            tags=payload.tags,
+        )
 
     @app.patch("/api/media/{media_id}/tags", dependencies=[Depends(require_auth)])
     async def update_media_tags(media_id: str, payload: UpdateMediaTagsRequest):
@@ -528,6 +1052,206 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             thumb_path,
             media_type=media_type,
             headers={"Cache-Control": "public, max-age=31536000, immutable"},
+        )
+
+    @app.get("/api/media/{media_id}/preview", dependencies=[Depends(require_auth)])
+    async def get_media_preview(media_id: str):
+        item = db.get_media(media_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Preview not found")
+
+        candidates: list[Path] = []
+        if item.get("preview_filename"):
+            candidates.append(cfg.thumbs_dir / item["preview_filename"])
+        candidates.append(cfg.thumbs_dir / f"{media_id}_preview.webp")
+
+        preview_path = next((p for p in candidates if p.is_file()), None)
+        if preview_path is None:
+            raise HTTPException(status_code=404, detail="Preview not found")
+
+        return FileResponse(
+            preview_path,
+            media_type="image/webp",
+            headers={"Cache-Control": "public, max-age=31536000, immutable"},
+        )
+
+    @app.get("/api/media/{media_id}/zip/entries", dependencies=[Depends(require_auth)])
+    async def get_zip_entries(media_id: str):
+        item = db.get_media(media_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Media item not found")
+        entries = await _get_zip_entries(item)
+        return {
+            "media_id": media_id,
+            "filename": item["filename"],
+            "total_entries": len(entries),
+            "entries": [
+                {
+                    "path": e["path"],
+                    "name": e["name"],
+                    "size_bytes": e["size_bytes"],
+                    "compress_size": e["compress_size"],
+                    "compress_type": e["compress_type"],
+                    "media_type": e["media_type"],
+                    "mime_type": e["mime_type"],
+                }
+                for e in entries
+            ],
+        }
+
+    @app.get("/api/media/{media_id}/zip/stream", dependencies=[Depends(require_auth)])
+    async def stream_zip_entry(
+        media_id: str,
+        request: Request,
+        path: str = Query(...),
+        download: bool = Query(default=False),
+    ):
+        item = db.get_media(media_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Media item not found")
+
+        source = await _resolve_media_source(item)
+        entries = await _get_zip_entries(item, source=source)
+        norm_target = path.lstrip("/")
+        entry = next(
+            (e for e in entries if e["path"] == path or e["path"].lstrip("/") == norm_target),
+            None,
+        )
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Entry not found in ZIP archive")
+
+        header_offset = int(entry["header_offset"])
+        lfh = await _read_source_range(source, header_offset, header_offset + 29)
+        if len(lfh) != 30 or lfh[:4] != b"PK\x03\x04":
+            raise HTTPException(status_code=400, detail="Invalid ZIP local file header")
+
+        fname_len, extra_len = struct.unpack("<HH", lfh[26:30])
+        data_start = header_offset + 30 + fname_len + extra_len
+        compress_size = int(entry["compress_size"])
+        size_bytes = int(entry["size_bytes"])
+        compress_type = int(entry["compress_type"])
+        data_end = data_start + compress_size - 1
+
+        mime_type = entry["mime_type"] or "application/octet-stream"
+        headers: dict[str, str] = {}
+        if download:
+            headers["Content-Disposition"] = f'attachment; filename="{entry["name"]}"'
+
+        range_header = request.headers.get("range")
+        if range_header:
+            try:
+                req_start, req_end = _parse_range_header(range_header, size_bytes)
+            except ValueError:
+                raise HTTPException(
+                    status_code=416,
+                    headers={"Content-Range": f"bytes */{size_bytes}"},
+                    detail="Invalid Range header",
+                )
+        else:
+            req_start, req_end = 0, max(0, size_bytes - 1)
+
+        if compress_type == zipfile.ZIP_STORED:
+            headers["Accept-Ranges"] = "bytes"
+            if range_header:
+                arc_start = data_start + req_start
+                arc_end = data_start + req_end
+                prefetched = await _prefetch_multipart_first(source, arc_start, arc_end)
+                headers["Content-Range"] = f"bytes {req_start}-{req_end}/{size_bytes}"
+                headers["Content-Length"] = str(req_end - req_start + 1)
+                return StreamingResponse(
+                    _iter_source_range(source, arc_start, arc_end, prefetched=prefetched),
+                    status_code=206,
+                    media_type=mime_type,
+                    headers=headers,
+                )
+            headers["Content-Length"] = str(size_bytes)
+            if size_bytes == 0:
+                return StreamingResponse(
+                    iter([b""]), status_code=200, media_type=mime_type, headers=headers
+                )
+            arc_start = data_start
+            arc_end = data_start + size_bytes - 1
+            prefetched = await _prefetch_multipart_first(source, arc_start, arc_end)
+            return StreamingResponse(
+                _iter_source_range(source, arc_start, arc_end, prefetched=prefetched),
+                status_code=200,
+                media_type=mime_type,
+                headers=headers,
+            )
+
+        if compress_type == zipfile.ZIP_DEFLATED:
+            if compress_size == 0 or size_bytes == 0:
+                headers["Content-Length"] = "0"
+                return StreamingResponse(
+                    iter([b""]), status_code=200, media_type=mime_type, headers=headers
+                )
+
+            prefetched = await _prefetch_multipart_first(source, data_start, data_end)
+
+            async def _iter_deflated():
+                decomp = zlib.decompressobj(-zlib.MAX_WBITS)
+                raw_iter = _iter_source_range(source, data_start, data_end, prefetched=prefetched)
+                pos = 0
+
+                def _slice_out(chunk: bytes) -> bytes | None:
+                    nonlocal pos
+                    if not chunk:
+                        return None
+                    c_start = pos
+                    c_end = pos + len(chunk) - 1
+                    pos += len(chunk)
+                    if not range_header:
+                        return chunk
+                    if c_end < req_start or c_start > req_end:
+                        return None
+                    s0 = max(0, req_start - c_start)
+                    s1 = min(len(chunk), req_end - c_start + 1)
+                    return chunk[s0:s1]
+
+                if hasattr(raw_iter, "__aiter__"):
+                    async for raw_chunk in raw_iter:
+                        out = decomp.decompress(raw_chunk)
+                        sliced = _slice_out(out)
+                        if sliced:
+                            yield sliced
+                        if range_header and pos > req_end:
+                            break
+                else:
+                    for raw_chunk in raw_iter:
+                        out = decomp.decompress(raw_chunk)
+                        sliced = _slice_out(out)
+                        if sliced:
+                            yield sliced
+                        if range_header and pos > req_end:
+                            break
+
+                if not (range_header and pos > req_end):
+                    tail = decomp.flush()
+                    sliced = _slice_out(tail)
+                    if sliced:
+                        yield sliced
+
+            if range_header:
+                headers["Accept-Ranges"] = "bytes"
+                headers["Content-Range"] = f"bytes {req_start}-{req_end}/{size_bytes}"
+                headers["Content-Length"] = str(req_end - req_start + 1)
+                return StreamingResponse(
+                    _iter_deflated(),
+                    status_code=206,
+                    media_type=mime_type,
+                    headers=headers,
+                )
+
+            headers["Content-Length"] = str(size_bytes)
+            return StreamingResponse(
+                _iter_deflated(),
+                status_code=200,
+                media_type=mime_type,
+                headers=headers,
+            )
+
+        raise HTTPException(
+            status_code=400, detail=f"Unsupported ZIP compression method: {compress_type}"
         )
 
     @app.get("/api/media/{media_id}/stream", dependencies=[Depends(require_auth)])
@@ -639,40 +1363,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.delete("/api/media/{media_id}", dependencies=[Depends(require_auth)])
     async def delete_media(media_id: str):
-        item = db.delete_media(media_id)
+        item = await _delete_media_item(media_id)
         if not item:
             raise HTTPException(status_code=404, detail="Media item not found")
-
-        raw_path = (item.get("file_path") or "").strip()
-        if raw_path:
-            file_path = Path(raw_path)
-            if file_path.is_file():
-                try:
-                    file_path.unlink()
-                except OSError as exc:
-                    logger.warning("Could not delete %s: %s", file_path, exc)
-
-        parts = item.get("parts") or []
-        if parts:
-            for p in parts:
-                if p.get("telegram_chat_id") and p.get("telegram_msg_id"):
-                    await tg_pool.delete_archive_message(
-                        p["telegram_chat_id"],
-                        int(p["telegram_msg_id"]),
-                        worker_name=p.get("telegram_worker_name"),
-                    )
-        elif item.get("telegram_chat_id") and item.get("telegram_msg_id"):
-            await tg_pool.delete_archive_message(
-                item["telegram_chat_id"],
-                int(item["telegram_msg_id"]),
-                worker_name=item.get("telegram_worker_name"),
-            )
-
-        if item.get("thumb_filename"):
-            thumb_path = cfg.thumbs_dir / item["thumb_filename"]
-            if thumb_path.exists():
-                thumb_path.unlink(missing_ok=True)
-
         return {"deleted": True, "id": media_id}
 
     if STATIC_DIR.exists():

@@ -1110,6 +1110,170 @@ class TelegramPool:
             except Exception as exc:
                 logger.warning("Could not delete archive msg %s: %s", msg_id, exc)
 
+    async def migrate_media_topic(
+        self,
+        item: dict[str, Any],
+        new_folder: str,
+        *,
+        new_title: str | None = None,
+        new_tags: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        raw_chat = item.get("telegram_chat_id")
+        if not self.clients or not raw_chat:
+            return None
+
+        chat_key = str(raw_chat)
+        try:
+            target: int | str = int(chat_key)
+        except ValueError:
+            target = chat_key
+
+        ordered_top = self._ordered_clients(preferred_worker=item.get("telegram_worker_name"))
+        if not ordered_top:
+            return None
+        first_cfg = ordered_top[0][0]
+        new_topic_id = await self._ensure_topic_id(first_cfg, chat_key, new_folder)
+        if new_topic_id == item.get("telegram_topic_id"):
+            return None
+
+        parts = list(item.get("parts") or [])
+        if not parts and item.get("telegram_msg_id"):
+            size_bytes = int(item.get("size_bytes") or 0)
+            parts = [
+                {
+                    "part_index": 0,
+                    "start_byte": 0,
+                    "end_byte": max(0, size_bytes - 1),
+                    "size_bytes": size_bytes,
+                    "telegram_chat_id": chat_key,
+                    "telegram_topic_id": item.get("telegram_topic_id"),
+                    "telegram_msg_id": int(item["telegram_msg_id"]),
+                    "telegram_worker_name": item.get("telegram_worker_name"),
+                }
+            ]
+        if not parts:
+            return None
+
+        parts.sort(key=lambda p: int(p["part_index"]))
+        total_parts = len(parts)
+        is_multipart = total_parts > 1 or int(item.get("part_count") or 1) > 1
+        total_size = int(item.get("size_bytes") or 0)
+        filename = item.get("filename") or new_title or item.get("title") or "file"
+        gallery_link = self._gallery_link(item["id"])
+        resolved_tags = normalize_tags(new_tags if new_tags is not None else item.get("tags"))
+
+        migrated_parts: list[dict[str, Any]] = []
+        for p in parts:
+            p_chat_key = str(p.get("telegram_chat_id") or chat_key)
+            try:
+                p_target: int | str = int(p_chat_key)
+            except ValueError:
+                p_target = p_chat_key
+            old_msg_id = int(p["telegram_msg_id"])
+            pref_worker = p.get("telegram_worker_name") or item.get("telegram_worker_name")
+
+            old_msg = None
+            src_cfg = None
+            src_client = None
+            src_peer = None
+            last_err: Exception | None = None
+            for cfg, client in self._ordered_clients(preferred_worker=pref_worker):
+                try:
+                    peer = await client.get_input_entity(p_target)
+                    msg = await client.get_messages(peer, ids=old_msg_id)
+                    if msg and getattr(msg, "media", None) is not None:
+                        old_msg = msg
+                        src_cfg = cfg
+                        src_client = client
+                        src_peer = peer
+                        break
+                except Exception as exc:
+                    last_err = exc
+
+            if old_msg is None or src_client is None or src_cfg is None:
+                if last_err:
+                    raise last_err
+                raise FileNotFoundError(f"Telegram archive message {old_msg_id} not found for topic migration")
+
+            p_idx = int(p["part_index"])
+            p_size = int(p["size_bytes"])
+            caption = build_archive_caption(
+                filename=filename,
+                folder=new_folder,
+                size_bytes=total_size,
+                gallery_link=gallery_link,
+                tags=resolved_tags,
+                source_url=item.get("source_url"),
+                part_index=p_idx if is_multipart else None,
+                total_parts=total_parts if is_multipart else None,
+                part_size_bytes=p_size if is_multipart else None,
+            )
+            compact_caption = _truncate_utf16(
+                f"{' '.join(str(filename).splitlines()).strip() or 'file'}"
+                + (f" (Part {p_idx + 1}/{total_parts})" if is_multipart else ""),
+                160,
+            )
+
+            send_kwargs: dict[str, Any] = {
+                "caption": caption,
+                "reply_to": new_topic_id,
+            }
+            if is_multipart:
+                send_kwargs["force_document"] = True
+            else:
+                send_kwargs["supports_streaming"] = True
+
+            try:
+                sent = await src_client.send_file(src_peer, old_msg.media, **send_kwargs)
+            except TELEGRAM_NON_RETRYABLE_CAPTION_ERRORS:
+                send_kwargs["caption"] = compact_caption
+                sent = await src_client.send_file(src_peer, old_msg.media, **send_kwargs)
+            except RPCError as rpc_err:
+                err_text = str(rpc_err).upper()
+                if (
+                    new_topic_id
+                    and new_topic_id != 1
+                    and ("TOPIC" in err_text or "REPLY" in err_text or "THREAD" in err_text)
+                ):
+                    new_topic_id = await self._ensure_topic_id(
+                        src_cfg, chat_key, new_folder, force_recreate=True
+                    )
+                    send_kwargs["reply_to"] = new_topic_id
+                    try:
+                        sent = await src_client.send_file(src_peer, old_msg.media, **send_kwargs)
+                    except TELEGRAM_NON_RETRYABLE_CAPTION_ERRORS:
+                        send_kwargs["caption"] = compact_caption
+                        sent = await src_client.send_file(src_peer, old_msg.media, **send_kwargs)
+                else:
+                    raise
+
+            msg_obj = sent[0] if isinstance(sent, list) else sent
+            new_msg_id = int(msg_obj.id)
+
+            await self.delete_archive_message(p_chat_key, old_msg_id, worker_name=pref_worker)
+
+            migrated_parts.append(
+                {
+                    "part_index": p_idx,
+                    "start_byte": int(p["start_byte"]),
+                    "end_byte": int(p["end_byte"]),
+                    "size_bytes": p_size,
+                    "telegram_chat_id": chat_key,
+                    "telegram_topic_id": new_topic_id,
+                    "telegram_msg_id": new_msg_id,
+                    "telegram_worker_name": src_cfg.name,
+                }
+            )
+
+        return {
+            "chat_id": chat_key,
+            "topic_id": new_topic_id,
+            "message_id": migrated_parts[0]["telegram_msg_id"],
+            "worker_name": migrated_parts[0]["telegram_worker_name"],
+            "part_count": len(migrated_parts),
+            "parts": migrated_parts,
+        }
+
     async def _claim_group_message(self, chat_id: int | str, msg_id: int) -> bool:
         now = time.monotonic()
         key = (str(chat_id), int(msg_id))
@@ -1507,6 +1671,14 @@ class TelegramPool:
                         "Telegram storage mode requires TELEGRAM_APIS_JSON and TELEGRAM_ARCHIVE_CHAT_ID to be configured and reachable."
                     )
 
+                msg_file = getattr(event.message, "file", None)
+                raw_dur = getattr(msg_file, "duration", None) if msg_file else None
+                raw_w = getattr(msg_file, "width", None) if msg_file else None
+                raw_h = getattr(msg_file, "height", None) if msg_file else None
+                duration_sec = float(raw_dur) if raw_dur is not None and float(raw_dur) > 0 else None
+                width = int(raw_w) if raw_w is not None and int(raw_w) > 0 else None
+                height = int(raw_h) if raw_h is not None and int(raw_h) > 0 else None
+
                 item = self.ingest.record_media(
                     media_id=media_id,
                     title=Path(filename).stem,
@@ -1523,6 +1695,9 @@ class TelegramPool:
                     source_kind="upload",
                     source_url=None,
                     mirror_info=mirror_info,
+                    duration_sec=duration_sec,
+                    width=width,
+                    height=height,
                 )
                 self.db.update_job(
                     job_id,

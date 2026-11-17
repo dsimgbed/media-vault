@@ -140,6 +140,13 @@ class Database:
                     telegram_msg_id INTEGER,
                     telegram_worker_name TEXT,
                     part_count INTEGER NOT NULL DEFAULT 1,
+                    duration_sec REAL,
+                    width INTEGER,
+                    height INTEGER,
+                    video_codec TEXT,
+                    audio_codec TEXT,
+                    fps REAL,
+                    preview_filename TEXT,
                     created_at TEXT NOT NULL
                 );
 
@@ -222,6 +229,20 @@ class Database:
                 conn.execute("ALTER TABLE media_items ADD COLUMN telegram_worker_name TEXT")
             if "part_count" not in cols:
                 conn.execute("ALTER TABLE media_items ADD COLUMN part_count INTEGER NOT NULL DEFAULT 1")
+            if "duration_sec" not in cols:
+                conn.execute("ALTER TABLE media_items ADD COLUMN duration_sec REAL")
+            if "width" not in cols:
+                conn.execute("ALTER TABLE media_items ADD COLUMN width INTEGER")
+            if "height" not in cols:
+                conn.execute("ALTER TABLE media_items ADD COLUMN height INTEGER")
+            if "video_codec" not in cols:
+                conn.execute("ALTER TABLE media_items ADD COLUMN video_codec TEXT")
+            if "audio_codec" not in cols:
+                conn.execute("ALTER TABLE media_items ADD COLUMN audio_codec TEXT")
+            if "fps" not in cols:
+                conn.execute("ALTER TABLE media_items ADD COLUMN fps REAL")
+            if "preview_filename" not in cols:
+                conn.execute("ALTER TABLE media_items ADD COLUMN preview_filename TEXT")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_media_folder ON media_items(folder)")
 
             job_cols = {r["name"] for r in conn.execute("PRAGMA table_info(ingest_jobs)").fetchall()}
@@ -355,6 +376,13 @@ class Database:
         telegram_worker_name: str | None = None,
         part_count: int = 1,
         parts: list[dict[str, Any]] | None = None,
+        duration_sec: float | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        video_codec: str | None = None,
+        audio_codec: str | None = None,
+        fps: float | None = None,
+        preview_filename: str | None = None,
     ) -> dict[str, Any]:
         now = utc_now_iso()
         resolved_part_count = len(parts) if (parts and part_count == 1) else max(1, int(part_count))
@@ -367,8 +395,10 @@ class Database:
                     id, title, filename, folder, tags, media_type, mime_type, size_bytes,
                     drive_name, file_path, thumb_filename, source_origin,
                     source_kind, source_url, telegram_chat_id, telegram_topic_id,
-                    telegram_msg_id, telegram_worker_name, part_count, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    telegram_msg_id, telegram_worker_name, part_count,
+                    duration_sec, width, height, video_codec, audio_codec, fps, preview_filename,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     media_id,
@@ -390,6 +420,13 @@ class Database:
                     telegram_msg_id,
                     telegram_worker_name,
                     resolved_part_count,
+                    duration_sec,
+                    width,
+                    height,
+                    video_codec,
+                    audio_codec,
+                    fps,
+                    preview_filename,
                     now,
                 ),
             )
@@ -438,6 +475,128 @@ class Database:
                 "UPDATE media_items SET telegram_topic_id = ? WHERE id = ?",
                 (topic_id, media_id),
             )
+
+    def update_media(
+        self,
+        media_id: str,
+        *,
+        title: str | None = None,
+        filename: str | None = None,
+        folder: str | None = None,
+        file_path: str | None = None,
+        tags: str | list[str] | None = None,
+        telegram_chat_id: str | None = None,
+        telegram_topic_id: int | None = None,
+        telegram_msg_id: int | None = None,
+        telegram_worker_name: str | None = None,
+        part_count: int | None = None,
+        parts: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            existing = conn.execute("SELECT * FROM media_items WHERE id = ?", (media_id,)).fetchone()
+            if not existing:
+                return None
+
+            sets: list[str] = []
+            params: list[Any] = []
+            if title is not None:
+                sets.append("title = ?")
+                params.append(title)
+            if filename is not None:
+                sets.append("filename = ?")
+                params.append(filename)
+            if folder is not None:
+                sets.append("folder = ?")
+                params.append(folder)
+            if file_path is not None:
+                sets.append("file_path = ?")
+                params.append(file_path)
+
+            tag_list: list[str] | None = None
+            if tags is not None:
+                tag_list = normalize_tags(tags)
+                sets.append("tags = ?")
+                params.append(",".join(tag_list))
+
+            if telegram_chat_id is not None:
+                sets.append("telegram_chat_id = ?")
+                params.append(telegram_chat_id)
+            if telegram_topic_id is not None:
+                sets.append("telegram_topic_id = ?")
+                params.append(telegram_topic_id)
+            if telegram_msg_id is not None:
+                sets.append("telegram_msg_id = ?")
+                params.append(telegram_msg_id)
+            if telegram_worker_name is not None:
+                sets.append("telegram_worker_name = ?")
+                params.append(telegram_worker_name)
+
+            resolved_part_count = part_count
+            if resolved_part_count is None and parts is not None:
+                resolved_part_count = max(1, len(parts))
+            if resolved_part_count is not None:
+                sets.append("part_count = ?")
+                params.append(max(1, int(resolved_part_count)))
+
+            if sets:
+                params.append(media_id)
+                conn.execute(
+                    f"UPDATE media_items SET {', '.join(sets)} WHERE id = ?",
+                    params,
+                )
+
+            if tag_list is not None:
+                conn.execute("DELETE FROM media_tags WHERE media_id = ?", (media_id,))
+                if tag_list:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO media_tags (media_id, tag) VALUES (?, ?)",
+                        [(media_id, t) for t in tag_list],
+                    )
+
+            if parts is not None:
+                conn.execute("DELETE FROM media_parts WHERE media_id = ?", (media_id,))
+                for p in parts:
+                    conn.execute(
+                        """
+                        INSERT INTO media_parts (
+                            media_id, part_index, start_byte, end_byte, size_bytes,
+                            telegram_chat_id, telegram_topic_id, telegram_msg_id, telegram_worker_name
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            media_id,
+                            int(p["part_index"]),
+                            int(p["start_byte"]),
+                            int(p["end_byte"]),
+                            int(p["size_bytes"]),
+                            str(p["telegram_chat_id"]),
+                            p.get("telegram_topic_id"),
+                            int(p["telegram_msg_id"]),
+                            p.get("telegram_worker_name"),
+                        ),
+                    )
+
+            row = conn.execute("SELECT * FROM media_items WHERE id = ?", (media_id,)).fetchone()
+            assert row is not None
+            conn.execute("DELETE FROM media_fts WHERE media_id = ?", (media_id,))
+            conn.execute(
+                """
+                INSERT INTO media_fts (media_id, title, filename, folder, tags, source_url)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    media_id,
+                    row["title"],
+                    row["filename"],
+                    row["folder"],
+                    row["tags"] or "",
+                    row["source_url"] or "",
+                ),
+            )
+            item = self._hydrate_media(row)
+            item["parts"] = self._resolve_parts_for_item(conn, item)
+        self.publish({"type": "media_update", "media_id": media_id, "action": "update"})
+        return item
 
     def update_media_tags(self, media_id: str, tags: str | list[str] | None) -> dict[str, Any] | None:
         tag_list = normalize_tags(tags)

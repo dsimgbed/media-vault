@@ -20,7 +20,7 @@ import httpx
 from app.allocator import DriveAllocator, fmt_size, sanitize_folder
 from app.config import Settings
 from app.db import Database, normalize_tags
-from app.thumbnails import generate_thumbnail
+from app.thumbnails import extract_media_metadata, generate_thumbnail, generate_video_preview
 
 logger = logging.getLogger(__name__)
 
@@ -523,6 +523,13 @@ class IngestService:
         source_kind: str,
         source_url: str | None,
         mirror_info: dict[str, Any] | None = None,
+        duration_sec: float | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        video_codec: str | None = None,
+        audio_codec: str | None = None,
+        fps: float | None = None,
+        preview_filename: str | None = None,
     ) -> dict[str, Any]:
         return self.db.insert_media(
             media_id=media_id,
@@ -545,6 +552,13 @@ class IngestService:
             telegram_worker_name=mirror_info.get("worker_name") if mirror_info else None,
             part_count=int(mirror_info.get("part_count", 1)) if mirror_info else 1,
             parts=mirror_info.get("parts") if mirror_info else None,
+            duration_sec=duration_sec,
+            width=width,
+            height=height,
+            video_codec=video_codec,
+            audio_codec=audio_codec,
+            fps=fps,
+            preview_filename=preview_filename,
         )
 
     async def finalize_staged_file(
@@ -571,6 +585,15 @@ class IngestService:
         thumb_filename = await generate_thumbnail(
             local_path, media_type, self.settings.thumbs_dir, media_id
         )
+        meta = await extract_media_metadata(local_path, media_type)
+        preview_filename: str | None = None
+        if media_type == "video":
+            preview_filename = await generate_video_preview(
+                local_path,
+                self.settings.thumbs_dir,
+                media_id,
+                duration_sec=meta.get("duration_sec"),
+            )
 
         mode = self.settings.storage_mode
         should_mirror = mode == "telegram" or (mode == "both" and forward_to_telegram)
@@ -630,6 +653,13 @@ class IngestService:
             source_kind=source_kind,
             source_url=source_url,
             mirror_info=mirror_info,
+            duration_sec=meta.get("duration_sec"),
+            width=meta.get("width"),
+            height=meta.get("height"),
+            video_codec=meta.get("video_codec"),
+            audio_codec=meta.get("audio_codec"),
+            fps=meta.get("fps"),
+            preview_filename=preview_filename,
         )
 
     async def process_url_job(

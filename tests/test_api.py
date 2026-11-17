@@ -2235,3 +2235,604 @@ def test_sse_events_endpoint_and_frontend_polling_removed(tmp_path: Path):
         assert any(e.get("type") == "job_update" and e.get("status") == "done" for e in received)
 
 
+def _make_sample_mp4(dst: Path) -> bool:
+    import shutil
+    import subprocess
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False
+    res = subprocess.run(
+        [
+            ffmpeg,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=1.5:size=320x180:rate=24",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=1.5",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(dst),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return res.returncode == 0 and dst.is_file() and dst.stat().st_size > 0
+
+
+def test_rich_metadata_video_preview_fallback_and_telegram_zerocopy(tmp_path: Path, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from app.thumbnails import extract_media_metadata, generate_video_preview
+
+    settings = _make_settings(tmp_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        # 1) Image upload extracts width/height
+        jpg = _sample_jpeg_bytes()
+        img_resp = client.post(
+            "/api/ingest/upload",
+            files={"file": ("photo_meta.jpg", jpg, "image/jpeg")},
+        )
+        img_item = _wait_for_upload_item(client, img_resp)
+        assert img_item["width"] == 640
+        assert img_item["height"] == 360
+
+        # 2) Real MP4 video upload extracts metadata and generates animated WebP preview
+        sample_mp4 = tmp_path / "sample.mp4"
+        if _make_sample_mp4(sample_mp4):
+            vid_bytes = sample_mp4.read_bytes()
+            vid_resp = client.post(
+                "/api/ingest/upload",
+                files={"file": ("clip_meta.mp4", vid_bytes, "video/mp4")},
+            )
+            vid_item = _wait_for_upload_item(client, vid_resp, timeout=15.0)
+            vid_id = vid_item["id"]
+            assert vid_item["width"] == 320
+            assert vid_item["height"] == 180
+            assert vid_item["duration_sec"] and 1.0 <= vid_item["duration_sec"] <= 2.5
+            assert vid_item["video_codec"] == "h264"
+            assert vid_item["audio_codec"] == "aac"
+            assert vid_item["fps"] and abs(vid_item["fps"] - 24.0) < 0.5
+            assert vid_item["preview_filename"] == f"{vid_id}_preview.webp"
+
+            prev_path = settings.thumbs_dir / vid_item["preview_filename"]
+            assert prev_path.is_file()
+
+            prev_resp = client.get(f"/api/media/{vid_id}/preview")
+            assert prev_resp.status_code == 200
+            assert prev_resp.headers["content-type"] == "image/webp"
+            assert prev_resp.headers["cache-control"] == "public, max-age=31536000, immutable"
+            with Image.open(io.BytesIO(prev_resp.content)) as im:
+                assert im.format == "WEBP"
+
+            # Deleting video unlinks both thumb and animated preview
+            del_resp = client.delete(f"/api/media/{vid_id}")
+            assert del_resp.status_code == 200
+            assert not prev_path.exists()
+            assert client.get(f"/api/media/{vid_id}/preview").status_code == 404
+
+    # 3) Synthetic invalid file degrades gracefully in extract_media_metadata
+    bad_mp4 = tmp_path / "broken.mp4"
+    bad_mp4.write_bytes(b"not-a-real-video")
+    assert asyncio.run(extract_media_metadata(bad_mp4, "video")) == {}
+
+    # 4) generate_video_preview falls back to Pillow animated WebP when ffmpeg libwebp fails
+    class FakeProc:
+        def __init__(self, rc: int) -> None:
+            self.returncode = rc
+
+        async def communicate(self):
+            return b"", b""
+
+    async def fake_exec(*args, **kwargs):
+        out_arg = str(args[-1])
+        if out_arg.endswith(".webp"):
+            return FakeProc(1)
+        # Produce 3 PNG frames matching the pattern
+        parent = Path(out_arg).parent
+        for idx in (1, 2, 3):
+            frame_file = parent / f"fb_preview_pframe_{idx:02d}.png"
+            Image.new("RGB", (160, 90), color=(40 * idx, 100, 200)).save(frame_file, format="PNG")
+        return FakeProc(0)
+
+    monkeypatch.setattr("app.thumbnails.shutil.which", lambda _: "/usr/bin/ffmpeg")
+    monkeypatch.setattr("app.thumbnails.asyncio.create_subprocess_exec", fake_exec)
+
+    dummy_mp4 = tmp_path / "dummy.mp4"
+    dummy_mp4.write_bytes(b"fake")
+    preview_name = asyncio.run(
+        generate_video_preview(dummy_mp4, settings.thumbs_dir, "fb_preview", duration_sec=4.0)
+    )
+    assert preview_name == "fb_preview_preview.webp"
+    fb_prev_path = settings.thumbs_dir / preview_name
+    assert fb_prev_path.is_file()
+    with Image.open(fb_prev_path) as im:
+        assert im.format == "WEBP"
+        assert getattr(im, "n_frames", 1) == 3
+
+    # 5) Zero-copy Telegram ingestion extracts duration_sec, width, height from event.message.file
+    from app.config import TelegramApiConfig
+
+    settings_tg = _make_settings(tmp_path / "tg_zc", storage_mode="telegram")
+    settings_tg.telegram_archive_chat_id = "-100111222"
+    app_tg = create_app(settings_tg)
+    pool = app_tg.state.tg_pool
+
+    async def fake_mirror(_payload: dict):
+        return {"chat_id": "-100111222", "topic_id": 5, "message_id": 900, "worker_name": "bot1"}
+
+    monkeypatch.setattr(pool, "mirror_to_archive_topic", fake_mirror)
+
+    class FakeStatusMsg:
+        async def edit(self, _text: str):
+            return None
+
+    async def fake_reply(_text: str):
+        return FakeStatusMsg()
+
+    async def fake_dl_media(**_kwargs):
+        return None
+
+    fake_cfg = TelegramApiConfig(name="bot1", api_id=1, api_hash="h", bot_token="t1")
+    fake_event = SimpleNamespace(
+        chat_id=-100111222,
+        reply=fake_reply,
+        message=SimpleNamespace(
+            id=888,
+            message="ZeroCopy Video #action",
+            reply_to=None,
+            media=object(),
+            download_media=fake_dl_media,
+            file=SimpleNamespace(
+                name="action_clip.mp4",
+                mime_type="video/mp4",
+                size=1024 * 1024,
+                duration=95.5,
+                width=1920,
+                height=1080,
+            ),
+        ),
+    )
+    asyncio.run(pool._handle_telegram_media(fake_cfg, fake_event, "Action", tags=["action"]))
+    listed, total = app_tg.state.db.list_media()
+    assert total == 1
+    assert listed[0]["duration_sec"] == 95.5
+    assert listed[0]["width"] == 1920
+    assert listed[0]["height"] == 1080
+
+
+def test_zip_archive_explorer_local_and_tail_backed_telegram(tmp_path: Path, monkeypatch):
+    import zipfile
+
+    settings = _make_settings(tmp_path, storage_mode="both")
+    app = create_app(settings)
+
+    # Build a ZIP containing directory entries, stored text, deflated text, and an image
+    zip_buf = io.BytesIO()
+    stored_payload = b"StoredPayload-" + (b"0123456789ABCDEF" * 20)
+    deflated_payload = b"DeflatedLine\n" * 150
+    jpg_bytes = _sample_jpeg_bytes()
+    with zipfile.ZipFile(zip_buf, "w") as zf:
+        zf.writestr("docs/", b"")
+        zf.writestr("docs/readme.txt", stored_payload, compress_type=zipfile.ZIP_STORED)
+        zf.writestr("logs/app.log", deflated_payload, compress_type=zipfile.ZIP_DEFLATED)
+        zf.writestr("images/cover.jpg", jpg_bytes, compress_type=zipfile.ZIP_STORED)
+    zip_bytes = zip_buf.getvalue()
+
+    with TestClient(app) as client:
+        # Non-zip rejects /zip/entries with 400
+        img_resp = client.post(
+            "/api/ingest/upload",
+            files={"file": ("not_a_zip.jpg", jpg_bytes, "image/jpeg")},
+        )
+        img_item = _wait_for_upload_item(client, img_resp)
+        assert client.get(f"/api/media/{img_item['id']}/zip/entries").status_code == 400
+        assert client.get("/api/media/does_not_exist/zip/entries").status_code == 404
+
+        # Upload ZIP archive locally
+        z_resp = client.post(
+            "/api/ingest/upload",
+            files={"file": ("bundle.zip", zip_bytes, "application/zip")},
+        )
+        z_item = _wait_for_upload_item(client, z_resp)
+        zip_id = z_item["id"]
+
+        entries_resp = client.get(f"/api/media/{zip_id}/zip/entries")
+        assert entries_resp.status_code == 200
+        data = entries_resp.json()
+        assert data["total_entries"] == 3
+        paths = [e["path"] for e in data["entries"]]
+        assert "docs/" not in paths
+        assert paths == ["docs/readme.txt", "logs/app.log", "images/cover.jpg"]
+        assert zip_id in app.state.zip_cache
+
+        # Stream full ZIP_STORED entry + download disposition
+        r_stored = client.get(
+            f"/api/media/{zip_id}/zip/stream",
+            params={"path": "docs/readme.txt", "download": "true"},
+        )
+        assert r_stored.status_code == 200
+        assert r_stored.content == stored_payload
+        assert 'attachment; filename="readme.txt"' in r_stored.headers["content-disposition"]
+
+        # Range 206 on ZIP_STORED entry
+        r_stored_range = client.get(
+            f"/api/media/{zip_id}/zip/stream",
+            params={"path": "docs/readme.txt"},
+            headers={"Range": "bytes=14-45"},
+        )
+        assert r_stored_range.status_code == 206
+        assert r_stored_range.headers["content-range"] == f"bytes 14-45/{len(stored_payload)}"
+        assert r_stored_range.content == stored_payload[14:46]
+
+        # Full stream + Range 206 on ZIP_DEFLATED entry
+        r_def = client.get(f"/api/media/{zip_id}/zip/stream", params={"path": "logs/app.log"})
+        assert r_def.status_code == 200
+        assert r_def.content == deflated_payload
+
+        r_def_range = client.get(
+            f"/api/media/{zip_id}/zip/stream",
+            params={"path": "logs/app.log"},
+            headers={"Range": "bytes=20-79"},
+        )
+        assert r_def_range.status_code == 206
+        assert r_def_range.headers["content-range"] == f"bytes 20-79/{len(deflated_payload)}"
+        assert r_def_range.content == deflated_payload[20:80]
+
+        # Missing entry returns 404
+        assert (
+            client.get(f"/api/media/{zip_id}/zip/stream", params={"path": "missing.txt"}).status_code
+            == 404
+        )
+
+        # Delete invalidates zip_cache
+        assert client.delete(f"/api/media/{zip_id}").status_code == 200
+        assert zip_id not in app.state.zip_cache
+
+    # Telegram-backed large ZIP (>200 KB) verifies tail-only Central Directory fetch
+    tg_settings = _make_settings(tmp_path / "tg_zip", storage_mode="telegram")
+    tg_app = create_app(tg_settings)
+
+    big_zip_buf = io.BytesIO()
+    with zipfile.ZipFile(big_zip_buf, "w") as zf:
+        zf.writestr("big.bin", b"A" * 220_000, compress_type=zipfile.ZIP_STORED)
+        zf.writestr("nested/hello.txt", b"Hello from Telegram ZIP!", compress_type=zipfile.ZIP_DEFLATED)
+    big_zip_bytes = big_zip_buf.getvalue()
+
+    tg_app.state.db.insert_media(
+        media_id="tg_zip_1",
+        title="Telegram Zip",
+        filename="tg_bundle.zip",
+        folder="Archives",
+        media_type="file",
+        mime_type="application/zip",
+        size_bytes=len(big_zip_bytes),
+        drive_name="telegram",
+        file_path="",
+        thumb_filename=None,
+        source_origin="web",
+        source_kind="upload",
+        source_url=None,
+        telegram_chat_id="-100888",
+        telegram_topic_id=12,
+        telegram_msg_id=505,
+        telegram_worker_name="bot1",
+    )
+
+    fetched_ranges: list[tuple[int, int]] = []
+
+    async def fake_prepare_stream(chat_id: str, msg_id: int, worker_name: str | None = None):
+        return object(), object()
+
+    async def fake_iter_range(_client, _media, start: int, end: int):
+        fetched_ranges.append((start, end))
+        yield big_zip_bytes[start : end + 1]
+
+    monkeypatch.setattr(tg_app.state.tg_pool, "prepare_stream", fake_prepare_stream)
+    monkeypatch.setattr(tg_app.state.tg_pool, "iter_telegram_range", fake_iter_range)
+
+    with TestClient(tg_app) as tg_client:
+        res_entries = tg_client.get("/api/media/tg_zip_1/zip/entries")
+        assert res_entries.status_code == 200
+        assert [e["path"] for e in res_entries.json()["entries"]] == ["big.bin", "nested/hello.txt"]
+        # Tail read only fetched the last 131072 bytes, never offset 0
+        assert len(fetched_ranges) == 1
+        assert fetched_ranges[0][0] == len(big_zip_bytes) - 131072
+        assert fetched_ranges[0][1] == len(big_zip_bytes) - 1
+
+        res_hello = tg_client.get(
+            "/api/media/tg_zip_1/zip/stream",
+            params={"path": "nested/hello.txt"},
+        )
+        assert res_hello.status_code == 200
+        assert res_hello.content == b"Hello from Telegram ZIP!"
+
+
+def test_patch_move_rename_local_and_telegram_topic_migration(tmp_path: Path, monkeypatch):
+    from types import SimpleNamespace
+    from app.config import TelegramApiConfig
+
+    # 1) Local drive move & rename updates file path on disk, DB folder/title, and FTS
+    settings = _make_settings(tmp_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        jpg = _sample_jpeg_bytes()
+        resp = client.post(
+            "/api/ingest/upload",
+            data={"folder": "General"},
+            files={"file": ("move_me.jpg", jpg, "image/jpeg")},
+        )
+        item = _wait_for_upload_item(client, resp)
+        old_path = Path(item["file_path"])
+        assert old_path.is_file()
+
+        patch_resp = client.patch(
+            f"/api/media/{item['id']}",
+            json={"title": "Renamed Sunset", "folder": "Travel/Spain"},
+        )
+        assert patch_resp.status_code == 200
+        updated = patch_resp.json()
+        new_path = Path(updated["file_path"])
+        assert updated["title"] == "Renamed Sunset"
+        assert updated["folder"] == "Travel/Spain"
+        assert new_path.is_file()
+        assert not old_path.exists()
+        assert new_path.parent == tmp_path / "drives" / "drive1" / "Travel" / "Spain"
+
+        # FTS search finds new title and folder filter finds new folder
+        assert client.get("/api/media?q=Renamed").json()["total"] == 1
+        assert client.get("/api/media?folder=Travel/Spain").json()["total"] == 1
+        assert client.get("/api/media?folder=General").json()["total"] == 0
+
+    # 2) Multi-part Telegram item folder change migrates messages to new topic and deletes old messages
+    tg_settings = _make_settings(tmp_path / "tg_move", storage_mode="telegram")
+    tg_settings.telegram_archive_chat_id = "-100777"
+    tg_app = create_app(tg_settings)
+    pool = tg_app.state.tg_pool
+    db = tg_app.state.db
+
+    part0 = b"PART_ZERO_" * 50
+    part1 = b"PART_ONE__" * 50
+    total_size = len(part0) + len(part1)
+    stored_msgs: dict[int, bytes] = {101: part0, 102: part1}
+    sent_topics: list[tuple[int, int]] = []
+    deleted_msgs: list[int] = []
+    next_id = 200
+
+    class FakeMigrateWorker:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def get_input_entity(self, target):
+            return target
+
+        async def get_messages(self, peer, ids: int):
+            if ids not in stored_msgs:
+                return None
+            return SimpleNamespace(media=stored_msgs[ids])
+
+        def iter_download(self, media: bytes, *, offset: int = 0, request_size: int = 524288):
+            async def _gen():
+                yield media[offset:]
+
+            return _gen()
+
+        async def upload_file(self, reader, *, file_size: int, file_name: str, progress_callback=None):
+            buf = bytearray()
+            while True:
+                c = reader.read(65536)
+                if not c:
+                    break
+                buf.extend(c)
+            return SimpleNamespace(data=bytes(buf), file_name=file_name, file_size=file_size)
+
+        async def send_file(self, peer, uploaded, *, caption: str = "", reply_to=None, **_):
+            nonlocal next_id
+            next_id += 1
+            raw = uploaded if isinstance(uploaded, (bytes, bytearray)) else uploaded.data
+            stored_msgs[next_id] = bytes(raw)
+            sent_topics.append((next_id, int(reply_to)))
+            return SimpleNamespace(id=next_id)
+
+        async def delete_messages(self, peer, ids: list[int]):
+            for mid in ids:
+                deleted_msgs.append(int(mid))
+                stored_msgs.pop(int(mid), None)
+            return [True]
+
+        async def disconnect(self):
+            return None
+
+    worker = FakeMigrateWorker("bot1")
+    pool.clients = [(TelegramApiConfig(name="bot1", api_id=1, api_hash="h", bot_token="t1"), worker)]
+    db.save_topic_id("-100777", "General", 1)
+    db.save_topic_id("-100777", "Movies", 42)
+
+    db.insert_media(
+        media_id="tg_mp_move",
+        title="Original Movie",
+        filename="movie.bin",
+        folder="General",
+        media_type="file",
+        mime_type="application/octet-stream",
+        size_bytes=total_size,
+        drive_name="telegram",
+        file_path="",
+        thumb_filename=None,
+        source_origin="web",
+        source_kind="upload",
+        source_url=None,
+        telegram_chat_id="-100777",
+        telegram_topic_id=1,
+        telegram_msg_id=101,
+        telegram_worker_name="bot1",
+        part_count=2,
+        parts=[
+            {
+                "part_index": 0,
+                "start_byte": 0,
+                "end_byte": len(part0) - 1,
+                "size_bytes": len(part0),
+                "telegram_chat_id": "-100777",
+                "telegram_topic_id": 1,
+                "telegram_msg_id": 101,
+                "telegram_worker_name": "bot1",
+            },
+            {
+                "part_index": 1,
+                "start_byte": len(part0),
+                "end_byte": total_size - 1,
+                "size_bytes": len(part1),
+                "telegram_chat_id": "-100777",
+                "telegram_topic_id": 1,
+                "telegram_msg_id": 102,
+                "telegram_worker_name": "bot1",
+            },
+        ],
+    )
+
+    with TestClient(tg_app) as tg_client:
+        res = tg_client.patch(
+            "/api/media/tg_mp_move",
+            json={"title": "Migrated Movie", "folder": "Movies"},
+        )
+        assert res.status_code == 200
+        moved = res.json()
+        assert moved["title"] == "Migrated Movie"
+        assert moved["folder"] == "Movies"
+        assert moved["telegram_topic_id"] == 42
+        assert moved["telegram_msg_id"] == 201
+        assert [p["telegram_msg_id"] for p in moved["parts"]] == [201, 202]
+        assert all(tid == 42 for _, tid in sent_topics)
+        assert set(deleted_msgs) == {101, 102}
+
+        # Streaming still returns intact payload from new topic messages
+        streamed = tg_client.get("/api/media/tg_mp_move/stream")
+        assert streamed.status_code == 200
+        assert streamed.content == part0 + part1
+
+
+def test_pagination_bulk_actions_and_2a_frontend_hooks(tmp_path: Path):
+    import zipfile
+
+    settings = _make_settings(tmp_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        # UI HTML exposes all 2.A hooks
+        html = client.get("/").text
+        for hook in (
+            "badge-tr",
+            "mouseenter",
+            "renderZipExplorer",
+            "modalEditMetaBtn",
+            "editMetaModal",
+            "selectModeBtn",
+            "bulkToolbar",
+            "loadMoreWrap",
+            "IntersectionObserver",
+        ):
+            assert hook in html
+
+        jpg = _sample_jpeg_bytes()
+        created: list[dict] = []
+        for idx in range(5):
+            # Use same filename for first two to verify bulk ZIP duplicate filename handling
+            fname = "dup_photo.jpg" if idx < 2 else f"photo_{idx}.jpg"
+            r = client.post(
+                "/api/ingest/upload",
+                data={"folder": "General", "tags": "#init"},
+                files={"file": (fname, jpg, "image/jpeg")},
+            )
+            created.append(_wait_for_upload_item(client, r))
+
+        # Pagination limit & offset
+        p1 = client.get("/api/media?limit=2&offset=0").json()
+        p2 = client.get("/api/media?limit=2&offset=2").json()
+        p3 = client.get("/api/media?limit=2&offset=4").json()
+        assert p1["total"] == p2["total"] == p3["total"] == 5
+        assert len(p1["items"]) == 2
+        assert len(p2["items"]) == 2
+        assert len(p3["items"]) == 1
+        all_paged_ids = [x["id"] for page in (p1, p2, p3) for x in page["items"]]
+        assert len(set(all_paged_ids)) == 5
+
+        target_ids = [created[0]["id"], created[1]["id"], created[2]["id"]]
+
+        # Bulk Move
+        mv_resp = client.post(
+            "/api/media/bulk/move",
+            json={"media_ids": target_ids, "folder": "BulkFolder"},
+        )
+        assert mv_resp.status_code == 200
+        assert mv_resp.json()["moved"] == 3
+        for it in mv_resp.json()["items"]:
+            assert it["folder"] == "BulkFolder"
+            assert Path(it["file_path"]).is_file()
+            assert Path(it["file_path"]).parent.name == "BulkFolder"
+
+        # Bulk Tags: add, remove, replace
+        add_resp = client.post(
+            "/api/media/bulk/tags",
+            json={"media_ids": target_ids, "tags": "#vip, #4k", "mode": "add"},
+        )
+        assert add_resp.status_code == 200
+        for it in add_resp.json()["items"]:
+            assert set(it["tags"]) == {"init", "vip", "4k"}
+
+        rem_resp = client.post(
+            "/api/media/bulk/tags",
+            json={"media_ids": target_ids, "tags": "#init", "mode": "remove"},
+        )
+        assert rem_resp.status_code == 200
+        for it in rem_resp.json()["items"]:
+            assert set(it["tags"]) == {"vip", "4k"}
+
+        rep_resp = client.post(
+            "/api/media/bulk/tags",
+            json={"media_ids": target_ids, "tags": "#final", "mode": "replace"},
+        )
+        assert rep_resp.status_code == 200
+        for it in rep_resp.json()["items"]:
+            assert it["tags"] == ["final"]
+
+        # Bulk Download (GET & POST) produces valid media_bundle.zip with deduped filenames
+        dl_get = client.get("/api/media/bulk/download", params={"ids": ",".join(target_ids)})
+        assert dl_get.status_code == 200
+        assert dl_get.headers["content-type"].startswith("application/zip")
+        assert 'filename="media_bundle.zip"' in dl_get.headers["content-disposition"]
+        with zipfile.ZipFile(io.BytesIO(dl_get.content), "r") as zf:
+            names = zf.namelist()
+            assert len(names) == 3
+            assert len(set(names)) == 3
+            for name in names:
+                assert zf.read(name) == jpg
+
+        dl_post = client.post("/api/media/bulk/download", json={"media_ids": target_ids})
+        assert dl_post.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(dl_post.content), "r") as zf:
+            assert len(zf.namelist()) == 3
+
+        # Bulk Delete cleans files, thumbnails, and DB rows while keeping untouched items
+        paths_before_del = [Path(client.get(f"/api/media/{mid}").json()["file_path"]) for mid in target_ids]
+        del_resp = client.post("/api/media/bulk/delete", json={"media_ids": target_ids})
+        assert del_resp.status_code == 200
+        assert del_resp.json()["deleted"] == 3
+        for p in paths_before_del:
+            assert not p.exists()
+        assert client.get("/api/media").json()["total"] == 2
+
+
+

@@ -182,8 +182,10 @@
       transition: transform 0.12s ease, border-color 0.15s ease;
       display: flex;
       flex-direction: column;
+      position: relative;
     }
     .card:hover { transform: translateY(-2px); border-color: var(--accent); }
+    .card.selected { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(59,130,246,0.45); }
     .thumb-wrap {
       position: relative;
       aspect-ratio: 16 / 10;
@@ -199,11 +201,41 @@
       position: absolute; top: 8px; left: 8px;
       background: rgba(0,0,0,0.72); color: #fff;
       font-size: 0.7rem; padding: 2px 7px; border-radius: 6px;
+      max-width: 65%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .badge-tr {
+      position: absolute; top: 8px; right: 8px;
+      background: rgba(0,0,0,0.72); color: #fff;
+      font-size: 0.7rem; padding: 2px 7px; border-radius: 6px;
     }
     .badge-br {
       position: absolute; bottom: 8px; right: 8px;
       background: rgba(0,0,0,0.72); color: #fff;
       font-size: 0.7rem; padding: 2px 7px; border-radius: 6px;
+    }
+    .badge-bl {
+      position: absolute; bottom: 8px; left: 8px;
+      background: rgba(0,0,0,0.72); color: #fff;
+      font-size: 0.7rem; padding: 2px 7px; border-radius: 6px;
+    }
+    .card-check {
+      position: absolute; top: 8px; left: 8px; z-index: 3;
+      width: 18px; height: 18px; accent-color: var(--accent);
+      cursor: pointer; display: none;
+    }
+    .select-mode .card-check, .card.selected .card-check { display: block; }
+    .select-mode .badge-tl, .card.selected .badge-tl { left: 32px; }
+
+    .bulk-toolbar {
+      background: var(--panel);
+      border: 1px solid var(--accent);
+      border-radius: var(--radius);
+      padding: 10px 14px;
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
     }
     .card-body { padding: 10px 12px; display: grid; gap: 4px; }
     .card-title {
@@ -250,6 +282,87 @@
       padding: 14px 16px;
       display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap;
       font-size: 0.85rem; color: var(--muted);
+    }
+    .zip-explorer {
+      width: 100%;
+      max-height: 68vh;
+      display: grid;
+      grid-template-rows: auto 1fr;
+      background: var(--bg);
+      color: var(--text);
+    }
+    .zip-breadcrumbs {
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      flex-wrap: wrap;
+      font-size: 0.85rem;
+      background: var(--panel);
+    }
+    .zip-crumb {
+      background: none;
+      border: none;
+      padding: 2px 6px;
+      color: var(--accent);
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .zip-crumb:hover { background: var(--panel-2); }
+    .zip-body {
+      display: grid;
+      grid-template-columns: 1fr;
+      overflow: hidden;
+      min-height: 240px;
+    }
+    .zip-body.with-preview {
+      grid-template-columns: minmax(240px, 1fr) minmax(280px, 1.2fr);
+    }
+    @media (max-width: 700px) {
+      .zip-body.with-preview { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
+    }
+    .zip-list {
+      overflow-y: auto;
+      padding: 8px;
+      display: grid;
+      gap: 6px;
+      align-content: start;
+    }
+    .zip-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      font-size: 0.85rem;
+    }
+    .zip-row:hover { border-color: var(--accent); }
+    .zip-preview-pane {
+      border-left: 1px solid var(--border);
+      background: #05070a;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      padding: 12px;
+      overflow: auto;
+    }
+    .zip-preview-pane img, .zip-preview-pane video { max-width: 100%; max-height: 52vh; }
+    .zip-preview-pane pre {
+      width: 100%;
+      max-height: 52vh;
+      overflow: auto;
+      margin: 0;
+      padding: 10px;
+      font-size: 0.8rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+      color: var(--text);
     }
     .empty { text-align: center; padding: 48px 16px; color: var(--muted); }
   </style>
@@ -343,10 +456,30 @@
           <option value="largest">Largest first</option>
         </select>
       </div>
-      <div id="countLabel" style="font-size:0.85rem;color:var(--muted);"></div>
+      <div class="toolbar-group">
+        <button id="selectModeBtn" type="button" class="secondary">Select</button>
+        <div id="countLabel" style="font-size:0.85rem;color:var(--muted);"></div>
+      </div>
+    </section>
+
+    <section id="bulkToolbar" class="bulk-toolbar" style="display:none;">
+      <div class="toolbar-group">
+        <strong id="bulkCountLabel" style="font-size:0.88rem;">0 selected</strong>
+        <button id="bulkSelectAllBtn" type="button" class="secondary" style="padding:6px 10px;font-size:0.82rem;">Select All</button>
+        <button id="bulkClearBtn" type="button" class="secondary" style="padding:6px 10px;font-size:0.82rem;">Clear</button>
+      </div>
+      <div class="toolbar-group">
+        <button id="bulkMoveBtn" type="button" class="secondary" style="padding:6px 12px;font-size:0.82rem;">Move to Folder</button>
+        <button id="bulkTagsBtn" type="button" class="secondary" style="padding:6px 12px;font-size:0.82rem;">Edit Tags</button>
+        <button id="bulkDownloadBtn" type="button" class="secondary" style="padding:6px 12px;font-size:0.82rem;">Download ZIP</button>
+        <button id="bulkDeleteBtn" type="button" class="danger" style="padding:6px 12px;font-size:0.82rem;">Delete</button>
+      </div>
     </section>
 
     <section id="galleryGrid" class="gallery-grid"></section>
+    <div id="loadMoreWrap" style="display:none;text-align:center;padding:8px 0;">
+      <button id="loadMoreBtn" type="button" class="secondary">Load More</button>
+    </div>
   </main>
 
   <dialog id="viewerModal">
@@ -358,9 +491,31 @@
     <div class="modal-foot">
       <div id="modalMeta"></div>
       <div class="toolbar-group">
+        <button id="modalEditMetaBtn" type="button" class="secondary">Move / Rename</button>
         <button id="modalEditTagsBtn" type="button" class="secondary">Edit Tags</button>
         <a id="modalDownload" href="#" download><button type="button" class="secondary">Download</button></a>
         <button id="modalDeleteBtn" type="button" class="danger">Delete</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="editMetaModal" style="width:min(460px,92vw);">
+    <div class="modal-head">
+      <strong>Move / Rename Media</strong>
+      <button id="closeEditMetaBtn" type="button" class="secondary">Close</button>
+    </div>
+    <div style="padding:16px;display:grid;gap:12px;">
+      <label style="display:grid;gap:4px;font-size:0.85rem;color:var(--muted);">
+        Title
+        <input id="editMetaTitleInput" type="text" placeholder="Title..." />
+      </label>
+      <label style="display:grid;gap:4px;font-size:0.85rem;color:var(--muted);">
+        Folder / Topic
+        <input id="editMetaFolderInput" type="text" list="folderList" placeholder="General" />
+      </label>
+      <div class="toolbar-group" style="justify-content:flex-end;">
+        <button id="cancelEditMetaBtn" type="button" class="secondary">Cancel</button>
+        <button id="saveEditMetaBtn" type="button">Save</button>
       </div>
     </div>
   </dialog>
@@ -403,15 +558,31 @@
       defaultFolder: "General",
       maxUploadMb: 20480,
       activeMediaId: null,
+      activeMediaItem: null,
       jobPollTimer: null,
       mediaRefreshTimer: null,
       sse: null,
       sseConnected: false,
       hadActiveJobs: false,
       lastDoneCount: -1,
+      mediaItems: [],
+      mediaTotal: 0,
+      pageSize: 60,
+      isLoadingMore: false,
+      selectMode: false,
+      selectedIds: new Set(),
     };
 
     const $ = (id) => document.getElementById(id);
+
+    function escapeHtml(val) {
+      return String(val ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
 
     function fmtSize(bytes) {
       if (!bytes) return "0 B";
@@ -419,6 +590,42 @@
       let v = bytes, i = 0;
       while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
       return `${v.toFixed(1)} ${units[i]}`;
+    }
+
+    function fmtDuration(sec) {
+      if (!sec || sec <= 0) return "";
+      const total = Math.round(sec);
+      const h = Math.floor(total / 3600);
+      const m = Math.floor((total % 3600) / 60);
+      const s = total % 60;
+      const ss = String(s).padStart(2, "0");
+      if (h > 0) {
+        return `${h}:${String(m).padStart(2, "0")}:${ss}`;
+      }
+      return `${m}:${ss}`;
+    }
+
+    function fmtResolution(it, { exact = false } = {}) {
+      const w = Number(it.width || 0);
+      const h = Number(it.height || 0);
+      if (!w || !h) return "";
+      if (exact) return `${w}×${h}`;
+      if (h >= 2160 || w >= 3840) return "4K";
+      if (h >= 1440 && h <= 1460) return "1440p";
+      if (h >= 1070 && h <= 1090) return "1080p";
+      if (h >= 710 && h <= 730) return "720p";
+      if (h >= 470 && h <= 490) return "480p";
+      return `${w}×${h}`;
+    }
+
+    function updateBulkToolbar() {
+      const bar = $("bulkToolbar");
+      const count = state.selectedIds.size;
+      const show = state.selectMode || count > 0;
+      bar.style.display = show ? "flex" : "none";
+      $("bulkCountLabel").textContent = `${count} selected`;
+      $("selectModeBtn").textContent = state.selectMode ? "Done Selecting" : "Select";
+      $("galleryGrid").classList.toggle("select-mode", state.selectMode);
     }
 
     function authHeaders() {
@@ -484,9 +691,9 @@
       const list = $("folderList");
       const filter = $("folderFilter");
       const prev = filter.value;
-      list.innerHTML = data.folders.map(f => `<option value="${f}"></option>`).join("");
+      list.innerHTML = data.folders.map(f => `<option value="${escapeHtml(f)}"></option>`).join("");
       filter.innerHTML = `<option value="all">All folders</option>` +
-        data.folders.map(f => `<option value="${f}">${f}</option>`).join("");
+        data.folders.map(f => `<option value="${escapeHtml(f)}">${escapeHtml(f)}</option>`).join("");
       filter.value = prev || "all";
     }
 
@@ -495,9 +702,9 @@
       const list = $("tagList");
       const filter = $("tagFilter");
       const prev = filter.value;
-      list.innerHTML = data.tags.map(t => `<option value="#${t}"></option>`).join("");
+      list.innerHTML = data.tags.map(t => `<option value="#${escapeHtml(t)}"></option>`).join("");
       filter.innerHTML = `<option value="all">All tags</option>` +
-        data.tags.map(t => `<option value="${t}">#${t}</option>`).join("");
+        data.tags.map(t => `<option value="${escapeHtml(t)}">#${escapeHtml(t)}</option>`).join("");
       filter.value = prev && (prev === "all" || data.tags.includes(prev)) ? prev : "all";
     }
 
@@ -525,16 +732,16 @@
       }
 
       grid.innerHTML = data.drives.map(d => {
-        driveSelect.insertAdjacentHTML("beforeend", `<option value="${d.name}">${d.name}</option>`);
+        driveSelect.insertAdjacentHTML("beforeend", `<option value="${escapeHtml(d.name)}">${escapeHtml(d.name)}</option>`);
         if (!d.mounted) {
           return `<div class="drive-card">
-            <div class="drive-head"><span>${d.name}</span><span class="pill">unmounted</span></div>
-            <div class="drive-meta">${d.path}</div>
+            <div class="drive-head"><span>${escapeHtml(d.name)}</span><span class="pill">unmounted</span></div>
+            <div class="drive-meta">${escapeHtml(d.path)}</div>
           </div>`;
         }
         const pct = d.total_bytes ? Math.round((d.used_bytes / d.total_bytes) * 100) : 0;
         return `<div class="drive-card">
-          <div class="drive-head"><span>${d.name}</span><span class="pill ok">${fmtSize(d.free_bytes)} free</span></div>
+          <div class="drive-head"><span>${escapeHtml(d.name)}</span><span class="pill ok">${fmtSize(d.free_bytes)} free</span></div>
           <div class="drive-meta">${fmtSize(d.used_bytes)} used of ${fmtSize(d.total_bytes)} (${pct}%)</div>
           <div class="bar"><div style="width:${pct}%"></div></div>
         </div>`;
@@ -587,11 +794,11 @@
           <div class="job-item">
             <div class="job-head">
               <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:65%;">
-                <strong>[${j.source_origin}]</strong> ${j.source_ref}
+                <strong>[${escapeHtml(j.source_origin)}]</strong> ${escapeHtml(j.source_ref)}
               </span>
               <span>
-                <span class="status-tag status-${j.status}">${j.status}${j.status !== "done" && j.status !== "failed" ? ` (${pct}%)` : ""}</span>
-                <span style="color:var(--muted);margin-left:8px;">${j.message || ""}</span>
+                <span class="status-tag status-${escapeHtml(j.status)}">${escapeHtml(j.status)}${j.status !== "done" && j.status !== "failed" ? ` (${pct}%)` : ""}</span>
+                <span style="color:var(--muted);margin-left:8px;">${escapeHtml(j.message || "")}</span>
               </span>
             </div>
             <div class="${barCls}"><div style="width:${pct}%"></div></div>
@@ -670,50 +877,61 @@
       };
     }
 
-    async function loadMedia() {
-      const params = new URLSearchParams({
-        media_type: $("typeFilter").value,
-        drive_name: $("driveFilter").value,
-        folder: $("folderFilter").value,
-        tag: $("tagFilter").value,
-        q: $("searchInput").value.trim(),
-        sort: $("sortSelect").value,
-      });
-      const data = await apiFetch(`/api/media?${params}`);
-      $("countLabel").textContent = `${data.total} item(s)`;
+    function renderGallery() {
       const grid = $("galleryGrid");
+      const items = state.mediaItems;
+      const total = state.mediaTotal;
+      $("countLabel").textContent = items.length < total
+        ? `${items.length} of ${total} item(s)`
+        : `${total} item(s)`;
 
-      if (!data.items.length) {
+      const loadMoreWrap = $("loadMoreWrap");
+      loadMoreWrap.style.display = items.length < total ? "block" : "none";
+
+      if (!items.length) {
         grid.innerHTML = `<div class="empty" style="grid-column:1/-1;">No media yet. Paste a link, drop a file, or send one to your Telegram bot.</div>`;
+        updateBulkToolbar();
         return;
       }
 
-      grid.innerHTML = data.items.map(it => {
+      grid.innerHTML = items.map(it => {
         const thumbUrl = it.thumb_filename ? withToken(`/api/media/${it.id}/thumb`) : "";
+        const previewAttr = (it.media_type === "video" && it.preview_filename)
+          ? ` data-preview="${escapeHtml(withToken(`/api/media/${it.id}/preview`))}"`
+          : "";
         const thumbHtml = thumbUrl
-          ? `<img loading="lazy" src="${thumbUrl}" alt="${it.title}" />`
-          : `<div class="thumb-fallback">${it.media_type}</div>`;
-        const typeBadge = it.media_type === "video" ? "▶ Video" : it.media_type;
+          ? `<img loading="lazy" src="${escapeHtml(thumbUrl)}" data-thumb="${escapeHtml(thumbUrl)}" alt="${escapeHtml(it.title)}" />`
+          : `<div class="thumb-fallback">${escapeHtml(it.media_type)}</div>`;
+        const typeBadge = isZipItem(it) ? "📦 ZIP" : (it.media_type === "video" ? "▶ Video" : it.media_type);
         const folder = it.folder || state.defaultFolder;
+        const durTxt = fmtDuration(it.duration_sec);
+        const resTxt = fmtResolution(it);
+        const trParts = [durTxt, resTxt].filter(Boolean);
+        const trBadge = trParts.length
+          ? `<span class="badge-tr">${escapeHtml(trParts.join(" • "))}</span>`
+          : "";
         const partCount = Number(it.part_count || 1);
         const partsBadge = partCount > 1
           ? `<span class="pill ok" style="font-size:0.68rem;padding:1px 6px;">${partCount} Parts • Unified Stream</span>`
           : "";
         const tagsHtml = (it.tags && it.tags.length)
-          ? `<div class="tag-row">${it.tags.map(t => `<span class="tag-chip" data-tag="${t}">#${t}</span>`).join("")}</div>`
+          ? `<div class="tag-row">${it.tags.map(t => `<span class="tag-chip" data-tag="${escapeHtml(t)}">#${escapeHtml(t)}</span>`).join("")}</div>`
           : "";
+        const isSelected = state.selectedIds.has(it.id);
         return `
-          <article class="card" data-id="${it.id}">
+          <article class="card${isSelected ? " selected" : ""}" data-id="${escapeHtml(it.id)}"${previewAttr}>
             <div class="thumb-wrap">
+              <input type="checkbox" class="card-check" ${isSelected ? "checked" : ""} aria-label="Select item" />
               ${thumbHtml}
-              <span class="badge-tl">${typeBadge} • ${folder}</span>
-              <span class="badge-br">${it.drive_name}</span>
+              <span class="badge-tl">${escapeHtml(typeBadge)} • ${escapeHtml(folder)}</span>
+              ${trBadge}
+              <span class="badge-br">${escapeHtml(it.drive_name)}</span>
             </div>
             <div class="card-body">
-              <div class="card-title" title="${it.filename}">${it.title || it.filename}</div>
+              <div class="card-title" title="${escapeHtml(it.filename)}">${escapeHtml(it.title || it.filename)}</div>
               <div class="card-sub">
                 <span>${fmtSize(it.size_bytes)}</span>
-                <span>${partsBadge || it.source_origin.toUpperCase()}</span>
+                <span>${partsBadge || escapeHtml(it.source_origin.toUpperCase())}</span>
               </div>
               ${tagsHtml}
             </div>
@@ -730,13 +948,223 @@
       });
 
       grid.querySelectorAll(".card").forEach(el => {
-        el.addEventListener("click", () => openViewer(el.dataset.id));
+        const id = el.dataset.id;
+        const cb = el.querySelector(".card-check");
+        if (cb) {
+          cb.addEventListener("click", (e) => {
+            e.stopPropagation();
+            if (cb.checked) state.selectedIds.add(id);
+            else state.selectedIds.delete(id);
+            el.classList.toggle("selected", cb.checked);
+            updateBulkToolbar();
+          });
+        }
+
+        const previewUrl = el.dataset.preview;
+        if (previewUrl) {
+          const img = el.querySelector(".thumb-wrap img");
+          if (img) {
+            const staticSrc = img.dataset.thumb || img.src;
+            el.addEventListener("mouseenter", () => { img.src = previewUrl; });
+            el.addEventListener("mouseleave", () => { img.src = staticSrc; });
+          }
+        }
+
+        el.addEventListener("click", () => {
+          if (state.selectMode) {
+            if (state.selectedIds.has(id)) state.selectedIds.delete(id);
+            else state.selectedIds.add(id);
+            const checked = state.selectedIds.has(id);
+            if (cb) cb.checked = checked;
+            el.classList.toggle("selected", checked);
+            updateBulkToolbar();
+            return;
+          }
+          openViewer(id);
+        });
       });
+
+      updateBulkToolbar();
+    }
+
+    async function loadMedia({ append = false } = {}) {
+      if (append && state.isLoadingMore) return;
+      state.isLoadingMore = true;
+      const btn = $("loadMoreBtn");
+      if (btn) btn.disabled = true;
+
+      try {
+        const offset = append ? state.mediaItems.length : 0;
+        const params = new URLSearchParams({
+          media_type: $("typeFilter").value,
+          drive_name: $("driveFilter").value,
+          folder: $("folderFilter").value,
+          tag: $("tagFilter").value,
+          q: $("searchInput").value.trim(),
+          sort: $("sortSelect").value,
+          limit: String(state.pageSize),
+          offset: String(offset),
+        });
+        const data = await apiFetch(`/api/media?${params}`);
+        if (append) {
+          const seen = new Set(state.mediaItems.map(x => x.id));
+          const extra = (data.items || []).filter(x => !seen.has(x.id));
+          state.mediaItems = [...state.mediaItems, ...extra];
+        } else {
+          state.mediaItems = data.items || [];
+        }
+        state.mediaTotal = data.total || 0;
+        renderGallery();
+      } finally {
+        state.isLoadingMore = false;
+        if (btn) btn.disabled = false;
+      }
+    }
+
+    function isZipItem(item) {
+      const name = (item.filename || "").toLowerCase();
+      return name.endsWith(".zip") || item.mime_type === "application/zip";
+    }
+
+    function isPreviewableZipEntry(entry) {
+      if (["image", "video", "audio"].includes(entry.media_type)) return true;
+      const mime = (entry.mime_type || "").toLowerCase();
+      if (mime.startsWith("text/") || mime === "application/json" || mime === "application/xml") return true;
+      const name = (entry.name || "").toLowerCase();
+      return /\.(txt|md|json|csv|log|xml|ya?ml|py|js|ts|html|css|ini|conf|sh)$/.test(name);
+    }
+
+    async function renderZipExplorer(item, mediaBox) {
+      mediaBox.innerHTML = `<div style="padding:36px;color:var(--muted);">Loading ZIP archive directory...</div>`;
+      let data;
+      try {
+        data = await apiFetch(`/api/media/${item.id}/zip/entries`);
+      } catch (err) {
+        mediaBox.innerHTML = `<div style="padding:36px;color:var(--err);">Could not inspect ZIP archive: ${escapeHtml(err.message)}</div>`;
+        return;
+      }
+
+      const entries = data.entries || [];
+      let currentDir = "";
+      let activePreviewEntry = null;
+
+      function renderExplorer() {
+        const prefix = currentDir ? `${currentDir}/` : "";
+        const subdirs = new Set();
+        const files = [];
+
+        for (const e of entries) {
+          if (!e.path.startsWith(prefix)) continue;
+          const rest = e.path.slice(prefix.length);
+          if (!rest) continue;
+          const slashIdx = rest.indexOf("/");
+          if (slashIdx >= 0) {
+            subdirs.add(rest.slice(0, slashIdx));
+          } else {
+            files.push(e);
+          }
+        }
+
+        const dirList = Array.from(subdirs).sort((a, b) => a.localeCompare(b));
+        files.sort((a, b) => a.name.localeCompare(b.name));
+
+        const parts = currentDir ? currentDir.split("/") : [];
+        const crumbsHtml = [
+          `<button type="button" class="zip-crumb" data-dir="">Root (${entries.length})</button>`,
+          ...parts.map((part, idx) => {
+            const target = parts.slice(0, idx + 1).join("/");
+            return `<span>/</span><button type="button" class="zip-crumb" data-dir="${escapeHtml(target)}">${escapeHtml(part)}</button>`;
+          }),
+        ].join(" ");
+
+        const rowsHtml = [
+          ...dirList.map(d => {
+            const nextDir = currentDir ? `${currentDir}/${d}` : d;
+            return `
+              <div class="zip-row zip-folder-row" data-dir="${escapeHtml(nextDir)}" style="cursor:pointer;">
+                <span>📁 <strong>${escapeHtml(d)}</strong></span>
+                <span class="pill">Folder</span>
+              </div>
+            `;
+          }),
+          ...files.map((f, idx) => {
+            const dlHref = withToken(`/api/media/${item.id}/zip/stream?path=${encodeURIComponent(f.path)}&download=true`);
+            const canPreview = isPreviewableZipEntry(f);
+            return `
+              <div class="zip-row">
+                <div style="min-width:0;overflow:hidden;">
+                  <div style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"><strong>${escapeHtml(f.name)}</strong></div>
+                  <div style="font-size:0.75rem;color:var(--muted);">${escapeHtml(f.media_type)} • ${fmtSize(f.size_bytes)}</div>
+                </div>
+                <div class="toolbar-group" style="flex-shrink:0;">
+                  ${canPreview ? `<button type="button" class="secondary zip-preview-btn" data-idx="${idx}" style="padding:4px 10px;font-size:0.78rem;">Preview</button>` : ""}
+                  <a href="${escapeHtml(dlHref)}" download="${escapeHtml(f.name)}"><button type="button" class="secondary" style="padding:4px 10px;font-size:0.78rem;">Download</button></a>
+                </div>
+              </div>
+            `;
+          }),
+        ].join("") || `<div style="padding:24px;color:var(--muted);text-align:center;">Empty folder</div>`;
+
+        mediaBox.innerHTML = `
+          <div class="zip-explorer">
+            <div class="zip-breadcrumbs">${crumbsHtml}</div>
+            <div class="zip-body${activePreviewEntry ? " with-preview" : ""}">
+              <div class="zip-list">${rowsHtml}</div>
+              ${activePreviewEntry ? `<div id="zipPreviewPane" class="zip-preview-pane">Loading preview...</div>` : ""}
+            </div>
+          </div>
+        `;
+
+        mediaBox.querySelectorAll(".zip-crumb").forEach(btn => {
+          btn.addEventListener("click", () => {
+            currentDir = btn.dataset.dir || "";
+            renderExplorer();
+          });
+        });
+
+        mediaBox.querySelectorAll(".zip-folder-row").forEach(row => {
+          row.addEventListener("click", () => {
+            currentDir = row.dataset.dir || "";
+            renderExplorer();
+          });
+        });
+
+        mediaBox.querySelectorAll(".zip-preview-btn").forEach(btn => {
+          btn.addEventListener("click", () => {
+            activePreviewEntry = files[Number(btn.dataset.idx)];
+            renderExplorer();
+          });
+        });
+
+        if (activePreviewEntry) {
+          const pane = $("zipPreviewPane");
+          const entryUrl = withToken(`/api/media/${item.id}/zip/stream?path=${encodeURIComponent(activePreviewEntry.path)}`);
+          if (activePreviewEntry.media_type === "video") {
+            pane.innerHTML = `<video controls autoplay playsinline src="${escapeHtml(entryUrl)}"></video>`;
+          } else if (activePreviewEntry.media_type === "image") {
+            pane.innerHTML = `<img src="${escapeHtml(entryUrl)}" alt="${escapeHtml(activePreviewEntry.name)}" />`;
+          } else if (activePreviewEntry.media_type === "audio") {
+            pane.innerHTML = `<audio controls autoplay style="width:90%;" src="${escapeHtml(entryUrl)}"></audio>`;
+          } else {
+            fetch(entryUrl, { headers: authHeaders() })
+              .then(r => r.text())
+              .then(txt => {
+                if (pane) pane.innerHTML = `<pre>${escapeHtml(txt.slice(0, 200000))}</pre>`;
+              })
+              .catch(err => {
+                if (pane) pane.innerHTML = `<div style="color:var(--err);">Preview failed: ${escapeHtml(err.message)}</div>`;
+              });
+          }
+        }
+      }
+
+      renderExplorer();
     }
 
     async function openViewer(mediaId) {
       const item = await apiFetch(`/api/media/${mediaId}`);
       state.activeMediaId = item.id;
+      state.activeMediaItem = item;
       state.activeMediaTags = item.tags || [];
       location.hash = `media=${item.id}`;
       $("modalTitle").textContent = item.title || item.filename;
@@ -746,35 +1174,44 @@
       $("modalDownload").href = dlUrl;
 
       const mediaBox = $("modalMedia");
-      if (item.media_type === "video") {
+      if (isZipItem(item)) {
+        await renderZipExplorer(item, mediaBox);
+      } else if (item.media_type === "video") {
         mediaBox.innerHTML = `<video controls autoplay playsinline src="${streamUrl}"></video>`;
       } else if (item.media_type === "image") {
-        mediaBox.innerHTML = `<img src="${streamUrl}" alt="${item.title}" />`;
+        mediaBox.innerHTML = `<img src="${streamUrl}" alt="${escapeHtml(item.title)}" />`;
       } else if (item.media_type === "audio") {
         mediaBox.innerHTML = `<audio controls autoplay style="width:90%;margin:32px;" src="${streamUrl}"></audio>`;
       } else {
-        mediaBox.innerHTML = `<div style="padding:40px;color:var(--muted);">Preview unavailable for ${item.mime_type}. Use Download below.</div>`;
+        mediaBox.innerHTML = `<div style="padding:40px;color:var(--muted);">Preview unavailable for ${escapeHtml(item.mime_type)}. Use Download below.</div>`;
       }
 
       const srcLink = item.source_url
-        ? ` • <a href="${item.source_url}" target="_blank" rel="noopener" style="color:var(--accent);">Source URL</a>`
+        ? ` • <a href="${escapeHtml(item.source_url)}" target="_blank" rel="noopener" style="color:var(--accent);">Source URL</a>`
         : "";
       const topicInfo = item.telegram_topic_id ? ` • Topic #${item.telegram_topic_id}` : "";
       const partCount = Number(item.part_count || (item.parts ? item.parts.length : 1) || 1);
       const partInfo = partCount > 1
         ? ` • <span class="pill ok">${partCount} Parts • Unified Stream</span>`
         : "";
+      const resExact = fmtResolution(item, { exact: true });
+      const durTxt = fmtDuration(item.duration_sec);
+      const codecs = [item.video_codec, item.audio_codec].filter(Boolean).join("/");
+      const fpsTxt = item.fps ? `${Math.round(item.fps * 100) / 100}fps` : "";
+      const richParts = [resExact, durTxt, codecs, fpsTxt].filter(Boolean);
+      const richInfo = richParts.length ? ` • ${escapeHtml(richParts.join(" • "))}` : "";
       const tagsLine = (item.tags && item.tags.length)
-        ? ` • ${item.tags.map(t => `<span class="tag-chip">#${t}</span>`).join(" ")}`
+        ? ` • ${item.tags.map(t => `<span class="tag-chip">#${escapeHtml(t)}</span>`).join(" ")}`
         : "";
-      $("modalMeta").innerHTML = `${item.drive_name}/${item.folder || state.defaultFolder} • ${fmtSize(item.size_bytes)} • ${item.source_origin}/${item.source_kind}${topicInfo}${partInfo}${tagsLine}${srcLink}`;
-      $("viewerModal").showModal();
+      $("modalMeta").innerHTML = `${escapeHtml(item.drive_name)}/${escapeHtml(item.folder || state.defaultFolder)} • ${fmtSize(item.size_bytes)}${richInfo} • ${escapeHtml(item.source_origin)}/${escapeHtml(item.source_kind)}${topicInfo}${partInfo}${tagsLine}${srcLink}`;
+      if (!$("viewerModal").open) $("viewerModal").showModal();
     }
 
     function closeViewer() {
       $("modalMedia").innerHTML = "";
       $("viewerModal").close();
       state.activeMediaId = null;
+      state.activeMediaItem = null;
       if (location.hash.startsWith("#media=")) {
         history.replaceState(null, "", location.pathname + location.search);
       }
@@ -1074,16 +1511,148 @@
       handleFiles(e.dataTransfer.files);
     });
 
-    ["typeFilter", "folderFilter", "tagFilter", "driveFilter", "sortSelect"].forEach(id => $(id).addEventListener("change", loadMedia));
+    ["typeFilter", "folderFilter", "tagFilter", "driveFilter", "sortSelect"].forEach(id => $(id).addEventListener("change", () => loadMedia()));
     $("searchInput").addEventListener("input", () => {
       clearTimeout(window._searchT);
-      window._searchT = setTimeout(loadMedia, 250);
+      window._searchT = setTimeout(() => loadMedia(), 250);
+    });
+
+    $("loadMoreBtn").addEventListener("click", () => loadMedia({ append: true }));
+    if (typeof IntersectionObserver !== "undefined") {
+      const sentinel = $("loadMoreWrap");
+      const observer = new IntersectionObserver((entries) => {
+        if (entries.some(e => e.isIntersecting) && !state.isLoadingMore && state.mediaItems.length < state.mediaTotal) {
+          loadMedia({ append: true }).catch(() => {});
+        }
+      }, { rootMargin: "200px" });
+      observer.observe(sentinel);
+    }
+
+    $("selectModeBtn").addEventListener("click", () => {
+      state.selectMode = !state.selectMode;
+      if (!state.selectMode) {
+        state.selectedIds.clear();
+        renderGallery();
+      } else {
+        updateBulkToolbar();
+      }
+    });
+
+    $("bulkSelectAllBtn").addEventListener("click", () => {
+      state.selectMode = true;
+      state.mediaItems.forEach(it => state.selectedIds.add(it.id));
+      renderGallery();
+    });
+
+    $("bulkClearBtn").addEventListener("click", () => {
+      state.selectedIds.clear();
+      renderGallery();
+    });
+
+    $("bulkMoveBtn").addEventListener("click", async () => {
+      const ids = Array.from(state.selectedIds);
+      if (!ids.length) return;
+      const folder = prompt("Move selected items to folder / topic:", selectedFolder());
+      if (folder === null || !folder.trim()) return;
+      try {
+        await apiFetch("/api/media/bulk/move", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ media_ids: ids, folder: folder.trim() }),
+        });
+        await Promise.all([loadFolders(), loadMedia()]);
+      } catch (err) {
+        alert(`Bulk move failed: ${err.message}`);
+      }
+    });
+
+    $("bulkTagsBtn").addEventListener("click", async () => {
+      const ids = Array.from(state.selectedIds);
+      if (!ids.length) return;
+      const tags = prompt("Enter tags to apply (prefix with ! to replace all, or - to remove):", "");
+      if (tags === null) return;
+      const trimmed = tags.trim();
+      const mode = trimmed.startsWith("!") ? "replace" : (trimmed.startsWith("-") ? "remove" : "add");
+      const cleanTags = (mode === "replace" || mode === "remove") ? trimmed.slice(1).trim() : trimmed;
+      try {
+        await apiFetch("/api/media/bulk/tags", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ media_ids: ids, tags: cleanTags, mode }),
+        });
+        await Promise.all([loadTags(), loadMedia()]);
+      } catch (err) {
+        alert(`Bulk tag update failed: ${err.message}`);
+      }
+    });
+
+    $("bulkDownloadBtn").addEventListener("click", () => {
+      const ids = Array.from(state.selectedIds);
+      if (!ids.length) return;
+      const url = withToken(`/api/media/bulk/download?ids=${encodeURIComponent(ids.join(","))}`);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "media_bundle.zip";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    });
+
+    $("bulkDeleteBtn").addEventListener("click", async () => {
+      const ids = Array.from(state.selectedIds);
+      if (!ids.length || !confirm(`Delete ${ids.length} selected item(s) permanently?`)) return;
+      try {
+        await apiFetch("/api/media/bulk/delete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ media_ids: ids }),
+        });
+        state.selectedIds.clear();
+        state.selectMode = false;
+        await refreshAll();
+      } catch (err) {
+        alert(`Bulk delete failed: ${err.message}`);
+      }
     });
 
     $("closeModalBtn").addEventListener("click", closeViewer);
     $("viewerModal").addEventListener("click", (e) => {
       if (e.target === $("viewerModal")) closeViewer();
     });
+
+    $("modalEditMetaBtn").addEventListener("click", () => {
+      if (!state.activeMediaId || !state.activeMediaItem) return;
+      $("editMetaTitleInput").value = state.activeMediaItem.title || "";
+      $("editMetaFolderInput").value = state.activeMediaItem.folder || state.defaultFolder;
+      $("editMetaModal").showModal();
+    });
+    $("closeEditMetaBtn").addEventListener("click", () => $("editMetaModal").close());
+    $("cancelEditMetaBtn").addEventListener("click", () => $("editMetaModal").close());
+    $("editMetaModal").addEventListener("click", (e) => {
+      if (e.target === $("editMetaModal")) $("editMetaModal").close();
+    });
+    $("saveEditMetaBtn").addEventListener("click", async () => {
+      if (!state.activeMediaId) return;
+      const title = $("editMetaTitleInput").value.trim();
+      const folder = $("editMetaFolderInput").value.trim() || state.defaultFolder;
+      const btn = $("saveEditMetaBtn");
+      btn.disabled = true;
+      try {
+        await apiFetch(`/api/media/${state.activeMediaId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: title || undefined, folder }),
+        });
+        $("editMetaModal").close();
+        await openViewer(state.activeMediaId);
+        await Promise.all([loadFolders(), loadMedia()]);
+      } catch (err) {
+        alert(`Failed updating media: ${err.message}`);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
     $("modalEditTagsBtn").addEventListener("click", async () => {
       if (!state.activeMediaId) return;
       const current = (state.activeMediaTags || []).map(t => `#${t}`).join(" ");
@@ -1099,7 +1668,9 @@
     });
     $("modalDeleteBtn").addEventListener("click", async () => {
       if (!state.activeMediaId || !confirm("Delete this file from the cloud drive?")) return;
-      await apiFetch(`/api/media/${state.activeMediaId}`, { method: "DELETE" });
+      const deletedId = state.activeMediaId;
+      await apiFetch(`/api/media/${deletedId}`, { method: "DELETE" });
+      state.selectedIds.delete(deletedId);
       closeViewer();
       await refreshAll();
     });
