@@ -3,6 +3,7 @@ import { emit, on } from "/static/js/bus.js";
 import { apiFetch } from "/static/js/api.js";
 import { $ } from "/static/js/utils.js";
 import { toast } from "/static/js/ui/dialogs.js";
+import { initMaintenance, openSystemSheet } from "/static/js/features/maintenance.js";
 
 function syncAuthBoxes() {
   const locked = Boolean(state.authRequired && !state.token);
@@ -20,6 +21,7 @@ export async function loadHealth() {
   state.storageMode = data.storage_mode || "telegram";
   state.defaultFolder = data.default_folder || "General";
   state.maxUploadMb = data.max_upload_mb || 20480;
+  state.telegramArchiveEnabled = Boolean(data.telegram_archive_enabled);
 
   const folderInput = $("folderInput");
   if (folderInput && !folderInput.value) {
@@ -32,14 +34,22 @@ export async function loadHealth() {
 
   syncAuthBoxes();
 
-  const tgText = data.telegram_workers > 0
-    ? `Telegram: ${data.telegram_workers} worker(s) online (${state.storageMode})`
-    : "Telegram: disabled";
-  const tgOk = data.telegram_workers > 0;
+  const totalWorkers = Number(data.telegram_workers || 0);
+  const onlineWorkers = Number(data.telegram_workers_online ?? totalWorkers);
+  const cooldownWorkers = Number(data.telegram_workers_in_cooldown || 0);
+  let tgText = "Telegram: disabled";
+  if (totalWorkers > 0) {
+    tgText = cooldownWorkers > 0
+      ? `Telegram: ${onlineWorkers}/${totalWorkers} online (${cooldownWorkers} cooldown)`
+      : `Telegram: ${onlineWorkers}/${totalWorkers} online (${state.storageMode})`;
+  }
+  const tgOk = totalWorkers > 0;
+  const tgWarn = tgOk && (cooldownWorkers > 0 || onlineWorkers < totalWorkers);
   for (const el of [$("tgStatus"), $("sheetTgStatus")]) {
     if (!el) continue;
     el.textContent = tgText;
     el.classList.toggle("ok", tgOk);
+    el.classList.toggle("warn", tgWarn);
   }
 
   const ckText = data.ytdlp_cookies_configured ? "Cookies: loaded" : "Cookies: none";
@@ -77,7 +87,7 @@ async function handleSaveToken(inputEl) {
   }
   syncAuthBoxes();
   const sheet = $("systemSheet");
-  if (sheet?.open) sheet.close();
+  if (sheet?.open && inputEl?.id !== "sheetTokenInput") sheet.close();
   emit("auth:unlocked");
 }
 
@@ -133,8 +143,10 @@ export function initSystem() {
   });
 
   $("mobileSettingsBtn")?.addEventListener("click", () => {
-    const sheet = $("systemSheet");
-    if (sheet && !sheet.open) sheet.showModal();
+    openSystemSheet("settings");
+  });
+  $("tgStatus")?.addEventListener("click", () => {
+    openSystemSheet("health");
   });
   $("closeSystemSheetBtn")?.addEventListener("click", () => $("systemSheet")?.close());
   $("systemSheet")?.addEventListener("click", (e) => {
@@ -194,4 +206,6 @@ export function initSystem() {
   on("auth:required", () => {
     syncAuthBoxes();
   });
+
+  initMaintenance();
 }

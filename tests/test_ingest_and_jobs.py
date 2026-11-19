@@ -1,0 +1,904 @@
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+
+from fastapi.testclient import TestClient
+
+from app.main import create_app
+from tests.helpers import (
+    _make_settings,
+    _sample_jpeg_bytes,
+    _ui_source,
+    _wait_for_job,
+    _wait_for_upload_item,
+)
+
+
+def test_allocator_skips_full_drive_and_supports_most_free(tmp_path: Path, monkeypatch):
+    from collections import namedtuple
+    from app.allocator import DriveAllocator
+
+    DiskUsage = namedtuple("DiskUsage", ["total", "used", "free"])
+    settings = _make_settings(tmp_path)
+    drive1 = str(tmp_path / "drives" / "drive1")
+    drive2 = str(tmp_path / "drives" / "drive2")
+
+    def fake_disk_usage(path):
+        s = str(path)
+        if s.startswith(drive1):
+            return DiskUsage(1000, 950, 50)
+        return DiskUsage(1000, 200, 800)
+
+    monkeypatch.setattr("app.allocator.shutil.disk_usage", fake_disk_usage)
+
+    allocator = DriveAllocator(settings)
+    staged = tmp_path / "staging" / "big.bin"
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.write_bytes(b"x" * 100)
+
+    import asyncio
+    drive_name, final_path, _ = asyncio.run(allocator.allocate_and_move(staged))
+    assert drive_name == "drive2"
+    assert final_path.exists()
+
+
+def test_ytdlp_cmd_resolves_venv_executable(monkeypatch):
+    import sys
+    from app.ingest import _ytdlp_cmd
+
+    monkeypatch.setenv("PATH", "")
+    cmd = _ytdlp_cmd()
+    expected = Path(sys.executable).parent / "yt-dlp"
+    if expected.is_file():
+        assert cmd == [str(expected)]
+    else:
+        assert cmd == [sys.executable, "-m", "yt_dlp"]
+
+
+def test_ytdlp_cookies_endpoints_and_args(tmp_path: Path, monkeypatch):
+    import asyncio
+    from app.ingest import _download_ytdlp, _format_ytdlp_error
+
+    settings = _make_settings(tmp_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        assert client.get("/api/health").json()["ytdlp_cookies_configured"] is False
+
+        bad = client.post("/api/ytdlp/cookies", json={"cookies_text": "not valid cookies"})
+        assert bad.status_code == 400
+
+        sample_cookies = "# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tVISITOR_INFO1_LIVE\tabc\n"
+        ok = client.post("/api/ytdlp/cookies", json={"cookies_text": sample_cookies})
+        assert ok.status_code == 200
+        assert client.get("/api/health").json()["ytdlp_cookies_configured"] is True
+
+        captured_args: list[tuple[str, ...]] = []
+
+        async def fake_streaming(*args: str, on_line=None):
+            captured_args.append(args)
+            (tmp_path / "out.mp4").write_bytes(b"mp4")
+            return 0, []
+
+        monkeypatch.setattr("app.ingest._run_subprocess_streaming", fake_streaming)
+        files = asyncio.run(
+            _download_ytdlp(
+                "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+                tmp_path,
+                cookies_file=settings.ytdlp_cookies_file,
+                proxy="socks5://127.0.0.1:1080",
+            )
+        )
+        assert len(files) == 1
+        assert "--cookies" in captured_args[0]
+        assert str(settings.ytdlp_cookies_file) in captured_args[0]
+        assert "--proxy" in captured_args[0]
+        assert "socks5://127.0.0.1:1080" in captured_args[0]
+
+        cleared = client.delete("/api/ytdlp/cookies")
+        assert cleared.status_code == 200
+        assert client.get("/api/health").json()["ytdlp_cookies_configured"] is False
+
+    msg = _format_ytdlp_error(
+        "ERROR: [youtube] jNQXAC9IVRw: Sign in to confirm you’re not a bot. Use --cookies"
+    )
+    assert "YouTube bot check" in msg
+    assert "cookies.txt" in msg
+
+
+def test_ytdlp_update_endpoint_and_version_in_health(tmp_path: Path, monkeypatch):
+    settings = _make_settings(tmp_path)
+    app = create_app(settings)
+
+    async def fake_update_ytdlp():
+        return {"ok": True, "before": "2026.10.26", "after": "2026.11.16", "updated": True, "output": "ok"}
+
+    monkeypatch.setattr("app.main.update_ytdlp", fake_update_ytdlp)
+
+    with TestClient(app) as client:
+        h = client.get("/api/health").json()
+        assert "ytdlp_version" in h
+
+        r = client.post("/api/ytdlp/update")
+        assert r.status_code == 200
+        assert r.json()["updated"] is True
+        assert r.json()["after"] == "2026.11.16"
+
+
+def test_format_spec_resolution_and_formats_endpoint(tmp_path: Path, monkeypatch):
+    from app.ingest import resolve_format_spec
+
+    assert resolve_format_spec(None) == (["-f", "bv*+ba/b", "--merge-output-format", "mp4"], False)
+    assert resolve_format_spec("720p") == (
+        ["-f", "bv*[height<=720]+ba/b[height<=720]/b", "--merge-output-format", "mp4"],
+        False,
+    )
+    assert resolve_format_spec("audio") == (["-f", "ba/b", "-x", "--audio-format", "mp3"], True)
+    assert resolve_format_spec("audio:140") == (["-f", "140"], True)
+    assert resolve_format_spec("299+bestaudio/299") == (
+        ["-f", "299+bestaudio/299", "--merge-output-format", "mp4"],
+        False,
+    )
+
+    try:
+        resolve_format_spec("bad format; rm -rf")
+        assert False, "Expected ValueError"
+    except ValueError:
+        pass
+
+    settings = _make_settings(tmp_path)
+    app = create_app(settings)
+
+    async def fake_subproc(*args: str):
+        payload = {
+            "title": "Sample Video",
+            "duration": 90,
+            "webpage_url": "https://example.com/watch?v=abc",
+            "formats": [
+                {"format_id": "sb0", "ext": "mhtml", "vcodec": "none", "acodec": "none"},
+                {"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a.40.2", "filesize": 1200},
+                {"format_id": "299", "ext": "mp4", "vcodec": "avc1", "acodec": "none", "height": 1080, "fps": 60, "filesize": 50000},
+            ],
+        }
+        return 0, json.dumps(payload), ""
+
+    monkeypatch.setattr("app.ingest._run_subprocess", fake_subproc)
+
+    with TestClient(app) as client:
+        res = client.post("/api/ytdlp/formats", json={"url": "https://example.com/watch?v=abc"})
+        assert res.status_code == 200
+        body = res.json()
+        assert body["title"] == "Sample Video"
+        assert [f["id"] for f in body["formats"]] == ["299", "140"]
+        assert body["formats"][0]["select_spec"] == "299+bestaudio/299"
+        assert body["formats"][1]["select_spec"] == "audio:140"
+
+        bad = client.post("/api/ingest/url", json={"url": "https://example.com/v", "format_spec": "bad;spec"})
+        assert bad.status_code == 400
+
+
+def test_job_progress_and_group_topic_routing(tmp_path: Path, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from app.telegram_mtproto import TelegramPool, parse_format_from_text
+
+    settings = _make_settings(tmp_path)
+    app = create_app(settings)
+    db = app.state.db
+    pool: TelegramPool = app.state.tg_pool
+
+    # Verify job progress updates from streaming yt-dlp output
+    async def fake_streaming(*args: str, on_line=None):
+        if on_line:
+            await on_line("[download]  40.0% of 10.00MiB at 2.00MiB/s ETA 00:03")
+        # Find --paths directory in args and create output file
+        paths_idx = list(args).index("--paths")
+        out_dir = Path(args[paths_idx + 1])
+        (out_dir / "video.mp4").write_bytes(b"fake-mp4-data")
+        return 0, []
+
+    monkeypatch.setattr("app.ingest._run_subprocess_streaming", fake_streaming)
+    job_id = db.create_job("telegram", "url", "https://example.com/video")
+    items = asyncio.run(
+        app.state.ingest.process_url_job(
+            job_id,
+            "https://example.com/video",
+            source_origin="telegram",
+            folder="Clips",
+            format_spec="720p",
+        )
+    )
+    assert len(items) == 1
+    job = db.get_job(job_id)
+    assert job is not None
+    assert job["status"] == "done"
+    assert job["progress"] == 100.0
+
+    # Verify group deduplication claims a message only once across multiple workers
+    assert asyncio.run(pool._claim_group_message(-1009998887776, 501)) is True
+    assert asyncio.run(pool._claim_group_message(-1009998887776, 501)) is False
+
+    # Verify topic-based folder lookup & explicit #Folder override
+    settings.telegram_archive_chat_id = "-1009998887776"
+    db.save_topic_id("-1009998887776", "Futa", 77)
+    assert db.get_folder_by_topic_id("-1009998887776", 77) == "futa"
+
+    ev_in_topic = SimpleNamespace(
+        chat_id=-1009998887776,
+        message=SimpleNamespace(reply_to=SimpleNamespace(forum_topic=True, reply_to_top_id=77, reply_to_msg_id=77)),
+    )
+    assert asyncio.run(pool._resolve_group_folder(None, ev_in_topic, "https://example.com/v", "General")) == "futa"
+    assert asyncio.run(pool._resolve_group_folder(None, ev_in_topic, "#Anime https://example.com/v", "General")) == "Anime"
+    assert parse_format_from_text("#Anime format:720p https://example.com/v") == "720p"
+
+
+def test_decoupled_202_upload_and_folder_upload_with_background_mirror_and_413(tmp_path: Path):
+    import asyncio
+    import threading
+
+    settings = _make_settings(tmp_path, storage_mode="telegram")
+    app = create_app(settings)
+
+    mirror_started = threading.Event()
+    mirror_release = threading.Event()
+    mirror_calls: list[str] = []
+
+    async def blocking_mirror(payload: dict) -> dict:
+        mirror_calls.append(payload["filename"])
+        mirror_started.set()
+        while not mirror_release.is_set():
+            await asyncio.sleep(0.01)
+        cb = payload.get("progress_cb")
+        if cb:
+            await cb(75.0, "Uploading to Telegram: 75%")
+        return {
+            "chat_id": "-100123",
+            "topic_id": 1,
+            "message_id": 100 + len(mirror_calls),
+            "worker_name": "bot1",
+        }
+
+    app.state.ingest.mirror_hook = blocking_mirror
+    jpg = _sample_jpeg_bytes()
+
+    with TestClient(app) as client:
+        # 1) Single file upload returns 202 immediately while mirror_hook is still blocked
+        resp = client.post(
+            "/api/ingest/upload",
+            data={"folder": "General"},
+            files={"file": ("async_photo.jpg", jpg, "image/jpeg")},
+        )
+        assert resp.status_code == 202
+        body = resp.json()
+        assert body["status"] == "queued"
+        job_id = body["job_id"]
+
+        assert mirror_started.wait(timeout=2.0)
+        mid_job = client.get(f"/api/jobs/{job_id}").json()
+        assert mid_job["status"] == "allocating"
+
+        # Release mirror_hook -> job transitions to done
+        mirror_release.set()
+        item = _wait_for_upload_item(client, resp)
+        assert item["filename"] == "async_photo.jpg"
+        assert item["telegram_msg_id"] == 101
+
+        # 2) Folder upload also returns 202 immediately while mirror_hook is blocked
+        mirror_started.clear()
+        mirror_release.clear()
+        folder_resp = client.post(
+            "/api/ingest/upload-folder",
+            data={"archive_name": "AsyncBundle", "relative_paths": ["AsyncBundle/a.bin"]},
+            files=[("files", ("a.bin", b"hello-bundle" * 10, "application/octet-stream"))],
+        )
+        assert folder_resp.status_code == 202
+        f_body = folder_resp.json()
+        assert f_body["status"] == "queued"
+        f_job_id = f_body["job_id"]
+
+        assert mirror_started.wait(timeout=2.0)
+        f_mid_job = client.get(f"/api/jobs/{f_job_id}").json()
+        assert f_mid_job["status"] == "allocating"
+
+        mirror_release.set()
+        f_item = _wait_for_upload_item(client, folder_resp)
+        assert f_item["filename"] == "AsyncBundle.zip"
+        assert f_item["telegram_msg_id"] == 102
+
+        # 3) 413 payload-too-large fails synchronously and cleans staging_dir
+        settings.max_upload_mb = 0
+        too_big = client.post(
+            "/api/ingest/upload",
+            files={"file": ("too_big.bin", b"12345", "application/octet-stream")},
+        )
+        assert too_big.status_code == 413
+        assert list(settings.staging_dir.iterdir()) == []
+
+        too_big_folder = client.post(
+            "/api/ingest/upload-folder",
+            data={"archive_name": "TooBigFolder", "relative_paths": ["TooBigFolder/x.bin"]},
+            files=[("files", ("x.bin", b"12345", "application/octet-stream"))],
+        )
+        assert too_big_folder.status_code == 413
+        assert list(settings.staging_dir.iterdir()) == []
+
+
+def test_bounded_concurrency_url_job_queue(tmp_path: Path, monkeypatch):
+    import asyncio
+    import threading
+
+    settings = _make_settings(tmp_path, storage_mode="drives")
+    settings.ingest_concurrency = 2
+    app = create_app(settings)
+    db = app.state.db
+
+    active_lock = threading.Lock()
+    active_count = 0
+    max_seen_active = 0
+    two_running = threading.Event()
+    release_gate = threading.Event()
+
+    async def fake_is_ddl(url: str) -> bool:
+        return False
+
+    async def fake_ytdlp(
+        url: str,
+        job_dir: Path,
+        *,
+        cookies_file=None,
+        proxy: str = "",
+        format_spec=None,
+        concurrent_fragments: int = 4,
+        on_progress=None,
+    ):
+        nonlocal active_count, max_seen_active
+        with active_lock:
+            active_count += 1
+            max_seen_active = max(max_seen_active, active_count)
+            if active_count == 2:
+                two_running.set()
+        try:
+            while not release_gate.is_set():
+                await asyncio.sleep(0.01)
+            out_file = job_dir / f"{url.rsplit('/', 1)[-1]}.mp4"
+            out_file.write_bytes(f"fake-video-bytes-{url}".encode())
+            return [out_file]
+        finally:
+            with active_lock:
+                active_count -= 1
+
+    monkeypatch.setattr("app.ingest.is_direct_download", fake_is_ddl)
+    monkeypatch.setattr("app.ingest._download_ytdlp", fake_ytdlp)
+
+    with TestClient(app) as client:
+        job_ids = []
+        for idx in range(4):
+            res = client.post("/api/ingest/url", json={"url": f"https://example.com/vid_{idx}"})
+            assert res.status_code == 202
+            job_ids.append(res.json()["job_id"])
+
+        assert two_running.wait(timeout=2.0)
+        # Allow a moment for jobs to settle at the semaphore
+        deadline = time.monotonic() + 2.0
+        statuses = []
+        while time.monotonic() < deadline:
+            statuses = [client.get(f"/api/jobs/{jid}").json()["status"] for jid in job_ids]
+            if statuses.count("downloading") == 2 and statuses.count("queued") == 2:
+                break
+            time.sleep(0.01)
+
+        assert statuses.count("downloading") == 2
+        assert statuses.count("queued") == 2
+        assert max_seen_active <= 2
+
+        release_gate.set()
+
+        finish_deadline = time.monotonic() + 5.0
+        while time.monotonic() < finish_deadline:
+            statuses = [client.get(f"/api/jobs/{jid}").json()["status"] for jid in job_ids]
+            if all(s == "done" for s in statuses):
+                break
+            time.sleep(0.01)
+
+        assert all(s == "done" for s in statuses)
+        assert max_seen_active == 2
+        assert len(db.list_media()[0]) == 4
+
+
+def test_startup_crash_recovery_marks_stuck_jobs_and_cleans_staging(tmp_path: Path):
+    from app.db import Database
+
+    settings = _make_settings(tmp_path, storage_mode="drives")
+    settings.ensure_dirs()
+    db = Database(settings.db_path)
+
+    j_queued = db.create_job("web", "url", "https://example.com/1")
+    j_downloading = db.create_job("web", "url", "https://example.com/2")
+    db.update_job(j_downloading, status="downloading", progress=30.0, message="Downloading...")
+    j_allocating = db.create_job("web", "upload", "file.bin")
+    db.update_job(j_allocating, status="allocating", progress=75.0, message="Allocating...")
+    j_done = db.create_job("web", "upload", "ok.bin")
+    db.update_job(j_done, status="done", progress=100.0, message="Done")
+
+    orphan_dir = settings.staging_dir / "orphan_tmp"
+    orphan_dir.mkdir(parents=True, exist_ok=True)
+    (orphan_dir / "partial.part").write_bytes(b"partial")
+    orphan_file = settings.staging_dir / "stray.tmp"
+    orphan_file.write_bytes(b"stray")
+
+    app = create_app(settings)
+    with TestClient(app) as client:
+        for jid in (j_queued, j_downloading, j_allocating):
+            job = client.get(f"/api/jobs/{jid}").json()
+            assert job["status"] == "failed"
+            assert job["message"] == "Interrupted by server restart"
+
+        done_job = client.get(f"/api/jobs/{j_done}").json()
+        assert done_job["status"] == "done"
+        assert done_job["message"] == "Done"
+        assert list(settings.staging_dir.iterdir()) == []
+
+
+def test_subprocess_streaming_chunk_splitting_and_ytdlp_flags(tmp_path: Path, monkeypatch):
+    import asyncio
+    from app.ingest import _download_ytdlp, _run_subprocess_streaming
+
+    class FakeStdout:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self._chunks = list(chunks)
+
+        async def read(self, n: int) -> bytes:
+            if self._chunks:
+                return self._chunks.pop(0)
+            return b""
+
+    class FakeProc:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self.stdout = FakeStdout(chunks)
+            self.returncode = 0
+
+        async def wait(self) -> int:
+            return self.returncode
+
+    # Mix \r, \n, and \r\n across chunk boundaries + >80 lines total to verify deque cap
+    chunks = [
+        b"line_000\r",
+        b"\nline_001\rline_002\npa",
+        b"rtial_003\r\n",
+    ]
+    for i in range(4, 100):
+        chunks.append(f"line_{i:03d}\n".encode())
+    chunks.append(b"final_trailing_no_newline")
+
+    async def fake_exec(*args, **kwargs):
+        return FakeProc(chunks)
+
+    monkeypatch.setattr("app.ingest.asyncio.create_subprocess_exec", fake_exec)
+
+    seen_lines: list[str] = []
+
+    async def on_line(line: str) -> None:
+        seen_lines.append(line)
+
+    rc, tail = asyncio.run(_run_subprocess_streaming("dummy-cmd", on_line=on_line))
+    assert rc == 0
+    assert seen_lines[0] == "line_000"
+    assert seen_lines[1] == "line_001"
+    assert seen_lines[2] == "line_002"
+    assert seen_lines[3] == "partial_003"
+    assert seen_lines[-1] == "final_trailing_no_newline"
+    assert len(seen_lines) == 101
+    assert len(tail) == 80
+    assert tail == seen_lines[-80:]
+
+    # Verify _download_ytdlp passes --concurrent-fragments and faststart postprocessor-args for video only
+    recorded_args: list[tuple[str, ...]] = []
+
+    async def fake_streaming(*args: str, on_line=None):
+        recorded_args.append(args)
+        paths_idx = list(args).index("--paths")
+        out_dir = Path(args[paths_idx + 1])
+        (out_dir / "out.mp4").write_bytes(b"data")
+        return 0, []
+
+    monkeypatch.setattr("app.ingest._run_subprocess_streaming", fake_streaming)
+
+    vid_dir = tmp_path / "vid"
+    vid_dir.mkdir()
+    asyncio.run(
+        _download_ytdlp(
+            "https://example.com/watch?v=123",
+            vid_dir,
+            format_spec="720p",
+            concurrent_fragments=6,
+        )
+    )
+    vid_args = list(recorded_args[0])
+    cf_idx = vid_args.index("--concurrent-fragments")
+    assert vid_args[cf_idx + 1] == "6"
+    pp_idx = vid_args.index("--postprocessor-args")
+    assert vid_args[pp_idx + 1] == "Merger+ffmpeg:-movflags +faststart"
+
+    aud_dir = tmp_path / "aud"
+    aud_dir.mkdir()
+    asyncio.run(
+        _download_ytdlp(
+            "https://example.com/watch?v=123",
+            aud_dir,
+            format_spec="audio",
+            concurrent_fragments=3,
+        )
+    )
+    aud_args = list(recorded_args[1])
+    cf_idx_a = aud_args.index("--concurrent-fragments")
+    assert aud_args[cf_idx_a + 1] == "3"
+    assert "Merger+ffmpeg:-movflags +faststart" not in aud_args
+
+
+def test_sse_events_endpoint_and_frontend_polling_removed(tmp_path: Path):
+    import threading
+
+    settings = _make_settings(tmp_path, auth_token="sse-secret")
+    app = create_app(settings)
+    db = app.state.db
+
+    with TestClient(app) as client:
+        # Auth enforced on /api/events
+        assert client.get("/api/events").status_code == 401
+
+        # UI HTML uses EventSource on /api/events and does NOT re-fetch gallery on active.length > 0
+        html = _ui_source(client)
+        assert 'new EventSource(withToken("/api/events"))' in html
+        assert "if (newlyFinished)" in html
+        assert "newlyFinished || active.length > 0" not in html
+
+        # Trigger live job + media events shortly after SSE stream connects
+        def _emit_events():
+            time.sleep(0.15)
+            jid = db.create_job("web", "url", "https://example.com/sse-test")
+            db.update_job(jid, status="downloading", progress=45.0, message="Downloading...")
+            db.insert_media(
+                media_id="sse_media_1",
+                title="SSE Item",
+                filename="sse.bin",
+                folder="General",
+                media_type="file",
+                mime_type="application/octet-stream",
+                size_bytes=64,
+                drive_name="drive1",
+                file_path="",
+                thumb_filename=None,
+                source_origin="web",
+                source_kind="upload",
+                source_url=None,
+            )
+            db.update_job(jid, status="done", progress=100.0, message="Done")
+
+        emitter = threading.Thread(target=_emit_events, daemon=True)
+        emitter.start()
+
+        received: list[dict] = []
+        with client.stream("GET", "/api/events?token=sse-secret") as resp:
+            assert resp.status_code == 200
+            assert resp.headers["content-type"].startswith("text/event-stream")
+            assert resp.headers["cache-control"] == "no-cache"
+            for line in resp.iter_lines():
+                if line.startswith("data: "):
+                    ev = json.loads(line[6:])
+                    received.append(ev)
+                    if ev.get("type") == "job_update" and ev.get("status") == "done":
+                        break
+
+        emitter.join(timeout=2.0)
+
+        assert received[0]["type"] == "connected"
+        assert received[0]["ok"] is True
+        assert any(e.get("type") == "job_update" and e.get("status") == "downloading" for e in received)
+        assert any(e.get("type") == "media_update" and e.get("media_id") == "sse_media_1" for e in received)
+        assert any(e.get("type") == "job_update" and e.get("status") == "done" for e in received)
+
+
+def test_url_normalization_and_url_deduplication(tmp_path: Path, monkeypatch):
+    from app.db import normalize_source_url
+
+    assert normalize_source_url(None) is None
+    assert normalize_source_url("") is None
+    assert normalize_source_url("   ") is None
+    assert (
+        normalize_source_url("https://youtu.be/dQw4w9WgXcQ?si=abc123&t=42")
+        == "https://youtube.com/watch?v=dQw4w9WgXcQ"
+    )
+    assert (
+        normalize_source_url("https://www.youtube.com/shorts/dQw4w9WgXcQ?feature=share")
+        == "https://youtube.com/watch?v=dQw4w9WgXcQ"
+    )
+    assert (
+        normalize_source_url(
+            "https://m.youtube.com/watch?v=dQw4w9WgXcQ&list=PL123&index=2&utm_source=x#frag"
+        )
+        == "https://youtube.com/watch?v=dQw4w9WgXcQ"
+    )
+    assert (
+        normalize_source_url("https://music.youtube.com/watch?v=dQw4w9WgXcQ&si=xyz")
+        == "https://youtube.com/watch?v=dQw4w9WgXcQ"
+    )
+    assert (
+        normalize_source_url("https://x.com/user/status/12345?s=20&t=abcd")
+        == "https://twitter.com/user/status/12345"
+    )
+    assert (
+        normalize_source_url("https://example.com/path/?b=2&a=1&utm_medium=social#top")
+        == "https://example.com/path?a=1&b=2"
+    )
+
+    settings = _make_settings(tmp_path)
+    app = create_app(settings)
+    download_calls = 0
+
+    async def fake_is_ddl(url: str) -> bool:
+        return False
+
+    async def fake_ytdlp(url: str, job_dir: Path, **_kwargs):
+        nonlocal download_calls
+        download_calls += 1
+        out_file = job_dir / f"video_{download_calls}.mp4"
+        out_file.write_bytes(f"video-bytes-{download_calls}".encode())
+        return [out_file]
+
+    monkeypatch.setattr("app.ingest.is_direct_download", fake_is_ddl)
+    monkeypatch.setattr("app.ingest._download_ytdlp", fake_ytdlp)
+
+    with TestClient(app) as client:
+        r1 = client.post(
+            "/api/ingest/url",
+            json={"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ&si=track1"},
+        )
+        assert r1.status_code == 202
+        j1 = _wait_for_job(client, r1.json()["job_id"])
+        assert j1["status"] == "done"
+        first_id = j1["media_ids"][0]
+        assert download_calls == 1
+
+        # Canonical duplicate via youtu.be skips download
+        r2 = client.post(
+            "/api/ingest/url",
+            json={"url": "https://youtu.be/dQw4w9WgXcQ?t=15"},
+        )
+        assert r2.status_code == 202
+        j2 = _wait_for_job(client, r2.json()["job_id"])
+        assert j2["status"] == "done"
+        assert "Duplicate URL skipped" in j2["message"]
+        assert j2["media_ids"] == [first_id]
+        assert download_calls == 1
+        assert client.get("/api/media").json()["total"] == 1
+
+        # Pre-flight duplicate check endpoint matches shorts variant too
+        chk = client.post(
+            "/api/ingest/check-duplicate",
+            json={"url": "https://youtube.com/shorts/dQw4w9WgXcQ"},
+        )
+        assert chk.status_code == 200
+        assert chk.json()["duplicate"] is True
+        assert chk.json()["item"]["id"] == first_id
+
+        # force=True bypasses dedup and downloads again
+        r3 = client.post(
+            "/api/ingest/url",
+            json={"url": "https://youtu.be/dQw4w9WgXcQ", "force": True},
+        )
+        assert r3.status_code == 202
+        j3 = _wait_for_job(client, r3.json()["job_id"])
+        assert j3["status"] == "done"
+        assert j3["media_ids"][0] != first_id
+        assert download_calls == 2
+        assert client.get("/api/media").json()["total"] == 2
+
+
+def test_sha256_upload_dedup_and_check_duplicate(tmp_path: Path):
+    settings = _make_settings(tmp_path)
+    app = create_app(settings)
+
+    with TestClient(app) as client:
+        jpg = _sample_jpeg_bytes()
+
+        r1 = client.post(
+            "/api/ingest/upload",
+            data={"folder": "Photos"},
+            files={"file": ("photo1.jpg", jpg, "image/jpeg")},
+        )
+        item1 = _wait_for_upload_item(client, r1)
+        assert item1["sha256"] and len(item1["sha256"]) == 64
+
+        chk_hit = client.post("/api/ingest/check-duplicate", json={"sha256": item1["sha256"]})
+        assert chk_hit.status_code == 200
+        assert chk_hit.json()["duplicate"] is True
+        assert chk_hit.json()["item"]["id"] == item1["id"]
+
+        chk_miss = client.post("/api/ingest/check-duplicate", json={"sha256": "0" * 64})
+        assert chk_miss.status_code == 200
+        assert chk_miss.json()["duplicate"] is False
+        assert chk_miss.json()["item"] is None
+
+        # Different filename, identical bytes -> deduplicated
+        r2 = client.post(
+            "/api/ingest/upload",
+            data={"folder": "Other"},
+            files={"file": ("copy_of_photo1.jpg", jpg, "image/jpeg")},
+        )
+        assert r2.status_code == 202
+        j2 = _wait_for_job(client, r2.json()["job_id"])
+        assert j2["status"] == "done"
+        assert "Duplicate skipped" in j2["message"]
+        assert j2["media_ids"] == [item1["id"]]
+        assert client.get("/api/media").json()["total"] == 1
+
+        # force=true allows re-ingest
+        r3 = client.post(
+            "/api/ingest/upload",
+            data={"folder": "Other", "force": "true"},
+            files={"file": ("copy_of_photo1.jpg", jpg, "image/jpeg")},
+        )
+        item3 = _wait_for_upload_item(client, r3)
+        assert item3["id"] != item1["id"]
+        assert client.get("/api/media").json()["total"] == 2
+
+
+def test_batch_urls_and_playlist_expansion(tmp_path: Path, monkeypatch):
+    settings = _make_settings(tmp_path)
+    app = create_app(settings)
+
+    async def fake_is_ddl(url: str) -> bool:
+        return False
+
+    async def fake_ytdlp(url: str, job_dir: Path, **_kwargs):
+        slug = url.rsplit("/", 1)[-1].replace("?", "_").replace("=", "_")
+        out_file = job_dir / f"{slug}.mp4"
+        out_file.write_bytes(f"media-for-{url}".encode())
+        return [out_file]
+
+    async def fake_run_subprocess(*args: str):
+        payload = {
+            "id": "PL_TEST",
+            "title": "My Playlist",
+            "entries": [
+                {"id": "vidA", "title": "First Clip", "webpage_url": "https://youtube.com/watch?v=vidA", "duration": 12},
+                {"id": "vidB", "title": "Second Clip", "url": "vidB", "duration": 25},
+                {"id": "vidC", "title": "Third Clip", "webpage_url": "https://youtube.com/watch?v=vidC", "duration": 30},
+            ],
+        }
+        return 0, json.dumps(payload), ""
+
+    monkeypatch.setattr("app.ingest.is_direct_download", fake_is_ddl)
+    monkeypatch.setattr("app.ingest._download_ytdlp", fake_ytdlp)
+    monkeypatch.setattr("app.ingest._run_subprocess", fake_run_subprocess)
+
+    with TestClient(app) as client:
+        # 1) Multi-line batch URLs + urls list
+        batch_res = client.post(
+            "/api/ingest/url",
+            json={
+                "url": "# comment line\nhttps://example.com/a\n\nhttps://example.com/b",
+                "urls": ["https://example.com/c"],
+                "folder": "Batch",
+            },
+        )
+        assert batch_res.status_code == 202
+        batch_data = batch_res.json()
+        assert batch_data["count"] == 3
+        assert len(batch_data["job_ids"]) == 3
+        for jid in batch_data["job_ids"]:
+            assert _wait_for_job(client, jid)["status"] == "done"
+        assert client.get("/api/media?folder=Batch").json()["total"] == 3
+
+        # 2) Playlist inspection endpoint
+        pl_inspect = client.post(
+            "/api/ytdlp/playlist",
+            json={"url": "https://youtube.com/playlist?list=PL_TEST", "max_items": 2},
+        )
+        assert pl_inspect.status_code == 200
+        pl_json = pl_inspect.json()
+        assert pl_json["is_playlist"] is True
+        assert pl_json["playlist_title"] == "My Playlist"
+        assert len(pl_json["entries"]) == 2
+        assert pl_json["entries"][0]["url"] == "https://youtube.com/watch?v=vidA"
+        assert pl_json["entries"][1]["url"] == "https://www.youtube.com/watch?v=vidB"
+
+        # 3) Playlist expansion during ingest with nested playlist folder
+        pl_ingest = client.post(
+            "/api/ingest/url",
+            json={
+                "url": "https://youtube.com/playlist?list=PL_TEST",
+                "folder": "Series",
+                "expand_playlist": True,
+                "use_playlist_folder": True,
+                "max_playlist_items": 2,
+            },
+        )
+        assert pl_ingest.status_code == 202
+        pl_data = pl_ingest.json()
+        assert pl_data["count"] == 2
+        for jid in pl_data["job_ids"]:
+            assert _wait_for_job(client, jid)["status"] == "done"
+        assert client.get("/api/media?folder=Series/My+Playlist").json()["total"] == 2
+
+
+def test_job_cancel_retry_telegram_force_and_ui_hooks(tmp_path: Path, monkeypatch):
+    import asyncio
+    import threading
+    from app.telegram_mtproto import parse_force_from_text
+
+    # Telegram force flag parsing helper
+    assert parse_force_from_text("https://youtu.be/abc --force") is True
+    assert parse_force_from_text("force:true https://youtu.be/abc") is True
+    assert parse_force_from_text("https://youtu.be/abc force:1") is True
+    assert parse_force_from_text("https://youtu.be/abc") is False
+
+    settings = _make_settings(tmp_path)
+    app = create_app(settings)
+
+    started = threading.Event()
+    should_block = True
+    terminated = False
+
+    class FakeProc:
+        returncode = None
+
+        def terminate(self):
+            nonlocal terminated
+            terminated = True
+            self.returncode = -15
+
+    async def fake_is_ddl(url: str) -> bool:
+        return False
+
+    async def fake_ytdlp(url: str, job_dir: Path, *, on_proc=None, **_kwargs):
+        if should_block:
+            if on_proc:
+                on_proc(FakeProc())
+            started.set()
+            await asyncio.sleep(30)
+        out_file = job_dir / "recovered.mp4"
+        out_file.write_bytes(b"retried-video-payload")
+        return [out_file]
+
+    monkeypatch.setattr("app.ingest.is_direct_download", fake_is_ddl)
+    monkeypatch.setattr("app.ingest._download_ytdlp", fake_ytdlp)
+
+    with TestClient(app) as client:
+        # Check 2.B frontend hooks in index.html
+        html = _ui_source(client)
+        for hook in (
+            "expandPlaylistCheck",
+            "forceIngestCheck",
+            "job-cancel-btn",
+            "job-retry-btn",
+            "status-cancelled",
+        ):
+            assert hook in html
+
+        r = client.post(
+            "/api/ingest/url",
+            json={"url": "https://example.com/slow_video", "folder": "Inbox"},
+        )
+        assert r.status_code == 202
+        job_id = r.json()["job_id"]
+        assert started.wait(timeout=2.0)
+
+        cancel_res = client.post(f"/api/jobs/{job_id}/cancel")
+        assert cancel_res.status_code == 200
+        assert cancel_res.json()["status"] == "cancelled"
+        assert terminated is True
+
+        # Cancelling again returns 409 Conflict
+        assert client.post(f"/api/jobs/{job_id}/cancel").status_code == 409
+
+        # Retry the cancelled job with downloads unblocked
+        should_block = False
+        retry_res = client.post(f"/api/jobs/{job_id}/retry", json={"force": False})
+        assert retry_res.status_code == 202
+        done_job = _wait_for_job(client, job_id)
+        assert done_job["status"] == "done"
+        assert len(done_job["media_ids"]) == 1
+        assert client.get("/api/media?folder=Inbox").json()["total"] == 1

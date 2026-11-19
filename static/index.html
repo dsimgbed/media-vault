@@ -20,7 +20,7 @@
   <header>
     <div class="brand">
       <span class="brand-title">Media Vault</span>
-      <span id="tgStatus" class="pill">Telegram: checking...</span>
+      <button id="tgStatus" type="button" class="pill pill-btn" title="Open System Health &amp; Telemetry">Telegram: checking...</button>
       <button id="cookiesBtn" type="button" class="pill pill-btn">Cookies: none</button>
       <button id="updateYtdlpBtn" type="button" class="pill pill-btn" title="Click to update yt-dlp">Update yt-dlp</button>
     </div>
@@ -306,29 +306,31 @@
     </div>
   </dialog>
 
-  <dialog id="systemSheet" class="modal-sm">
+  <dialog id="systemSheet" class="system-sheet">
     <div class="dialog-surface">
       <div class="modal-head">
-        <strong>System &amp; Settings</strong>
+        <strong>System &amp; Maintenance</strong>
         <button id="closeSystemSheetBtn" type="button" class="secondary">Close</button>
       </div>
-      <div class="modal-body">
-        <div class="sheet-status-row">
-          <span id="sheetTgStatus" class="pill">Telegram: checking...</span>
-        </div>
-        <div class="sheet-actions-grid">
-          <button id="sheetInstallPwaBtn" type="button" class="secondary" hidden>Install App</button>
-          <button id="sheetCookiesBtn" type="button" class="secondary">Cookies: none</button>
-          <button id="sheetUpdateYtdlpBtn" type="button" class="secondary">Update yt-dlp</button>
-          <button id="sheetRefreshBtn" type="button" class="secondary">Refresh Data</button>
-        </div>
-        <div id="sheetAuthSection" class="modal-field">
-          <span>Auth Token</span>
-          <div class="sheet-auth-row">
-            <input id="sheetTokenInput" type="password" placeholder="Auth token..." />
-            <button id="sheetSaveTokenBtn" type="button" class="secondary">Unlock</button>
+      <div id="systemTabs" class="system-tabs" role="tablist" aria-label="System sections"></div>
+      <div class="modal-body system-sheet-body">
+        <div id="systemSettingsPane" class="system-settings-pane">
+          <div class="sheet-status-row"><span id="sheetTgStatus" class="pill">Telegram: checking...</span></div>
+          <div class="sheet-actions-grid">
+            <button id="sheetInstallPwaBtn" type="button" class="secondary" hidden>Install App</button>
+            <button id="sheetCookiesBtn" type="button" class="secondary">Cookies: none</button>
+            <button id="sheetUpdateYtdlpBtn" type="button" class="secondary">Update yt-dlp</button>
+            <button id="sheetRefreshBtn" type="button" class="secondary">Refresh Data</button>
+          </div>
+          <div id="sheetAuthSection" class="modal-field">
+            <span>Auth Token</span>
+            <div class="sheet-auth-row">
+              <input id="sheetTokenInput" type="password" placeholder="Auth token..." />
+              <button id="sheetSaveTokenBtn" type="button" class="secondary">Unlock</button>
+            </div>
           </div>
         </div>
+        <div id="systemMaintenanceView" class="system-maint-view" hidden></div>
       </div>
     </div>
   </dialog>

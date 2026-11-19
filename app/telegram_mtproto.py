@@ -13,6 +13,7 @@ import time
 import uuid
 import weakref
 from collections import OrderedDict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -393,6 +394,9 @@ class TelegramBlockCache:
         self._entries: OrderedDict[tuple[Any, int], bytes] = OrderedDict()
         self._index: dict[Any, dict[int, int]] = {}
         self._total_bytes = 0
+        self._hits: int = 0
+        self._misses: int = 0
+        self._evictions: int = 0
         self._lock = threading.RLock()
 
     @property
@@ -433,6 +437,7 @@ class TelegramBlockCache:
         while self._total_bytes > self._max_bytes and self._entries:
             evicted_key, evicted_data = self._entries.popitem(last=False)
             self._total_bytes -= len(evicted_data)
+            self._evictions += 1
             ev_ns, ev_off = evicted_key
             ns_map = self._index.get(ev_ns)
             if ns_map is not None:
@@ -441,11 +446,12 @@ class TelegramBlockCache:
                     self._index.pop(ev_ns, None)
 
     def get_span(self, cache_ns: Any, cursor: int, end: int) -> bytes | None:
-        if self._max_bytes <= 0 or cursor > end:
-            return None
         with self._lock:
+            if self._max_bytes <= 0 or cursor > end:
+                return None
             segs = self._index.get(cache_ns)
             if not segs:
+                self._misses += 1
                 return None
             best_start: int | None = None
             best_reach = cursor
@@ -455,16 +461,20 @@ class TelegramBlockCache:
                     best_start = seg_start
                     best_reach = seg_end
             if best_start is None:
+                self._misses += 1
                 return None
             key = (cache_ns, best_start)
             data = self._entries.get(key)
             if data is None:
+                self._misses += 1
                 return None
             self._entries.move_to_end(key)
             rel_start = cursor - best_start
             rel_end = min(len(data), end - best_start + 1)
             if rel_end <= rel_start:
+                self._misses += 1
                 return None
+            self._hits += 1
             return data[rel_start:rel_end]
 
     def put(self, cache_ns: Any, offset: int, data: bytes) -> None:
@@ -506,6 +516,22 @@ class TelegramBlockCache:
             self._index.clear()
             self._total_bytes = 0
 
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            total_lookups = self._hits + self._misses
+            return {
+                "enabled": self._max_bytes > 0,
+                "used_bytes": self._total_bytes,
+                "max_bytes": self._max_bytes,
+                "utilization_pct": round((self._total_bytes / self._max_bytes) * 100.0, 2) if self._max_bytes > 0 else 0.0,
+                "entries": len(self._entries),
+                "block_size": self._block_size,
+                "hits": self._hits,
+                "misses": self._misses,
+                "evictions": self._evictions,
+                "hit_rate_pct": round((self._hits / total_lookups) * 100.0, 2) if total_lookups > 0 else 0.0,
+            }
+
 
 class TelegramPool:
     def __init__(
@@ -527,7 +553,11 @@ class TelegramPool:
         self._bot_ids: set[int] = set()
         self._rr_index = 0
         self._active_uploads: dict[str, int] = {}
+        self._active_streams: dict[str, int] = {}
         self._cooldown_until: dict[str, float] = {}
+        self._worker_meta: dict[str, dict[str, Any]] = {}
+        self._flood_wait_counts: dict[str, int] = {}
+        self._last_errors: dict[str, dict[str, str]] = {}
         self._stream_media_cache: dict[tuple[str, int, str], tuple[float, Any]] = {}
         self._stream_cache_ttl = 300.0
         self._media_cache_keys: OrderedDict[int, tuple[weakref.ref[Any] | None, tuple[str, int]]] = OrderedDict()
@@ -538,6 +568,57 @@ class TelegramPool:
 
         # Wire mirror hook so both Web and Telegram uploads can forward to the shared Forum Supergroup
         self.ingest.mirror_hook = self.mirror_to_archive_topic
+
+    def _record_flood_wait(self, worker_name: str, seconds: float) -> None:
+        self._cooldown_until[worker_name] = time.monotonic() + max(0.0, float(seconds))
+        self._flood_wait_counts[worker_name] = self._flood_wait_counts.get(worker_name, 0) + 1
+        self._record_worker_error(worker_name, f"FloodWait ({seconds}s)")
+
+    def _record_worker_error(self, worker_name: str, exc: Exception | str) -> None:
+        self._last_errors[worker_name] = {
+            "message": str(exc)[:300],
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def _worker_name_for_client(self, client: Any) -> str | None:
+        for cfg, c in self.clients:
+            if c is client:
+                return cfg.name
+        return None
+
+    def get_telemetry(self) -> dict[str, Any]:
+        now = time.monotonic()
+        workers: list[dict[str, Any]] = []
+        for cfg, client in self.clients:
+            meta = self._worker_meta.get(cfg.name, {})
+            err = self._last_errors.get(cfg.name)
+            is_conn = getattr(client, "is_connected", None)
+            online = bool(is_conn()) if callable(is_conn) else True
+            cooldown_rem = max(0.0, self._cooldown_until.get(cfg.name, 0.0) - now)
+            workers.append(
+                {
+                    "name": cfg.name,
+                    "api_id": cfg.api_id,
+                    "username": meta.get("username"),
+                    "online": online,
+                    "active_uploads": int(self._active_uploads.get(cfg.name, 0)),
+                    "active_streams": int(self._active_streams.get(cfg.name, 0)),
+                    "in_cooldown": cooldown_rem > 0.0,
+                    "cooldown_remaining_sec": round(cooldown_rem, 1),
+                    "flood_wait_count": int(self._flood_wait_counts.get(cfg.name, 0)),
+                    "last_error": err.get("message") if err else None,
+                    "last_error_at": err.get("at") if err else None,
+                }
+            )
+        return {
+            "worker_count": len(workers),
+            "online_count": sum(1 for w in workers if w["online"]),
+            "cooldown_count": sum(1 for w in workers if w["in_cooldown"]),
+            "archive_enabled": bool(self.settings.telegram_archive_chat_id.strip() and self.clients),
+            "workers": workers,
+            "block_cache": self._block_cache.stats(),
+            "stream_media_cache_entries": len(self._stream_media_cache),
+        }
 
     async def start(self) -> None:
         apis = self.settings.get_telegram_apis()
@@ -556,6 +637,11 @@ class TelegramPool:
             me = await client.get_me()
             if getattr(me, "id", None):
                 self._bot_ids.add(int(me.id))
+            self._worker_meta[cfg.name] = {
+                "username": getattr(me, "username", None),
+                "bot_id": getattr(me, "id", None),
+                "started_at": datetime.now(timezone.utc).isoformat(),
+            }
             logger.info(
                 "Started Telegram MTProto worker '%s' (@%s, api_id=%s, max 2GB)",
                 cfg.name,
@@ -573,6 +659,8 @@ class TelegramPool:
         self._tasks.clear()
         self.clients.clear()
         self._bot_ids.clear()
+        self._worker_meta.clear()
+        self._active_streams.clear()
 
     def _is_authorized(self, sender_id: int | None) -> bool:
         allowed = self.settings.get_allowed_telegram_user_ids()
@@ -836,12 +924,13 @@ class TelegramPool:
                         ],
                     }
                 except FloodWaitError as fw:
-                    self._cooldown_until[cfg.name] = time.monotonic() + fw.seconds
+                    self._record_flood_wait(cfg.name, fw.seconds)
                     logger.warning("Worker '%s' hit FloodWait (%ss) mirroring to topic; trying next worker.", cfg.name, fw.seconds)
                     last_err = fw
                 except TELEGRAM_NON_RETRYABLE_CAPTION_ERRORS:
                     raise
                 except Exception as exc:
+                    self._record_worker_error(cfg.name, exc)
                     logger.warning("Worker '%s' failed mirroring to topic: %s", cfg.name, exc)
                     last_err = exc
                 finally:
@@ -976,7 +1065,7 @@ class TelegramPool:
                             "telegram_worker_name": cfg.name,
                         }
                     except FloodWaitError as fw:
-                        self._cooldown_until[cfg.name] = time.monotonic() + fw.seconds
+                        self._record_flood_wait(cfg.name, fw.seconds)
                         logger.warning(
                             "Worker '%s' hit FloodWait (%ss) uploading part %s/%s; trying next worker.",
                             cfg.name,
@@ -988,6 +1077,7 @@ class TelegramPool:
                     except TELEGRAM_NON_RETRYABLE_CAPTION_ERRORS:
                         raise
                     except Exception as exc:
+                        self._record_worker_error(cfg.name, exc)
                         logger.warning(
                             "Worker '%s' failed uploading part %s/%s: %s",
                             cfg.name,
@@ -1074,6 +1164,8 @@ class TelegramPool:
         ordered = self._ordered_clients(preferred_worker=worker_name)
 
         for cfg, client in ordered:
+            if now < self._cooldown_until.get(cfg.name, 0.0):
+                continue
             cache_key = (str(chat_id), int(msg_id), cfg.name)
             cached = self._stream_media_cache.get(cache_key)
             if cached and now < cached[0]:
@@ -1081,7 +1173,12 @@ class TelegramPool:
                 return client, cached[1]
 
         last_err: Exception | None = None
+        last_flood_wait: FloodWaitError | None = None
+        attempted = 0
         for cfg, client in ordered:
+            if time.monotonic() < self._cooldown_until.get(cfg.name, 0.0):
+                continue
+            attempted += 1
             try:
                 peer = await client.get_input_entity(target)
                 msg = await client.get_messages(peer, ids=msg_id)
@@ -1094,13 +1191,24 @@ class TelegramPool:
                     self._remember_media_key(msg.media, str(chat_id), int(msg_id))
                     return client, msg.media
             except FloodWaitError as fw:
-                self._cooldown_until[cfg.name] = time.monotonic() + fw.seconds
+                self._record_flood_wait(cfg.name, fw.seconds)
                 logger.warning("Worker '%s' hit FloodWait (%ss) fetching stream; trying next.", cfg.name, fw.seconds)
+                last_flood_wait = fw
                 last_err = fw
             except Exception as exc:
+                self._record_worker_error(cfg.name, exc)
                 logger.warning("Worker '%s' failed resolving stream message %s: %s", cfg.name, msg_id, exc)
                 last_err = exc
 
+        if attempted == 0 and ordered:
+            now_check = time.monotonic()
+            min_wait = min(
+                max(1, int(self._cooldown_until.get(cfg.name, 0.0) - now_check))
+                for cfg, _ in ordered
+            )
+            raise FloodWaitError(request=None, capture=min_wait)
+        if last_flood_wait is not None and isinstance(last_err, FloodWaitError):
+            raise last_flood_wait
         if last_err:
             raise RuntimeError(str(last_err))
         raise FileNotFoundError("Media message no longer exists in Telegram archive.")
@@ -1157,6 +1265,9 @@ class TelegramPool:
                 pending.clear()
 
         errored = False
+        wname = self._worker_name_for_client(client)
+        if wname:
+            self._active_streams[wname] = self._active_streams.get(wname, 0) + 1
         try:
             async for chunk in iterator:
                 if remaining <= 0:
@@ -1181,10 +1292,19 @@ class TelegramPool:
                     break
                 remaining -= len(data)
                 yield data
-        except Exception:
+        except FloodWaitError as fw:
             errored = True
+            if wname:
+                self._record_flood_wait(wname, fw.seconds)
+            raise
+        except Exception as exc:
+            errored = True
+            if wname:
+                self._record_worker_error(wname, exc)
             raise
         finally:
+            if wname:
+                self._active_streams[wname] = max(0, self._active_streams.get(wname, 1) - 1)
             if not errored:
                 _flush_pending_blocks(flush_partial=True)
             close_fn = getattr(iterator, "close", None)
@@ -1236,13 +1356,17 @@ class TelegramPool:
             target: int | str = int(chat_id)
         except ValueError:
             target = chat_id
-        for _, client in self._ordered_clients(preferred_worker=worker_name):
+        for cfg, client in self._ordered_clients(preferred_worker=worker_name):
             try:
                 peer = await client.get_input_entity(target)
                 res = await client.delete_messages(peer, [msg_id])
                 if res:
                     return
+            except FloodWaitError as fw:
+                self._record_flood_wait(cfg.name, fw.seconds)
+                logger.warning("Could not delete archive msg %s: %s", msg_id, fw)
             except Exception as exc:
+                self._record_worker_error(cfg.name, exc)
                 logger.warning("Could not delete archive msg %s: %s", msg_id, exc)
 
     async def migrate_media_topic(
@@ -1322,7 +1446,11 @@ class TelegramPool:
                         src_client = client
                         src_peer = peer
                         break
+                except FloodWaitError as fw:
+                    self._record_flood_wait(cfg.name, fw.seconds)
+                    last_err = fw
                 except Exception as exc:
+                    self._record_worker_error(cfg.name, exc)
                     last_err = exc
 
             if old_msg is None or src_client is None or src_cfg is None:
@@ -1408,6 +1536,254 @@ class TelegramPool:
             "part_count": len(migrated_parts),
             "parts": migrated_parts,
         }
+
+    async def upload_backup_file(
+        self,
+        local_path: Path,
+        *,
+        topic_name: str = "_VaultBackups",
+        caption: str = "",
+    ) -> dict[str, Any] | None:
+        target = self._parse_archive_target()
+        if target is None or not self.clients:
+            return None
+        local_path = Path(local_path)
+        if not local_path.is_file():
+            raise FileNotFoundError(f"Backup file not found: {local_path}")
+
+        chat_key = str(target)
+        send_caption = _truncate_utf16(caption or local_path.name, TELEGRAM_CAPTION_MAX_UTF16)
+        last_err: Exception | None = None
+
+        for cfg, client in self._ordered_clients():
+            self._active_uploads[cfg.name] = self._active_uploads.get(cfg.name, 0) + 1
+            try:
+                peer = await client.get_input_entity(target)
+                topic_id = await self._ensure_topic_id(cfg, chat_key, topic_name)
+                try:
+                    sent = await client.send_file(
+                        peer,
+                        str(local_path),
+                        caption=send_caption,
+                        reply_to=topic_id,
+                        force_document=True,
+                    )
+                except RPCError as rpc_err:
+                    err_text = str(rpc_err).upper()
+                    if (
+                        topic_id
+                        and topic_id != 1
+                        and ("TOPIC" in err_text or "REPLY" in err_text or "THREAD" in err_text)
+                    ):
+                        logger.info("Cached topic %s invalid for '%s'; recreating...", topic_id, topic_name)
+                        topic_id = await self._ensure_topic_id(
+                            cfg, chat_key, topic_name, force_recreate=True
+                        )
+                        sent = await client.send_file(
+                            peer,
+                            str(local_path),
+                            caption=send_caption,
+                            reply_to=topic_id,
+                            force_document=True,
+                        )
+                    else:
+                        raise
+                msg_obj = sent[0] if isinstance(sent, list) else sent
+                return {
+                    "chat_id": chat_key,
+                    "topic_id": topic_id,
+                    "message_id": int(msg_obj.id),
+                    "worker_name": cfg.name,
+                }
+            except FloodWaitError as fw:
+                self._record_flood_wait(cfg.name, fw.seconds)
+                logger.warning(
+                    "Worker '%s' hit FloodWait (%ss) uploading backup; trying next worker.",
+                    cfg.name,
+                    fw.seconds,
+                )
+                last_err = fw
+            except Exception as exc:
+                self._record_worker_error(cfg.name, exc)
+                logger.warning("Worker '%s' failed uploading backup: %s", cfg.name, exc)
+                last_err = exc
+            finally:
+                self._active_uploads[cfg.name] = max(0, self._active_uploads.get(cfg.name, 1) - 1)
+
+        if last_err:
+            raise last_err
+        return None
+
+    async def verify_archive_messages(
+        self,
+        chat_id: str,
+        msg_ids: list[int],
+        *,
+        batch_size: int = 50,
+        delay_sec: float = 0.25,
+    ) -> dict[str, Any]:
+        clean_ids = sorted({int(mid) for mid in msg_ids if int(mid) > 0})
+        if not clean_ids:
+            return {"present": [], "missing": [], "unchecked_rate_limited": [], "errors": []}
+        if not self.clients:
+            return {
+                "present": [],
+                "missing": [],
+                "unchecked_rate_limited": clean_ids,
+                "errors": ["No Telegram workers online"],
+            }
+
+        try:
+            target: int | str = int(chat_id)
+        except ValueError:
+            target = chat_id
+
+        effective_batch = max(1, min(100, int(batch_size)))
+        batches = [clean_ids[i : i + effective_batch] for i in range(0, len(clean_ids), effective_batch)]
+
+        present: set[int] = set()
+        missing: set[int] = set()
+        unchecked: set[int] = set()
+        errors: list[str] = []
+
+        for b_idx, batch in enumerate(batches):
+            now = time.monotonic()
+            candidates = [
+                (cfg, client)
+                for cfg, client in self._ordered_clients()
+                if now >= self._cooldown_until.get(cfg.name, 0.0)
+            ]
+            if not candidates:
+                for rem_batch in batches[b_idx:]:
+                    unchecked.update(rem_batch)
+                errors.append("All Telegram workers are in FloodWait cooldown")
+                break
+
+            resolved = False
+            for cfg, client in candidates:
+                try:
+                    peer = await client.get_input_entity(target)
+                    msgs = await client.get_messages(peer, ids=batch)
+                    if msgs is None:
+                        normalized: list[Any] = [None] * len(batch)
+                    elif isinstance(msgs, (list, tuple)):
+                        normalized = list(msgs)
+                    else:
+                        normalized = [msgs]
+
+                    if len(normalized) == len(batch):
+                        paired = list(zip(batch, normalized))
+                    else:
+                        by_id = {
+                            int(m.id): m
+                            for m in normalized
+                            if m is not None and getattr(m, "id", None) is not None
+                        }
+                        paired = [(mid, by_id.get(mid)) for mid in batch]
+
+                    for mid, msg in paired:
+                        if (
+                            msg is not None
+                            and getattr(msg, "media", None) is not None
+                            and not getattr(msg, "empty", False)
+                        ):
+                            present.add(mid)
+                        else:
+                            missing.add(mid)
+                    resolved = True
+                    break
+                except FloodWaitError as fw:
+                    self._record_flood_wait(cfg.name, fw.seconds)
+                    logger.warning(
+                        "Worker '%s' hit FloodWait (%ss) verifying archive batch; trying next worker.",
+                        cfg.name,
+                        fw.seconds,
+                    )
+                except Exception as exc:
+                    self._record_worker_error(cfg.name, exc)
+                    errors.append(f"{cfg.name}: {exc}")
+                    logger.warning(
+                        "Worker '%s' failed verifying archive batch: %s",
+                        cfg.name,
+                        exc,
+                    )
+
+            if not resolved:
+                now_after = time.monotonic()
+                all_in_cooldown = all(
+                    now_after < self._cooldown_until.get(cfg.name, 0.0) for cfg, _ in self.clients
+                )
+                if all_in_cooldown:
+                    for rem_batch in batches[b_idx:]:
+                        unchecked.update(rem_batch)
+                    if "All Telegram workers are in FloodWait cooldown" not in errors:
+                        errors.append("All Telegram workers are in FloodWait cooldown")
+                    break
+                unchecked.update(batch)
+
+            if delay_sec > 0 and b_idx + 1 < len(batches):
+                await asyncio.sleep(delay_sec)
+
+        return {
+            "present": sorted(present),
+            "missing": sorted(missing),
+            "unchecked_rate_limited": sorted(unchecked),
+            "errors": errors,
+        }
+
+    async def download_media_to_path(
+        self,
+        item: dict[str, Any],
+        dest_path: Path,
+        *,
+        max_bytes: int | None = None,
+    ) -> int:
+        dest_path = Path(dest_path)
+        size_bytes = int(item.get("size_bytes") or 0)
+        if max_bytes is not None and size_bytes > max_bytes:
+            raise ValueError(f"Media size {size_bytes} exceeds repair download limit {max_bytes}")
+
+        parts = list(item.get("parts") or [])
+        if len(parts) > 1:
+            total_part_bytes = sum(int(p.get("size_bytes") or 0) for p in parts)
+            effective_size = size_bytes if size_bytes > 0 else total_part_bytes
+            if max_bytes is not None and effective_size > max_bytes:
+                raise ValueError(
+                    f"Media size {effective_size} exceeds repair download limit {max_bytes}"
+                )
+            end = effective_size - 1 if effective_size > 0 else -1
+            chunk_iter = self.iter_telegram_multipart_range(parts, 0, end)
+        else:
+            chat_id = item.get("telegram_chat_id") or (parts[0].get("telegram_chat_id") if parts else None)
+            msg_id = item.get("telegram_msg_id") or (parts[0].get("telegram_msg_id") if parts else None)
+            worker_name = item.get("telegram_worker_name") or (parts[0].get("telegram_worker_name") if parts else None)
+            if not chat_id or not msg_id:
+                raise ValueError("Media item is missing Telegram archive reference.")
+            client, media = await self.prepare_stream(str(chat_id), int(msg_id), worker_name=worker_name)
+            end = (size_bytes - 1) if size_bytes > 0 else (max_bytes if max_bytes is not None else (1 << 50))
+            chunk_iter = self.iter_telegram_range(client, media, 0, end)
+
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        written = 0
+        try:
+            with dest_path.open("wb") as f:
+                async for chunk in chunk_iter:
+                    if not chunk:
+                        continue
+                    written += len(chunk)
+                    if max_bytes is not None and written > max_bytes:
+                        raise ValueError(
+                            f"Downloaded size {written} exceeds repair download limit {max_bytes}"
+                        )
+                    await asyncio.to_thread(f.write, chunk)
+        except BaseException:
+            dest_path.unlink(missing_ok=True)
+            raise
+        finally:
+            aclose = getattr(chunk_iter, "aclose", None)
+            if callable(aclose):
+                await aclose()
+        return written
 
     async def _claim_group_message(self, chat_id: int | str, msg_id: int) -> bool:
         now = time.monotonic()
@@ -1741,6 +2117,7 @@ class TelegramPool:
         except asyncio.CancelledError:
             await status_msg.edit(f"[{cfg.name}] Cancelled: {display_url}")
         except FloodWaitError as fw:
+            self._record_flood_wait(cfg.name, fw.seconds)
             self.db.update_job(job_id, status="failed", message=f"Telegram flood wait: {fw.seconds}s")
             await status_msg.edit(f"[{cfg.name}] Rate limited by Telegram for {fw.seconds}s. Try another worker/bot.")
         except Exception as exc:
@@ -1787,6 +2164,7 @@ class TelegramPool:
         )
         job_id = self.db.create_job("telegram", "upload", filename)
         job_dir = Path(tempfile.mkdtemp(dir=self.settings.staging_dir))
+        self.ingest.register_staging_dir(job_dir)
         staged_path = job_dir / filename
 
         last_update = 0.0
@@ -1963,11 +2341,14 @@ class TelegramPool:
                 f"View: {self._gallery_link(item['id'])}"
             )
         except FloodWaitError as fw:
+            self._record_flood_wait(cfg.name, fw.seconds)
             self.db.update_job(job_id, status="failed", message=f"Telegram flood wait: {fw.seconds}s")
             await status_msg.edit(f"[{cfg.name}] Rate limited by Telegram for {fw.seconds}s. Try another worker/bot.")
         except Exception as exc:
+            self._record_worker_error(cfg.name, exc)
             self.db.update_job(job_id, status="failed", message=str(exc))
             err_msg = _truncate_utf16(str(exc), 1500)
             await status_msg.edit(f"[{cfg.name}] Failed:\n`{err_msg}`")
         finally:
             shutil.rmtree(job_dir, ignore_errors=True)
+            self.ingest.unregister_staging_dir(job_dir)

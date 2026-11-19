@@ -297,6 +297,37 @@ class Database:
                     user_id INTEGER PRIMARY KEY,
                     default_folder TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS vault_backups (
+                    id TEXT PRIMARY KEY,
+                    filename TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL,
+                    uncompressed_bytes INTEGER NOT NULL DEFAULT 0,
+                    sha256 TEXT,
+                    trigger TEXT NOT NULL DEFAULT 'manual',
+                    note TEXT,
+                    telegram_chat_id TEXT,
+                    telegram_topic_id INTEGER,
+                    telegram_msg_id INTEGER,
+                    telegram_worker_name TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_vault_backups_created_at ON vault_backups(created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS maintenance_runs (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    progress REAL NOT NULL DEFAULT 0,
+                    message TEXT,
+                    options_json TEXT,
+                    summary_json TEXT,
+                    details_json TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_maintenance_runs_created_at ON maintenance_runs(created_at DESC);
                 """
             )
             # Safe migration for existing DBs created before folder / Telegram storage support
@@ -1041,3 +1072,363 @@ class Database:
                 """,
                 (user_id, folder),
             )
+
+    def backup_to(self, dest_path: Path) -> None:
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        # Ensure the database file is initialized and any in-flight schema setup completed.
+        with self._connect():
+            pass
+        src = sqlite3.connect(self.db_path, timeout=30.0)
+        dst = sqlite3.connect(dest_path, timeout=30.0)
+        try:
+            src.backup(dst, pages=256, sleep=0.005)
+        finally:
+            dst.close()
+            src.close()
+
+    def get_db_stats(self) -> dict[str, Any]:
+        wal_path = Path(f"{self.db_path}-wal")
+        size_bytes = self.db_path.stat().st_size if self.db_path.exists() else 0
+        wal_size_bytes = wal_path.stat().st_size if wal_path.exists() else 0
+        with self._connect() as conn:
+            journal_row = conn.execute("PRAGMA journal_mode").fetchone()
+            journal_mode = str(journal_row[0]) if journal_row else "unknown"
+            media_count = int(conn.execute("SELECT COUNT(*) FROM media_items").fetchone()[0])
+            parts_count = int(conn.execute("SELECT COUNT(*) FROM media_parts").fetchone()[0])
+            jobs_count = int(conn.execute("SELECT COUNT(*) FROM ingest_jobs").fetchone()[0])
+            tags_count = int(
+                conn.execute("SELECT COUNT(DISTINCT tag) FROM media_tags WHERE tag != ''").fetchone()[0]
+            )
+            backups_count = int(conn.execute("SELECT COUNT(*) FROM vault_backups").fetchone()[0])
+        folders_count = len(self.list_folders())
+        return {
+            "db_path": str(self.db_path),
+            "size_bytes": size_bytes,
+            "wal_size_bytes": wal_size_bytes,
+            "journal_mode": journal_mode,
+            "media_count": media_count,
+            "parts_count": parts_count,
+            "jobs_count": jobs_count,
+            "folders_count": folders_count,
+            "tags_count": tags_count,
+            "backups_count": backups_count,
+        }
+
+    def list_all_media_for_audit(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            media_rows = conn.execute(
+                "SELECT * FROM media_items ORDER BY created_at DESC"
+            ).fetchall()
+            part_rows = conn.execute(
+                "SELECT * FROM media_parts ORDER BY media_id ASC, part_index ASC"
+            ).fetchall()
+
+        parts_by_media: dict[str, list[dict[str, Any]]] = {}
+        for pr in part_rows:
+            d = dict(pr)
+            parts_by_media.setdefault(d["media_id"], []).append(d)
+
+        items: list[dict[str, Any]] = []
+        for row in media_rows:
+            item = self._hydrate_media(row)
+            parts = parts_by_media.get(item["id"])
+            if parts:
+                item["parts"] = parts
+            elif item.get("telegram_chat_id") and item.get("telegram_msg_id"):
+                size_bytes = int(item.get("size_bytes") or 0)
+                item["parts"] = [
+                    {
+                        "media_id": item["id"],
+                        "part_index": 0,
+                        "start_byte": 0,
+                        "end_byte": max(0, size_bytes - 1),
+                        "size_bytes": size_bytes,
+                        "telegram_chat_id": item["telegram_chat_id"],
+                        "telegram_topic_id": item.get("telegram_topic_id"),
+                        "telegram_msg_id": int(item["telegram_msg_id"]),
+                        "telegram_worker_name": item.get("telegram_worker_name"),
+                    }
+                ]
+            else:
+                item["parts"] = []
+            items.append(item)
+        return items
+
+    def update_media_assets(
+        self,
+        media_id: str,
+        *,
+        thumb_filename: str | None = None,
+        preview_filename: str | None = None,
+        duration_sec: float | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        video_codec: str | None = None,
+        audio_codec: str | None = None,
+        fps: float | None = None,
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            existing = conn.execute("SELECT * FROM media_items WHERE id = ?", (media_id,)).fetchone()
+            if not existing:
+                return None
+
+            sets: list[str] = []
+            params: list[Any] = []
+            if thumb_filename is not None:
+                sets.append("thumb_filename = ?")
+                params.append(thumb_filename)
+            if preview_filename is not None:
+                sets.append("preview_filename = ?")
+                params.append(preview_filename)
+            if duration_sec is not None:
+                sets.append("duration_sec = ?")
+                params.append(duration_sec)
+            if width is not None:
+                sets.append("width = ?")
+                params.append(width)
+            if height is not None:
+                sets.append("height = ?")
+                params.append(height)
+            if video_codec is not None:
+                sets.append("video_codec = ?")
+                params.append(video_codec)
+            if audio_codec is not None:
+                sets.append("audio_codec = ?")
+                params.append(audio_codec)
+            if fps is not None:
+                sets.append("fps = ?")
+                params.append(fps)
+
+            if sets:
+                params.append(media_id)
+                conn.execute(
+                    f"UPDATE media_items SET {', '.join(sets)} WHERE id = ?",
+                    params,
+                )
+
+            row = conn.execute("SELECT * FROM media_items WHERE id = ?", (media_id,)).fetchone()
+            assert row is not None
+            item = self._hydrate_media(row)
+            item["parts"] = self._resolve_parts_for_item(conn, item)
+        self.publish({"type": "media_update", "media_id": media_id, "action": "repair"})
+        return item
+
+    def insert_backup_record(self, record: dict[str, Any]) -> dict[str, Any]:
+        backup_id = str(record.get("id") or uuid.uuid4().hex[:12])
+        created_at = str(record.get("created_at") or utc_now_iso())
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO vault_backups (
+                    id, filename, file_path, size_bytes, uncompressed_bytes, sha256,
+                    trigger, note, telegram_chat_id, telegram_topic_id,
+                    telegram_msg_id, telegram_worker_name, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    backup_id,
+                    str(record["filename"]),
+                    str(record["file_path"]),
+                    int(record["size_bytes"]),
+                    int(record.get("uncompressed_bytes") or 0),
+                    record.get("sha256"),
+                    str(record.get("trigger") or "manual"),
+                    record.get("note"),
+                    record.get("telegram_chat_id"),
+                    record.get("telegram_topic_id"),
+                    record.get("telegram_msg_id"),
+                    record.get("telegram_worker_name"),
+                    created_at,
+                ),
+            )
+            row = conn.execute("SELECT * FROM vault_backups WHERE id = ?", (backup_id,)).fetchone()
+            assert row is not None
+            return dict(row)
+
+    def list_backup_records(self, limit: int = 50) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM vault_backups ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_backup_record(self, backup_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM vault_backups WHERE id = ?", (backup_id,)).fetchone()
+            return dict(row) if row else None
+
+    def delete_backup_record(self, backup_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM vault_backups WHERE id = ?", (backup_id,)).fetchone()
+            if not row:
+                return None
+            conn.execute("DELETE FROM vault_backups WHERE id = ?", (backup_id,))
+            return dict(row)
+
+    def get_latest_backup_record(self) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM vault_backups ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+            return dict(row) if row else None
+
+    @staticmethod
+    def _hydrate_maintenance_run(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        raw = dict(row)
+
+        def _parse_dict(val: Any) -> dict[str, Any]:
+            if isinstance(val, dict):
+                return val
+            if not val:
+                return {}
+            try:
+                parsed = json.loads(val)
+                return parsed if isinstance(parsed, dict) else {}
+            except (json.JSONDecodeError, TypeError):
+                return {}
+
+        return {
+            "id": raw["id"],
+            "kind": raw["kind"],
+            "status": raw["status"],
+            "progress": float(raw["progress"]),
+            "message": raw["message"] or "",
+            "options": _parse_dict(raw.get("options_json")),
+            "summary": _parse_dict(raw.get("summary_json")),
+            "details": _parse_dict(raw.get("details_json")),
+            "created_at": raw["created_at"],
+            "updated_at": raw["updated_at"],
+        }
+
+    def create_maintenance_run(
+        self,
+        kind: str,
+        *,
+        status: str = "running",
+        message: str = "",
+        options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        run_id = uuid.uuid4().hex[:12]
+        now = utc_now_iso()
+        options_json = json.dumps(options or {})
+        progress = 100.0 if status == "done" else 0.0
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO maintenance_runs (
+                    id, kind, status, progress, message, options_json, summary_json, details_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (run_id, kind, status, progress, message, options_json, "{}", "{}", now, now),
+            )
+            row = conn.execute("SELECT * FROM maintenance_runs WHERE id = ?", (run_id,)).fetchone()
+            assert row is not None
+            run = self._hydrate_maintenance_run(row)
+        self.publish({"type": "maintenance_update", "run_id": run_id, "kind": kind, "status": status})
+        return run
+
+    def update_maintenance_run(
+        self,
+        run_id: str,
+        *,
+        status: str | None = None,
+        progress: float | None = None,
+        message: str | None = None,
+        summary: dict[str, Any] | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        now = utc_now_iso()
+        if progress is None and status == "done":
+            progress = 100.0
+        with self._connect() as conn:
+            existing = conn.execute("SELECT * FROM maintenance_runs WHERE id = ?", (run_id,)).fetchone()
+            if not existing:
+                return None
+
+            sets = ["updated_at = ?"]
+            params: list[Any] = [now]
+            if status is not None:
+                sets.append("status = ?")
+                params.append(status)
+            if progress is not None:
+                clamped = max(0.0, min(100.0, float(progress)))
+                sets.append("progress = ?")
+                params.append(clamped)
+            if message is not None:
+                sets.append("message = ?")
+                params.append(message)
+            if summary is not None:
+                sets.append("summary_json = ?")
+                params.append(json.dumps(summary))
+            if details is not None:
+                sets.append("details_json = ?")
+                params.append(json.dumps(details))
+
+            params.append(run_id)
+            conn.execute(
+                f"UPDATE maintenance_runs SET {', '.join(sets)} WHERE id = ?",
+                params,
+            )
+            row = conn.execute("SELECT * FROM maintenance_runs WHERE id = ?", (run_id,)).fetchone()
+            assert row is not None
+            run = self._hydrate_maintenance_run(row)
+        self.publish(
+            {
+                "type": "maintenance_update",
+                "run_id": run_id,
+                "kind": run["kind"],
+                "status": run["status"],
+            }
+        )
+        return run
+
+    def get_maintenance_run(self, run_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM maintenance_runs WHERE id = ?", (run_id,)).fetchone()
+            return self._hydrate_maintenance_run(row) if row else None
+
+    def list_maintenance_runs(
+        self, *, kind: str | None = None, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            if kind is not None:
+                rows = conn.execute(
+                    "SELECT * FROM maintenance_runs WHERE kind = ? ORDER BY created_at DESC LIMIT ?",
+                    (kind, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM maintenance_runs ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            return [self._hydrate_maintenance_run(r) for r in rows]
+
+    def get_latest_maintenance_run(self, kind: str | None = None) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            if kind is not None:
+                row = conn.execute(
+                    "SELECT * FROM maintenance_runs WHERE kind = ? ORDER BY created_at DESC LIMIT 1",
+                    (kind,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM maintenance_runs ORDER BY created_at DESC LIMIT 1"
+                ).fetchone()
+            return self._hydrate_maintenance_run(row) if row else None
+
+    def recover_interrupted_maintenance_runs(self) -> int:
+        now = utc_now_iso()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE maintenance_runs
+                SET status = 'failed',
+                    message = 'Interrupted by server restart',
+                    updated_at = ?
+                WHERE status = 'running'
+                """,
+                (now,),
+            )
+            return int(cur.rowcount or 0)
+

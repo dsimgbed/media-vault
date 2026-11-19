@@ -139,6 +139,10 @@ export function connectEvents() {
         }
       } else if (payload.type === "media_update") {
         scheduleMediaRefresh();
+      } else if (payload.type === "maintenance_update") {
+        emit("maintenance:update", payload);
+      } else if (payload.type === "backup_update") {
+        emit("backup:update", payload);
       }
     } catch (err) {
       console.warn("SSE event error:", err);

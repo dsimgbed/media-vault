@@ -11,6 +11,7 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -592,6 +593,26 @@ class IngestService:
         self._active_procs: dict[str, set[asyncio.subprocess.Process]] = {}
         self._cancelled_jobs: set[str] = set()
         self._active_slots = 0
+        self._staging_lock = threading.Lock()
+        self._active_staging_dirs: set[Path] = set()
+
+    def register_staging_dir(self, path: Path | str) -> None:
+        resolved = Path(path).resolve()
+        with self._staging_lock:
+            self._active_staging_dirs.add(resolved)
+
+    def unregister_staging_dir(self, path: Path | str) -> None:
+        resolved = Path(path).resolve()
+        with self._staging_lock:
+            self._active_staging_dirs.discard(resolved)
+
+    def get_active_staging_dirs(self) -> set[Path]:
+        with self._staging_lock:
+            return set(self._active_staging_dirs)
+
+    def has_active_jobs(self) -> bool:
+        with self._staging_lock:
+            return bool(self._job_tasks or self._active_staging_dirs)
 
     @property
     def semaphore(self) -> asyncio.Semaphore:
@@ -1031,6 +1052,7 @@ class IngestService:
                 if job_id in self._cancelled_jobs:
                     raise asyncio.CancelledError()
                 job_dir = Path(tempfile.mkdtemp(dir=self.settings.staging_dir))
+                self.register_staging_dir(job_dir)
                 try:
                     ddl = await is_direct_download(url)
                     kind = "ddl" if ddl else "ytdlp"
@@ -1099,6 +1121,7 @@ class IngestService:
                     return items
                 finally:
                     shutil.rmtree(job_dir, ignore_errors=True)
+                    self.unregister_staging_dir(job_dir)
         except asyncio.CancelledError:
             job = self.db.get_job(job_id)
             if job and job.get("status") != "cancelled":
@@ -1128,9 +1151,12 @@ class IngestService:
         force: bool = False,
         precomputed_sha256: str | None = None,
     ) -> dict[str, Any]:
+        job_dir = staged_file.parent
+        self.register_staging_dir(job_dir)
         if job_id in self._cancelled_jobs:
             self.db.update_job(job_id, status="cancelled", message="Cancelled by user")
-            shutil.rmtree(staged_file.parent, ignore_errors=True)
+            shutil.rmtree(job_dir, ignore_errors=True)
+            self.unregister_staging_dir(job_dir)
             raise asyncio.CancelledError()
 
         safe_folder = sanitize_folder(folder, self.settings.default_folder)
@@ -1190,4 +1216,5 @@ class IngestService:
             raise
         finally:
             self._active_slots = max(0, self._active_slots - 1)
-            shutil.rmtree(staged_file.parent, ignore_errors=True)
+            shutil.rmtree(job_dir, ignore_errors=True)
+            self.unregister_staging_dir(job_dir)

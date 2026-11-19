@@ -1,4 +1,4 @@
-const CACHE_NAME = "media-vault-shell-v2";
+const CACHE_NAME = "media-vault-shell-v3";
 const SHELL_ASSETS = [
   "/",
   "/manifest.webmanifest",

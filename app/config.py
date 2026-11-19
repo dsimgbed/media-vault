@@ -56,6 +56,15 @@ class Settings(BaseSettings):
     ingest_concurrency: int = 3
     ytdlp_concurrent_fragments: int = 4
 
+    backup_dir: Path | None = None
+    backup_retention_count: int = 10
+    backup_interval_hours: float = 0.0
+    backup_telegram_enabled: bool = False
+    backup_telegram_topic: str = "_VaultBackups"
+    integrity_staging_grace_sec: int = 300
+    integrity_telegram_batch_size: int = 50
+    integrity_telegram_batch_delay_sec: float = 0.25
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "media.db"
@@ -67,6 +76,10 @@ class Settings(BaseSettings):
     @property
     def sessions_dir(self) -> Path:
         return self.data_dir / "sessions"
+
+    @property
+    def backups_dir(self) -> Path:
+        return self.backup_dir if self.backup_dir is not None else (self.data_dir / "backups")
 
     @property
     def min_free_buffer_bytes(self) -> int:
@@ -111,3 +124,4 @@ class Settings(BaseSettings):
         self.staging_dir.mkdir(parents=True, exist_ok=True)
         self.thumbs_dir.mkdir(parents=True, exist_ok=True)
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        self.backups_dir.mkdir(parents=True, exist_ok=True)

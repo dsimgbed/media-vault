@@ -18,6 +18,10 @@ A self-hosted server that gives you **both**:
 - **Telegram Group + Topic Routing**:
   - Each folder maps 1:1 to a **Forum Topic** in `TELEGRAM_ARCHIVE_CHAT_ID` (auto-created via Bot API).
   - Posting a video/DDL link directly in the archive supergroup (with `#Folder`, `folder:Name`, `format:720p`, or inside an existing Topic) deduplicates across workers, runs the full pipeline, and indexes into the Web Gallery.
+- **Vault Resilience & Maintenance**:
+  - **Online SQLite Backups**: Generates verified, gzip-compressed `.db.gz` snapshots via `POST /api/system/backups` (or on a schedule via `BACKUP_INTERVAL_HOURS`) with local rotation (`BACKUP_RETENTION_COUNT`) and optional upload to the `_VaultBackups` Forum Topic (`BACKUP_TELEGRAM_ENABLED=true`). Download or delete snapshots via `/api/system/backups/{backup_id}/download` and `DELETE /api/system/backups/{backup_id}`.
+  - **Self-Healing Integrity Audit & Repair**: `POST /api/system/integrity/audit` checks media integrity (missing thumbnails, animated previews, metadata, orphaned staging/thumbnail files, and optional Telegram message verification). `POST /api/system/integrity/repair` backfills missing assets from local drives or bounded Telegram fetches and optionally purges stale orphans, with run history tracked under `/api/system/integrity/runs`.
+  - **System Health & Maintenance Sheet**: Displays live per-worker Telegram pool telemetry (online/cooldown state, requests, FloodWait counts) and MTProto streaming block-cache metrics alongside backup and integrity controls (backed by `/api/system/status` and `/api/health`).
 
 ## Quick Start
 
@@ -75,3 +79,17 @@ Open `http://localhost:8080` (or your Tailscale IP) on your phone or laptop.
 ### 6. Notes for `rclone mount` & Reverse Proxies
 - Mount cloud drives with `--vfs-cache-mode writes` if using `STORAGE_MODE=drives` or `both`.
 - If putting Nginx/Caddy in front of this server for 2 GB web uploads, set `client_max_body_size 2048M;` (Nginx) or leave Caddy's default.
+
+### 7. Verifying & Restoring a Database Backup (CLI)
+> **Important:** Stop the Media Vault server before restoring so active connections do not hold SQLite locks or replay stale WAL state.
+
+1. **Verify a backup without modifying the database:**
+   ```bash
+   .venv/bin/python scripts/restore_vault.py --backup ./data/backups/vault_backup_<timestamp>_<id>.db.gz --verify-only
+   ```
+2. **Restore the database** (automatically creates a `.pre-restore-<timestamp>.bak` copy of any existing DB, removes stale `-wal`/`-shm` sidecars, and verifies `PRAGMA integrity_check`; pass `--db-path <path>` to override `DATA_DIR/media.db`, and `--yes` to skip the interactive prompt):
+   ```bash
+   .venv/bin/python scripts/restore_vault.py --backup ./data/backups/vault_backup_<timestamp>_<id>.db.gz --yes
+   ```
+3. **Restart the server** once the restore reports `Status : RESTORED`.
+

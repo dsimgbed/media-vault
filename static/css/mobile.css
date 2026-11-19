@@ -172,7 +172,8 @@
 
   /* Bottom-sheet dialogs */
   dialog,
-  dialog.modal-sm {
+  dialog.modal-sm,
+  dialog.system-sheet {
     position: fixed;
     inset: auto 0 0 0;
     margin: 0;
@@ -185,6 +186,18 @@
     border-bottom: none;
     overflow-y: auto;
     padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  .sys-grid-2 {
+    grid-template-columns: 1fr;
+  }
+
+  .sys-metric-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .system-tabs {
+    padding: 8px 12px;
   }
 
   /* Full-screen media viewer on mobile */
