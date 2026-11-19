@@ -26,11 +26,43 @@ class PlaylistRequest(BaseModel):
 
 class CheckDuplicateRequest(BaseModel):
     url: str | None = None
+    urls: list[str] | None = Field(default=None, max_length=500)
+    sha256: str | None = None
+    size_bytes: int | None = Field(default=None, ge=0)
+    filename: str | None = None
+
+
+class UploadSessionInitRequest(BaseModel):
+    filename: str = Field(..., min_length=1, max_length=512)
+    total_size: int = Field(..., ge=0)
+    chunk_size: int | None = Field(default=None, ge=65536)
+    title: str | None = None
+    folder: str | None = None
+    tags: list[str] | str | None = None
+    forward_to_telegram: bool = True
+    force: bool = False
+    sha256: str | None = None
+    fingerprint: str | None = Field(default=None, max_length=512)
+
+
+class UploadSessionCompleteRequest(BaseModel):
     sha256: str | None = None
 
 
 class RetryJobRequest(BaseModel):
     force: bool = False
+
+
+class ClearJobsRequest(BaseModel):
+    statuses: list[Literal["done", "cancelled", "failed"]] = Field(
+        default_factory=lambda: ["done", "cancelled"]
+    )
+
+
+class RetryFailedJobsRequest(BaseModel):
+    force: bool = False
+    include_cancelled: bool = False
+    limit: int = Field(default=50, ge=1, le=200)
 
 
 class UpdateMediaTagsRequest(BaseModel):

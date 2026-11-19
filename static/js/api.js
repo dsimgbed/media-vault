@@ -35,13 +35,27 @@ export async function apiFetch(url, opts = {}) {
   return res.json();
 }
 
-export function uploadWithProgress(url, formData, onProgress) {
+export function uploadWithProgress(url, formData, onProgress, { signal } = {}) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+
     const xhr = new XMLHttpRequest();
     xhr.open("POST", url);
     if (state.token) {
       xhr.setRequestHeader("Authorization", `Bearer ${state.token}`);
     }
+
+    const cleanup = () => {
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => {
+      xhr.abort();
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable && typeof onProgress === "function") {
         const pct = Math.round((e.loaded / e.total) * 100);
@@ -49,6 +63,7 @@ export function uploadWithProgress(url, formData, onProgress) {
       }
     };
     xhr.onload = () => {
+      cleanup();
       if (xhr.status === 401) {
         handleUnauthorized();
         reject(new Error("Unauthorized — enter your WEB_AUTH_TOKEN above."));
@@ -64,7 +79,14 @@ export function uploadWithProgress(url, formData, onProgress) {
         reject(new Error(xhr.responseText || `Upload failed (${xhr.status})`));
       }
     };
-    xhr.onerror = () => reject(new Error("Network error during upload"));
+    xhr.onerror = () => {
+      cleanup();
+      reject(new Error("Network error during upload"));
+    };
+    xhr.onabort = () => {
+      cleanup();
+      reject(new DOMException("Aborted", "AbortError"));
+    };
     xhr.send(formData);
   });
 }

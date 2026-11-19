@@ -65,6 +65,15 @@ class Settings(BaseSettings):
     integrity_telegram_batch_size: int = 50
     integrity_telegram_batch_delay_sec: float = 0.25
 
+    upload_chunk_size_mb: int = 8
+    upload_max_chunk_size_mb: int = 32
+    upload_session_ttl_sec: int = 86400
+    upload_max_staging_mb: int = 0
+    upload_max_concurrent_sessions: int = 50
+    failed_upload_retention_sec: int = 3600
+    failed_upload_max_retained_mb: int = 4096
+    staging_gc_interval_sec: int = 300
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "media.db"
@@ -88,6 +97,22 @@ class Settings(BaseSettings):
     @property
     def max_upload_bytes(self) -> int:
         return self.max_upload_mb * 1024 * 1024
+
+    @property
+    def upload_chunk_size_bytes(self) -> int:
+        return max(65536, int(self.upload_chunk_size_mb) * 1024 * 1024)
+
+    @property
+    def upload_max_chunk_size_bytes(self) -> int:
+        return max(self.upload_chunk_size_bytes, int(self.upload_max_chunk_size_mb) * 1024 * 1024)
+
+    @property
+    def upload_max_staging_bytes(self) -> int:
+        return max(0, int(self.upload_max_staging_mb)) * 1024 * 1024
+
+    @property
+    def failed_upload_max_retained_bytes(self) -> int:
+        return max(0, int(self.failed_upload_max_retained_mb)) * 1024 * 1024
 
     @property
     def telegram_part_size_bytes(self) -> int:

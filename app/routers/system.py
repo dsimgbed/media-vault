@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from importlib.metadata import PackageNotFoundError, version as pkg_version
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+from app.allocator import sanitize_folder
 from app.context import AppContext
+from app.db import normalize_source_url
 from app.ingest import expand_ytdlp_playlist, list_ytdlp_formats
 from app.routers.deps import get_ctx, require_auth
 from app.schemas import CookiesRequest, FormatsRequest, PlaylistRequest
@@ -39,6 +42,8 @@ async def health(ctx: AppContext = Depends(get_ctx)):
         "default_folder": cfg.default_folder,
         "auth_required": bool(cfg.web_auth_token.strip()),
         "max_upload_mb": cfg.max_upload_mb,
+        "upload_chunk_size_mb": cfg.upload_chunk_size_mb,
+        "failed_upload_retention_sec": cfg.failed_upload_retention_sec,
         "telegram_part_size_mb": cfg.telegram_part_size_mb,
         "ingest_concurrency": cfg.ingest_concurrency,
         "ytdlp_cookies_configured": cookies_ok,
@@ -63,6 +68,7 @@ async def system_status(ctx: AppContext = Depends(get_ctx)):
             "latest": latest_backup,
         },
         "integrity": ctx.integrity.get_status() if ctx.integrity else {},
+        "uploads": ctx.uploads.get_status_summary() if ctx.uploads else {},
         "ingest": {
             "concurrency": cfg.ingest_concurrency,
             "active_jobs": ctx.ingest.has_active_jobs(),
@@ -138,7 +144,7 @@ async def inspect_ytdlp_playlist(
     if not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
     try:
-        return await expand_ytdlp_playlist(
+        res = await expand_ytdlp_playlist(
             url,
             cookies_file=ctx.settings.ytdlp_cookies_file,
             proxy=ctx.settings.ytdlp_proxy,
@@ -146,6 +152,38 @@ async def inspect_ytdlp_playlist(
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+    entries = res.get("entries") or []
+    matches = ctx.db.find_media_by_source_urls(
+        [str(e["url"]) for e in entries if isinstance(e, dict) and e.get("url")]
+    )
+    dup_count = 0
+    enriched_entries: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        entry_url = str(entry.get("url") or "")
+        norm_url = normalize_source_url(entry_url)
+        existing = matches.get(entry_url) or (matches.get(norm_url) if norm_url else None)
+        already = existing is not None
+        if already:
+            dup_count += 1
+        enriched = dict(entry)
+        enriched["normalized_url"] = norm_url
+        enriched["already_in_vault"] = already
+        enriched["existing_media_id"] = existing["id"] if existing else None
+        enriched["existing_folder"] = existing["folder"] if existing else None
+        enriched_entries.append(enriched)
+
+    pl_title = str(res.get("playlist_title") or "").strip()
+    res["entries"] = enriched_entries
+    res["duplicate_count"] = dup_count
+    res["suggested_folder"] = (
+        sanitize_folder(pl_title, ctx.settings.default_folder)
+        if pl_title
+        else ctx.settings.default_folder
+    )
+    return res
 
 
 @router.post("/api/ytdlp/cookies", dependencies=[Depends(require_auth)])

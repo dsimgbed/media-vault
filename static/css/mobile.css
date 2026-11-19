@@ -173,7 +173,8 @@
   /* Bottom-sheet dialogs */
   dialog,
   dialog.modal-sm,
-  dialog.system-sheet {
+  dialog.system-sheet,
+  dialog.playlist-modal {
     position: fixed;
     inset: auto 0 0 0;
     margin: 0;
@@ -278,5 +279,48 @@
   .thumb-wrap img {
     -webkit-touch-callout: none;
     user-select: none;
+  }
+
+  /* Upload Queue, Playlist Modal & Smart Job Center mobile ergonomics */
+  .uq-header,
+  .jc-header,
+  .pl-footer {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .uq-actions,
+  .uq-card-actions,
+  .jc-actions {
+    width: 100%;
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+
+  .uq-card-actions button,
+  .uq-actions button,
+  .jc-actions button,
+  .jc-filter-btn,
+  .pl-entry,
+  .pl-toolbar button,
+  .pl-footer button {
+    min-height: 40px;
+  }
+
+  .jc-filter-btn {
+    padding: 6px 12px;
+  }
+
+  .pl-field-row {
+    grid-template-columns: 1fr;
+  }
+
+  .pl-search-input {
+    width: 100%;
+    flex: 1 1 100%;
+  }
+
+  .pl-list {
+    max-height: 38vh;
   }
 }

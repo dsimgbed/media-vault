@@ -1,11 +1,19 @@
 import { state } from "/static/js/state.js";
 import { emit, on } from "/static/js/bus.js";
 import { apiFetch, uploadWithProgress } from "/static/js/api.js";
-import { $, fmtSize } from "/static/js/utils.js";
+import { $, fmtSize, escapeHtml } from "/static/js/utils.js";
 import { toast } from "/static/js/ui/dialogs.js";
 import { loadJobs } from "/static/js/features/jobs.js";
 import { getIngestTagPicker } from "/static/js/features/tags.js";
 import { normalizeTagsList } from "/static/js/ui/tag-picker.js";
+import {
+  initUploadQueue,
+  enqueueFiles,
+  getActiveUploadCount,
+} from "/static/js/features/upload-queue.js";
+import { openPlaylistPicker } from "/static/js/features/playlist-picker.js";
+
+let folderUploadController = null;
 
 export function selectedFolder() {
   return $("folderInput")?.value.trim() || state.defaultFolder;
@@ -36,6 +44,15 @@ export function shouldExpandPlaylist() {
   return Boolean($("expandPlaylistCheck") && $("expandPlaylistCheck").checked);
 }
 
+function currentUploadOptions() {
+  return {
+    folder: selectedFolder(),
+    tags: selectedTags(),
+    forwardToTelegram: shouldForwardToTelegram(),
+    force: shouldForceIngest(),
+  };
+}
+
 async function submitUrlIngest(url, formatSpec) {
   await apiFetch("/api/ingest/url", {
     method: "POST",
@@ -55,22 +72,6 @@ async function submitUrlIngest(url, formatSpec) {
   await loadJobs();
 }
 
-function uploadFile(file) {
-  const form = new FormData();
-  form.append("file", file);
-  form.append("folder", selectedFolder());
-  if (selectedTags()) form.append("tags", selectedTags());
-  form.append("forward_to_telegram", shouldForwardToTelegram() ? "true" : "false");
-  form.append("force", shouldForceIngest() ? "true" : "false");
-
-  $("uploadProgress").style.display = "block";
-  return uploadWithProgress("/api/ingest/upload", form, ({ loaded, total, pct }) => {
-    $("uploadProgressBar").style.width = `${pct}%`;
-    $("uploadProgressText").textContent =
-      `Uploading ${file.name} → ${selectedFolder()}: ${pct}% (${fmtSize(loaded)} / ${fmtSize(total)})`;
-  });
-}
-
 function uploadFolderFiles(fileEntries, archiveName) {
   const form = new FormData();
   form.append("archive_name", archiveName || "folder_archive");
@@ -83,33 +84,34 @@ function uploadFolderFiles(fileEntries, archiveName) {
     form.append("relative_paths", entry.relativePath || entry.file.name);
   }
 
+  folderUploadController = new AbortController();
+  const cancelBtn = $("cancelFolderUploadBtn");
+  if (cancelBtn) {
+    cancelBtn.hidden = false;
+    cancelBtn.disabled = false;
+  }
   $("uploadProgress").style.display = "block";
-  return uploadWithProgress("/api/ingest/upload-folder", form, ({ loaded, total, pct }) => {
-    $("uploadProgressBar").style.width = `${pct}%`;
-    $("uploadProgressText").textContent =
-      `Uploading folder ${archiveName} (${fileEntries.length} files) → ${selectedFolder()}: ${pct}% (${fmtSize(loaded)} / ${fmtSize(total)})`;
-  });
+  return uploadWithProgress(
+    "/api/ingest/upload-folder",
+    form,
+    ({ loaded, total, pct }) => {
+      $("uploadProgressBar").style.width = `${pct}%`;
+      $("uploadProgressText").textContent =
+        `Uploading folder ${archiveName} (${fileEntries.length} files) → ${selectedFolder()}: ${pct}% (${fmtSize(loaded)} / ${fmtSize(total)})`;
+    },
+    { signal: folderUploadController.signal }
+  );
 }
 
 function finishUploadProgress() {
+  folderUploadController = null;
+  const cancelBtn = $("cancelFolderUploadBtn");
+  if (cancelBtn) {
+    cancelBtn.hidden = true;
+    cancelBtn.disabled = false;
+  }
   $("uploadProgress").style.display = "none";
   $("uploadProgressBar").style.width = "0%";
-}
-
-async function handleFiles(files) {
-  const list = Array.from(files || []);
-  if (!list.length) return;
-  for (const f of list) {
-    try {
-      await uploadFile(f);
-      loadJobs().catch(() => {});
-    } catch (err) {
-      toast(`Failed uploading ${f.name}: ${err.message}`, { type: "error" });
-    }
-  }
-  finishUploadProgress();
-  emit("media:changed", { source: "upload" });
-  loadJobs().catch(() => {});
 }
 
 async function handleFolderSelection(fileList) {
@@ -121,13 +123,21 @@ async function handleFolderSelection(fileList) {
     file: f,
     relativePath: f.webkitRelativePath || f.name,
   }));
+  let cancelled = false;
   try {
     await uploadFolderFiles(entries, archiveName);
   } catch (err) {
-    toast(`Failed uploading folder ${archiveName}: ${err.message}`, { type: "error" });
+    if (err?.name === "AbortError") {
+      cancelled = true;
+      toast(`Cancelled folder upload ${archiveName}.`, { type: "info" });
+    } else {
+      toast(`Failed uploading folder ${archiveName}: ${err.message}`, { type: "error" });
+    }
   }
   finishUploadProgress();
-  emit("media:changed", { source: "upload-folder" });
+  if (!cancelled) {
+    emit("media:changed", { source: "upload-folder" });
+  }
   loadJobs().catch(() => {});
 }
 
@@ -155,6 +165,8 @@ async function collectEntryFiles(entry, prefix = "") {
 }
 
 export function initUploader() {
+  initUploadQueue();
+
   $("urlInput")?.addEventListener("input", () => {
     const el = $("urlInput");
     const lines = el.value.split(/\r?\n/).length;
@@ -177,6 +189,21 @@ export function initUploader() {
     } catch (err) {
       toast(`Ingest failed: ${err.message}`, { type: "error" });
     }
+  });
+
+  $("inspectPlaylistBtn")?.addEventListener("click", () => {
+    const url = $("urlInput").value.split(/\r?\n/).map((s) => s.trim()).find(Boolean) || "";
+    if (!url) {
+      toast("Paste a playlist URL first.", { type: "error" });
+      return;
+    }
+    openPlaylistPicker(url, {
+      defaultFolder: selectedFolder(),
+      defaultTags: selectedTags(),
+      defaultFormat: $("formatSelect")?.value || "best",
+      forwardToTelegram: shouldForwardToTelegram(),
+      defaultForce: shouldForceIngest(),
+    });
   });
 
   $("closeFormatsBtn")?.addEventListener("click", () => $("formatsModal").close());
@@ -220,8 +247,8 @@ export function initUploader() {
           return `
             <div class="format-row">
               <div class="format-info">
-                <div><strong>${f.resolution}</strong> <span class="pill">${f.ext}</span> <span class="pill">${f.kind}</span></div>
-                <div class="format-sub">id: ${f.id} • ${codecTxt}${fpsTxt} • ${sizeTxt}${noteTxt}</div>
+                <div><strong>${escapeHtml(f.resolution || "")}</strong> <span class="pill">${escapeHtml(f.ext || "")}</span> <span class="pill">${escapeHtml(f.kind || "")}</span></div>
+                <div class="format-sub">id: ${escapeHtml(f.id || "")} • ${escapeHtml(codecTxt)}${escapeHtml(fpsTxt)} • ${escapeHtml(sizeTxt)}${escapeHtml(noteTxt)}</div>
               </div>
               <div class="toolbar-group format-actions">
                 <button type="button" class="secondary fmt-select-btn" data-idx="${idx}">Use</button>
@@ -268,11 +295,29 @@ export function initUploader() {
     }
   });
 
+  $("cancelFolderUploadBtn")?.addEventListener("click", () => {
+    const btn = $("cancelFolderUploadBtn");
+    if (btn) btn.disabled = true;
+    folderUploadController?.abort();
+  });
+
   const dz = $("dropzone");
   dz?.addEventListener("click", () => $("fileInput").click());
   $("selectFolderBtn")?.addEventListener("click", () => $("folderUploadInput").click());
-  $("fileInput")?.addEventListener("change", (e) => handleFiles(e.target.files));
-  $("folderUploadInput")?.addEventListener("change", (e) => handleFolderSelection(e.target.files));
+  $("fileInput")?.addEventListener("change", (e) => {
+    const files = Array.from(e.target.files || []);
+    e.target.value = "";
+    if (files.length) {
+      enqueueFiles(files, currentUploadOptions());
+    }
+  });
+  $("folderUploadInput")?.addEventListener("change", async (e) => {
+    const files = Array.from(e.target.files || []);
+    e.target.value = "";
+    if (files.length) {
+      await handleFolderSelection(files);
+    }
+  });
   dz?.addEventListener("dragover", (e) => {
     e.preventDefault();
     dz.classList.add("dragover");
@@ -287,35 +332,47 @@ export function initUploader() {
       const dirs = entries.filter((ent) => ent.isDirectory);
       const looseFiles = entries.filter((ent) => ent.isFile);
       if (dirs.length) {
+        let uploadedAny = false;
         for (const dir of dirs) {
           try {
             const dirFiles = await collectEntryFiles(dir, "");
             if (dirFiles.length) {
               await uploadFolderFiles(dirFiles, dir.name);
+              uploadedAny = true;
             }
           } catch (err) {
-            toast(`Failed uploading folder ${dir.name}: ${err.message}`, { type: "error" });
+            if (err?.name === "AbortError") {
+              toast(`Cancelled folder upload ${dir.name}.`, { type: "info" });
+            } else {
+              toast(`Failed uploading folder ${dir.name}: ${err.message}`, { type: "error" });
+            }
           }
         }
+        finishUploadProgress();
         if (looseFiles.length) {
           const resolvedFiles = await Promise.all(
             looseFiles.map((ent) => new Promise((resolve, reject) => ent.file(resolve, reject)))
           );
-          await handleFiles(resolvedFiles);
-        } else {
-          finishUploadProgress();
-          emit("media:changed", { source: "upload-drop" });
-          loadJobs().catch(() => {});
+          enqueueFiles(resolvedFiles, currentUploadOptions());
         }
+        if (uploadedAny) {
+          emit("media:changed", { source: "upload-drop" });
+        }
+        loadJobs().catch(() => {});
         return;
       }
     }
-    handleFiles(e.dataTransfer.files);
+    const dropped = Array.from(e.dataTransfer?.files || []);
+    if (dropped.length) {
+      enqueueFiles(dropped, currentUploadOptions());
+    }
   });
 
   on("pwa:shared-files", ({ files } = {}) => {
     if (files?.length) {
-      handleFiles(files);
+      enqueueFiles(files, currentUploadOptions());
     }
   });
+
+  void getActiveUploadCount;
 }

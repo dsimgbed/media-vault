@@ -324,7 +324,7 @@ export function initViewer() {
   window.addEventListener("popstate", handleLocationHash);
   window.addEventListener("hashchange", handleLocationHash);
 
-  on("media:open", ({ id }) => {
+  on("media:open", ({ id } = {}) => {
     if (id) {
       openViewer(id).catch((err) => toast(err.message, { type: "error" }));
     }

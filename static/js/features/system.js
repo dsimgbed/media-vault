@@ -21,6 +21,8 @@ export async function loadHealth() {
   state.storageMode = data.storage_mode || "telegram";
   state.defaultFolder = data.default_folder || "General";
   state.maxUploadMb = data.max_upload_mb || 20480;
+  state.uploadChunkSizeMb = Number(data.upload_chunk_size_mb || 8);
+  state.failedUploadRetentionSec = Number(data.failed_upload_retention_sec ?? 3600);
   state.telegramArchiveEnabled = Boolean(data.telegram_archive_enabled);
 
   const folderInput = $("folderInput");

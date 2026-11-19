@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import unquote, urlparse
@@ -586,6 +587,7 @@ class IngestService:
         self.db = db
         self.allocator = allocator
         self.mirror_hook: MirrorHook | None = None
+        self.upload_service: Any = None
         self._configured_concurrency = max(1, int(settings.ingest_concurrency))
         self._semaphore = asyncio.Semaphore(self._configured_concurrency)
         self._background_tasks: set[asyncio.Task[Any]] = set()
@@ -595,6 +597,77 @@ class IngestService:
         self._active_slots = 0
         self._staging_lock = threading.Lock()
         self._active_staging_dirs: set[Path] = set()
+
+    @staticmethod
+    def _parse_iso_utc(raw: str | None) -> datetime | None:
+        if not raw:
+            return None
+        s = str(raw).strip()
+        if not s:
+            return None
+        if s.endswith("Z"):
+            s = f"{s[:-1]}+00:00"
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    @staticmethod
+    def _parse_job_params(job: dict[str, Any]) -> dict[str, Any]:
+        try:
+            parsed = json.loads(job.get("params_json") or "{}")
+            return parsed if isinstance(parsed, dict) else {}
+        except (json.JSONDecodeError, TypeError):
+            return {}
+
+    def _resolve_inside_staging(self, path: Path | str) -> Path | None:
+        if self.upload_service is not None and hasattr(self.upload_service, "resolve_inside_staging"):
+            return self.upload_service.resolve_inside_staging(path)
+        try:
+            staging_root = self.settings.staging_dir.resolve()
+            candidate = Path(path)
+            if candidate.is_symlink():
+                return None
+            cur = candidate
+            while cur != cur.parent:
+                if cur.is_symlink():
+                    return None
+                try:
+                    if cur.resolve() == staging_root:
+                        break
+                except OSError:
+                    return None
+                cur = cur.parent
+            resolved = candidate.resolve()
+            if resolved == staging_root:
+                return None
+            if not resolved.is_relative_to(staging_root):
+                return None
+            return resolved
+        except (OSError, ValueError):
+            return None
+
+    def cleanup_job_staged_files(self, job: dict[str, Any]) -> bool:
+        params = self._parse_job_params(job)
+        staged_raw = job.get("staged_path") or params.get("staged_path")
+        if not staged_raw:
+            return False
+        staged_file = Path(str(staged_raw))
+        parent_resolved = self._resolve_inside_staging(staged_file.parent)
+        if parent_resolved is not None:
+            existed = parent_resolved.exists()
+            shutil.rmtree(parent_resolved, ignore_errors=True)
+            self.unregister_staging_dir(parent_resolved)
+            return existed
+        file_resolved = self._resolve_inside_staging(staged_file)
+        if file_resolved is not None:
+            existed = file_resolved.exists()
+            file_resolved.unlink(missing_ok=True)
+            return existed
+        return False
 
     def register_staging_dir(self, path: Path | str) -> None:
         resolved = Path(path).resolve()
@@ -608,7 +681,12 @@ class IngestService:
 
     def get_active_staging_dirs(self) -> set[Path]:
         with self._staging_lock:
-            return set(self._active_staging_dirs)
+            active = set(self._active_staging_dirs)
+        if self.upload_service is not None and hasattr(
+            self.upload_service, "get_protected_staging_dirs"
+        ):
+            active.update(self.upload_service.get_protected_staging_dirs())
+        return active
 
     def has_active_jobs(self) -> bool:
         with self._staging_lock:
@@ -633,12 +711,47 @@ class IngestService:
                 self._active_procs.pop(job_id, None)
 
     def recover_on_startup(self) -> dict[str, int]:
-        recovered_jobs = self.db.recover_interrupted_jobs()
+        if hasattr(self.db, "recover_interrupted_upload_sessions"):
+            self.db.recover_interrupted_upload_sessions()
+        recovered_jobs = self.db.recover_interrupted_jobs(
+            staged_retention_sec=int(self.settings.failed_upload_retention_sec)
+        )
+
+        protected: set[Path] = set()
+        if self.upload_service is not None:
+            now = datetime.now(timezone.utc)
+            if hasattr(self.db, "list_upload_sessions"):
+                for sess in self.db.list_upload_sessions(status="uploading", limit=10000):
+                    if self.upload_service._is_expired(sess, now=now):
+                        self.upload_service._cleanup_session_files(sess)
+                        self.db.update_upload_session(sess["id"], status="expired")
+            if hasattr(self.upload_service, "_cleanup_expired_failed_uploads_sync"):
+                self.upload_service._cleanup_expired_failed_uploads_sync()
+            if hasattr(self.upload_service, "get_protected_staging_dirs"):
+                protected = {
+                    p.resolve() for p in self.upload_service.get_protected_staging_dirs()
+                }
+
         cleaned_staging = 0
         staging = self.settings.staging_dir
         if staging.exists():
             for entry in staging.iterdir():
-                if entry.is_dir() and not entry.is_symlink():
+                if entry.is_symlink():
+                    entry.unlink(missing_ok=True)
+                    cleaned_staging += 1
+                    continue
+                try:
+                    entry_resolved = entry.resolve()
+                except OSError:
+                    entry_resolved = entry
+                if any(
+                    entry_resolved == p
+                    or p.is_relative_to(entry_resolved)
+                    or entry_resolved.is_relative_to(p)
+                    for p in protected
+                ):
+                    continue
+                if entry.is_dir():
                     shutil.rmtree(entry, ignore_errors=True)
                 else:
                     entry.unlink(missing_ok=True)
@@ -649,16 +762,80 @@ class IngestService:
             "cleaned_staging_entries": cleaned_staging,
         }
 
+    def is_job_retryable(self, job: dict[str, Any]) -> bool:
+        if job.get("status") not in ("failed", "cancelled"):
+            return False
+        params = self._parse_job_params(job)
+        is_url_job = (
+            job.get("source_kind") == "url"
+            or bool(params.get("url"))
+            or str(job.get("source_ref") or "").startswith(("http://", "https://"))
+        )
+        if is_url_job:
+            return True
+
+        staged_raw = job.get("staged_path") or params.get("staged_path")
+        if not staged_raw:
+            return False
+        staged_path = self._resolve_inside_staging(str(staged_raw))
+        if staged_path is None:
+            return False
+
+        raw_exp = job.get("staged_expires_at")
+        if raw_exp:
+            now = datetime.now(timezone.utc)
+            exp_dt = self._parse_iso_utc(raw_exp)
+            is_expired = (
+                exp_dt <= now
+                if exp_dt is not None
+                else bool(str(raw_exp) <= now.isoformat())
+            )
+            if is_expired:
+                return False
+
+        return staged_path.is_file()
+
+    def hydrate_job(self, job: dict[str, Any]) -> dict[str, Any]:
+        out = dict(job)
+        media_ids: list[str] = []
+        raw_ids = out.get("media_ids_json")
+        if raw_ids:
+            try:
+                parsed = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
+                if isinstance(parsed, list):
+                    media_ids = [str(x) for x in parsed]
+            except (json.JSONDecodeError, TypeError):
+                media_ids = []
+        out["media_ids"] = media_ids
+        out["retryable"] = self.is_job_retryable(job)
+        out.pop("staged_path", None)
+        raw_params = out.get("params_json")
+        if raw_params:
+            try:
+                parsed_params = (
+                    json.loads(raw_params) if isinstance(raw_params, str) else raw_params
+                )
+                if isinstance(parsed_params, dict) and "staged_path" in parsed_params:
+                    sanitized_params = dict(parsed_params)
+                    sanitized_params.pop("staged_path", None)
+                    out["params_json"] = json.dumps(sanitized_params)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return out
+
     def submit_job(self, job_id: str, coro: Awaitable[Any]) -> asyncio.Task[Any]:
         async def _runner() -> Any:
             try:
                 return await coro
             except asyncio.CancelledError:
-                job = self.db.get_job(job_id)
-                if job and job.get("status") not in ("done", "failed", "cancelled"):
-                    self.db.update_job(job_id, status="cancelled", message="Cancelled by user")
+                if self._job_tasks.get(job_id) is asyncio.current_task():
+                    job = self.db.get_job(job_id)
+                    if job and job.get("status") not in ("done", "failed", "cancelled"):
+                        self.db.update_job(job_id, status="cancelled", message="Cancelled by user")
                 raise
             except Exception as exc:
+                if self._job_tasks.get(job_id) is not asyncio.current_task():
+                    return None
                 if job_id in self._cancelled_jobs:
                     self.db.update_job(job_id, status="cancelled", message="Cancelled by user")
                     return None
@@ -705,10 +882,12 @@ class IngestService:
         if task and not task.done():
             task.cancel()
 
+        self.cleanup_job_staged_files(job)
+        self.db.clear_job_staged_metadata(job_id)
         self.db.update_job(job_id, status="cancelled", message="Cancelled by user")
         updated = self.db.get_job(job_id)
         assert updated is not None
-        return updated
+        return self.hydrate_job(updated)
 
     async def retry_job(self, job_id: str, *, force: bool = False) -> dict[str, Any]:
         job = self.db.get_job(job_id)
@@ -717,13 +896,7 @@ class IngestService:
         if job["status"] not in ("failed", "cancelled"):
             raise ValueError("Only failed or cancelled jobs can be retried")
 
-        try:
-            params = json.loads(job.get("params_json") or "{}")
-            if not isinstance(params, dict):
-                params = {}
-        except json.JSONDecodeError:
-            params = {}
-
+        params = self._parse_job_params(job)
         is_url_job = (
             job["source_kind"] == "url"
             or bool(params.get("url"))
@@ -731,14 +904,12 @@ class IngestService:
         )
         if is_url_job:
             url = str(params.get("url") or job["source_ref"])
-            self._cancelled_jobs.discard(job_id)
-            self.db.update_job(
-                job_id,
-                status="queued",
-                progress=0.0,
-                message="Queued (retry)",
-                media_ids_json="[]",
+            claimed = self.db.claim_job_for_retry(
+                job_id, progress=0.0, message="Queued (retry)"
             )
+            if not claimed:
+                raise ValueError("Job cannot be retried in its current state")
+            self._cancelled_jobs.discard(job_id)
             effective_force = bool(force or params.get("force", False))
             self.submit_job(
                 job_id,
@@ -756,38 +927,77 @@ class IngestService:
             )
             updated = self.db.get_job(job_id)
             assert updated is not None
-            return updated
+            return self.hydrate_job(updated)
 
-        staged_raw = params.get("staged_path")
-        staged_path = Path(staged_raw) if staged_raw else None
-        if staged_path and staged_path.is_file():
-            self._cancelled_jobs.discard(job_id)
-            self.db.update_job(
-                job_id,
-                status="queued",
-                progress=50.0,
-                message="Queued (retry)",
-                media_ids_json="[]",
-            )
-            effective_force = bool(force or params.get("force", False))
-            self.submit_job(
-                job_id,
-                self.process_staged_upload_job(
-                    job_id,
-                    staged_path,
-                    source_origin=str(params.get("source_origin") or job["source_origin"]),
-                    folder=params.get("folder"),
-                    tags=params.get("tags"),
-                    title=params.get("title"),
-                    forward_to_telegram=bool(params.get("forward_to_telegram", True)),
-                    force=effective_force,
-                ),
-            )
-            updated = self.db.get_job(job_id)
-            assert updated is not None
-            return updated
+        retention_lock = getattr(self.upload_service, "_retention_lock", None)
+        with retention_lock if retention_lock is not None else self._staging_lock:
+            fresh_job = self.db.get_job(job_id)
+            if not fresh_job:
+                raise KeyError("Job not found")
+            if fresh_job["status"] not in ("failed", "cancelled"):
+                raise ValueError("Only failed or cancelled jobs can be retried")
 
-        raise ValueError("Upload jobs cannot be retried after staging cleanup; please re-upload the file.")
+            params = self._parse_job_params(fresh_job)
+            staged_raw = fresh_job.get("staged_path") or params.get("staged_path")
+            if not staged_raw:
+                raise ValueError(
+                    "Upload jobs cannot be retried after staging cleanup; please re-upload the file."
+                )
+
+            staged_path = self._resolve_inside_staging(str(staged_raw))
+            if staged_path is None:
+                self.db.clear_job_staged_metadata(job_id)
+                raise ValueError(
+                    "Upload jobs cannot be retried after staging cleanup; please re-upload the file."
+                )
+
+            raw_exp = fresh_job.get("staged_expires_at")
+            if raw_exp:
+                now = datetime.now(timezone.utc)
+                exp_dt = self._parse_iso_utc(raw_exp)
+                is_expired = (
+                    exp_dt <= now
+                    if exp_dt is not None
+                    else bool(str(raw_exp) <= now.isoformat())
+                )
+                if is_expired:
+                    self.cleanup_job_staged_files(fresh_job)
+                    self.db.clear_job_staged_metadata(job_id)
+                    raise ValueError("Retained upload expired; please re-upload the file.")
+
+            if not staged_path.is_file():
+                self.db.clear_job_staged_metadata(job_id)
+                raise ValueError(
+                    "Upload jobs cannot be retried after staging cleanup; please re-upload the file."
+                )
+
+            claimed = self.db.claim_job_for_retry(
+                job_id, progress=50.0, message="Queued (retry)"
+            )
+            if not claimed:
+                raise ValueError("Job cannot be retried in its current state")
+
+            self.register_staging_dir(staged_path.parent)
+
+        self._cancelled_jobs.discard(job_id)
+        effective_force = bool(force or params.get("force", False))
+        self.submit_job(
+            job_id,
+            self.process_staged_upload_job(
+                job_id,
+                staged_path,
+                source_origin=str(params.get("source_origin") or fresh_job["source_origin"]),
+                folder=params.get("folder"),
+                tags=params.get("tags"),
+                title=params.get("title"),
+                forward_to_telegram=bool(params.get("forward_to_telegram", True)),
+                force=effective_force,
+                precomputed_sha256=params.get("precomputed_sha256"),
+            ),
+        )
+        updated = self.db.get_job(job_id)
+        assert updated is not None
+        return self.hydrate_job(updated)
 
     async def wait_for_jobs(self, timeout: float | None = None) -> None:
         if not self._background_tasks:
@@ -1123,11 +1333,14 @@ class IngestService:
                     shutil.rmtree(job_dir, ignore_errors=True)
                     self.unregister_staging_dir(job_dir)
         except asyncio.CancelledError:
-            job = self.db.get_job(job_id)
-            if job and job.get("status") != "cancelled":
-                self.db.update_job(job_id, status="cancelled", message="Cancelled by user")
+            if self._job_tasks.get(job_id) is asyncio.current_task():
+                job = self.db.get_job(job_id)
+                if job and job.get("status") != "cancelled":
+                    self.db.update_job(job_id, status="cancelled", message="Cancelled by user")
             raise
         except Exception as exc:
+            if self._job_tasks.get(job_id) is not asyncio.current_task():
+                raise
             if job_id in self._cancelled_jobs:
                 self.db.update_job(job_id, status="cancelled", message="Cancelled by user")
                 raise asyncio.CancelledError()
@@ -1135,7 +1348,8 @@ class IngestService:
             raise
         finally:
             self._active_slots = max(0, self._active_slots - 1)
-            self._active_procs.pop(job_id, None)
+            if self._job_tasks.get(job_id) is asyncio.current_task():
+                self._active_procs.pop(job_id, None)
 
     async def process_staged_upload_job(
         self,
@@ -1154,7 +1368,14 @@ class IngestService:
         job_dir = staged_file.parent
         self.register_staging_dir(job_dir)
         if job_id in self._cancelled_jobs:
-            self.db.update_job(job_id, status="cancelled", message="Cancelled by user")
+            self.db.update_job(
+                job_id,
+                status="cancelled",
+                message="Cancelled by user",
+                staged_path=None,
+                staged_expires_at=None,
+                staged_size_bytes=0,
+            )
             shutil.rmtree(job_dir, ignore_errors=True)
             self.unregister_staging_dir(job_dir)
             raise asyncio.CancelledError()
@@ -1165,6 +1386,7 @@ class IngestService:
             overall = 50.0 + (pct / 100.0) * 49.0
             self.db.update_job(job_id, status="allocating", progress=overall, message=msg)
 
+        retain_staging = False
         sem = self.semaphore
         self._active_slots += 1
         try:
@@ -1195,26 +1417,105 @@ class IngestService:
                     done_msg = f"Duplicate skipped (already in {item['folder']}: {item['filename']})"
                 else:
                     done_msg = f"Saved to {item['drive_name']}/{safe_folder}"
+                retain_staging = False
                 self.db.update_job(
                     job_id,
                     status="done",
                     progress=100.0,
                     message=done_msg,
                     media_ids_json=json.dumps([item["id"]]),
+                    staged_path=None,
+                    staged_expires_at=None,
+                    staged_size_bytes=0,
                 )
                 return item
         except asyncio.CancelledError:
+            retain_staging = False
             job = self.db.get_job(job_id)
             if job and job.get("status") != "cancelled":
-                self.db.update_job(job_id, status="cancelled", message="Cancelled by user")
+                self.db.update_job(
+                    job_id,
+                    status="cancelled",
+                    message="Cancelled by user",
+                    staged_path=None,
+                    staged_expires_at=None,
+                    staged_size_bytes=0,
+                )
+            else:
+                self.db.clear_job_staged_metadata(job_id)
             raise
         except Exception as exc:
             if job_id in self._cancelled_jobs:
-                self.db.update_job(job_id, status="cancelled", message="Cancelled by user")
+                retain_staging = False
+                self.db.update_job(
+                    job_id,
+                    status="cancelled",
+                    message="Cancelled by user",
+                    staged_path=None,
+                    staged_expires_at=None,
+                    staged_size_bytes=0,
+                )
                 raise asyncio.CancelledError()
-            self.db.update_job(job_id, status="failed", message=str(exc))
+
+            retention_sec = int(self.settings.failed_upload_retention_sec)
+            if staged_file.is_file() and retention_sec > 0:
+                file_size = int(staged_file.stat().st_size)
+                if self.upload_service is not None:
+                    allowed = self.upload_service.enforce_failed_upload_retention_budget(file_size)
+                else:
+                    allowed = (
+                        self.settings.failed_upload_max_retained_bytes <= 0
+                        or file_size <= self.settings.failed_upload_max_retained_bytes
+                    )
+                if allowed:
+                    expires_at = (
+                        datetime.now(timezone.utc) + timedelta(seconds=retention_sec)
+                    ).isoformat()
+                    resolved_staged = str(staged_file.resolve())
+                    updated_params: dict[str, Any] | None = None
+                    job_row = self.db.get_job(job_id)
+                    if job_row is not None:
+                        params = self._parse_job_params(job_row)
+                        changed = False
+                        if params.get("staged_path") != resolved_staged:
+                            params["staged_path"] = resolved_staged
+                            changed = True
+                        if precomputed_sha256 and not params.get("precomputed_sha256"):
+                            params["precomputed_sha256"] = precomputed_sha256.strip().lower()
+                            changed = True
+                        if changed:
+                            updated_params = params
+                    self.db.update_job(
+                        job_id,
+                        status="failed",
+                        message=str(exc),
+                        staged_path=resolved_staged,
+                        staged_expires_at=expires_at,
+                        staged_size_bytes=file_size,
+                        params=updated_params,
+                    )
+                    retain_staging = True
+                else:
+                    self.db.update_job(
+                        job_id,
+                        status="failed",
+                        message=str(exc),
+                        staged_path=None,
+                        staged_expires_at=None,
+                        staged_size_bytes=0,
+                    )
+            else:
+                self.db.update_job(
+                    job_id,
+                    status="failed",
+                    message=str(exc),
+                    staged_path=None,
+                    staged_expires_at=None,
+                    staged_size_bytes=0,
+                )
             raise
         finally:
             self._active_slots = max(0, self._active_slots - 1)
-            shutil.rmtree(job_dir, ignore_errors=True)
             self.unregister_staging_dir(job_dir)
+            if not retain_staging:
+                shutil.rmtree(job_dir, ignore_errors=True)

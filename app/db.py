@@ -8,7 +8,7 @@ import sqlite3
 import threading
 import uuid
 from collections.abc import Iterator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -33,6 +33,9 @@ _TRACKING_QUERY_PARAMS = {
     "t",
 }
 _YOUTUBE_PLAYLIST_PARAMS = {"list", "index", "start_radio", "rv"}
+_UNSET = object()
+_ACTIVE_JOB_STATUSES = ("queued", "downloading", "allocating")
+_TERMINAL_JOB_STATUSES = ("done", "failed", "cancelled")
 
 
 def normalize_source_url(url: str | None) -> str | None:
@@ -280,11 +283,40 @@ class Database:
                     message TEXT,
                     media_ids_json TEXT,
                     params_json TEXT,
+                    staged_path TEXT,
+                    staged_expires_at TEXT,
+                    staged_size_bytes INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON ingest_jobs(created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS upload_sessions (
+                    id TEXT PRIMARY KEY,
+                    filename TEXT NOT NULL,
+                    title TEXT,
+                    folder TEXT,
+                    tags TEXT NOT NULL DEFAULT '',
+                    forward_to_telegram INTEGER NOT NULL DEFAULT 1,
+                    force INTEGER NOT NULL DEFAULT 0,
+                    total_size INTEGER NOT NULL,
+                    chunk_size INTEGER NOT NULL,
+                    total_chunks INTEGER NOT NULL,
+                    received_chunks_json TEXT NOT NULL DEFAULT '[]',
+                    received_bytes INTEGER NOT NULL DEFAULT 0,
+                    expected_sha256 TEXT,
+                    fingerprint TEXT,
+                    staging_dir TEXT NOT NULL,
+                    staging_file TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'uploading',
+                    job_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_upload_sessions_status ON upload_sessions(status);
+                CREATE INDEX IF NOT EXISTS idx_upload_sessions_expires_at ON upload_sessions(expires_at);
 
                 CREATE TABLE IF NOT EXISTS folder_topics (
                     chat_id TEXT NOT NULL,
@@ -367,6 +399,7 @@ class Database:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_media_folder ON media_items(folder)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_media_sha256 ON media_items(sha256)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_media_norm_url ON media_items(normalized_source_url)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_media_size_bytes ON media_items(size_bytes)")
 
             url_rows = conn.execute(
                 "SELECT id, source_url FROM media_items WHERE source_url IS NOT NULL AND source_url != '' AND normalized_source_url IS NULL"
@@ -382,6 +415,14 @@ class Database:
                 conn.execute("ALTER TABLE ingest_jobs ADD COLUMN progress REAL NOT NULL DEFAULT 0")
             if "params_json" not in job_cols:
                 conn.execute("ALTER TABLE ingest_jobs ADD COLUMN params_json TEXT")
+            if "staged_path" not in job_cols:
+                conn.execute("ALTER TABLE ingest_jobs ADD COLUMN staged_path TEXT")
+            if "staged_expires_at" not in job_cols:
+                conn.execute("ALTER TABLE ingest_jobs ADD COLUMN staged_expires_at TEXT")
+            if "staged_size_bytes" not in job_cols:
+                conn.execute("ALTER TABLE ingest_jobs ADD COLUMN staged_size_bytes INTEGER NOT NULL DEFAULT 0")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON ingest_jobs(status, created_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_staged_expires ON ingest_jobs(staged_expires_at)")
 
             # Backfill media_tags for legacy DBs
             tag_rows = conn.execute(
@@ -438,50 +479,285 @@ class Database:
         message: str = "",
         progress: float | None = None,
         media_ids_json: str | None = None,
+        staged_path: Any = _UNSET,
+        staged_expires_at: Any = _UNSET,
+        staged_size_bytes: Any = _UNSET,
+        params: dict[str, Any] | None = None,
     ) -> None:
         now = utc_now_iso()
         if progress is None and status == "done":
             progress = 100.0
         with self._connect() as conn:
             sets = ["status = ?", "message = ?", "updated_at = ?"]
-            params: list[Any] = [status, message, now]
+            sql_params: list[Any] = [status, message, now]
             if progress is not None:
                 clamped = max(0.0, min(100.0, float(progress)))
                 sets.append("progress = ?")
-                params.append(clamped)
+                sql_params.append(clamped)
             if media_ids_json is not None:
                 sets.append("media_ids_json = ?")
-                params.append(media_ids_json)
-            params.append(job_id)
+                sql_params.append(media_ids_json)
+            if staged_path is not _UNSET:
+                sets.append("staged_path = ?")
+                sql_params.append(staged_path)
+            if staged_expires_at is not _UNSET:
+                sets.append("staged_expires_at = ?")
+                sql_params.append(staged_expires_at)
+            if staged_size_bytes is not _UNSET:
+                sets.append("staged_size_bytes = ?")
+                sql_params.append(max(0, int(staged_size_bytes or 0)))
+            if params is not None:
+                sets.append("params_json = ?")
+                sql_params.append(json.dumps(params))
+            sql_params.append(job_id)
             conn.execute(
                 f"UPDATE ingest_jobs SET {', '.join(sets)} WHERE id = ?",
-                params,
+                sql_params,
             )
         self.publish({"type": "job_update", "job_id": job_id, "status": status})
+
+    def claim_job_for_retry(
+        self, job_id: str, *, progress: float, message: str
+    ) -> dict[str, Any] | None:
+        now = utc_now_iso()
+        clamped = max(0.0, min(100.0, float(progress)))
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE ingest_jobs
+                SET status = 'queued', progress = ?, message = ?, media_ids_json = '[]',
+                    staged_expires_at = NULL, updated_at = ?
+                WHERE id = ? AND status IN ('failed', 'cancelled')
+                """,
+                (clamped, message, now, job_id),
+            )
+            if int(cur.rowcount or 0) != 1:
+                return None
+            row = conn.execute("SELECT * FROM ingest_jobs WHERE id = ?", (job_id,)).fetchone()
+            if not row:
+                return None
+            result = dict(row)
+        self.publish({"type": "job_update", "job_id": job_id, "status": "queued"})
+        return result
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM ingest_jobs WHERE id = ?", (job_id,)).fetchone()
             return dict(row) if row else None
 
-    def list_jobs(self, limit: int = 30) -> list[dict[str, Any]]:
+    @staticmethod
+    def _build_job_status_filter(status: str | None) -> tuple[str, list[Any]]:
+        if not status or status == "all":
+            return "", []
+        if status == "active":
+            return "WHERE status IN ('queued', 'downloading', 'allocating')", []
+        return "WHERE status = ?", [status]
+
+    def list_jobs(
+        self,
+        limit: int = 30,
+        *,
+        offset: int = 0,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        where_sql, sql_params = self._build_job_status_filter(status)
+        safe_limit = max(1, int(limit))
+        safe_offset = max(0, int(offset))
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM ingest_jobs ORDER BY created_at DESC LIMIT ?",
-                (limit,),
+                f"SELECT * FROM ingest_jobs {where_sql} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                [*sql_params, safe_limit, safe_offset],
             ).fetchall()
             return [dict(r) for r in rows]
 
-    def recover_interrupted_jobs(self, message: str = "Interrupted by server restart") -> int:
+    def list_jobs_for_strip(self, limit: int = 20) -> list[dict[str, Any]]:
+        safe_limit = max(1, int(limit))
+        with self._connect() as conn:
+            active_rows = conn.execute(
+                """
+                SELECT * FROM ingest_jobs
+                WHERE status IN ('queued', 'downloading', 'allocating')
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
+            remaining = max(0, safe_limit - len(active_rows))
+            finished_rows: list[sqlite3.Row] = []
+            if remaining > 0:
+                finished_rows = conn.execute(
+                    """
+                    SELECT * FROM ingest_jobs
+                    WHERE status NOT IN ('queued', 'downloading', 'allocating')
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (remaining,),
+                ).fetchall()
+            return [dict(r) for r in active_rows] + [dict(r) for r in finished_rows]
+
+    def count_jobs(self, *, status: str | None = None) -> int:
+        where_sql, sql_params = self._build_job_status_filter(status)
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM ingest_jobs {where_sql}",
+                sql_params,
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+    def get_job_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {
+            "all": 0,
+            "active": 0,
+            "done": 0,
+            "failed": 0,
+            "cancelled": 0,
+        }
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) AS cnt FROM ingest_jobs GROUP BY status"
+            ).fetchall()
+        for r in rows:
+            st = str(r["status"])
+            cnt = int(r["cnt"])
+            counts["all"] += cnt
+            if st in _ACTIVE_JOB_STATUSES:
+                counts["active"] += cnt
+            elif st in counts:
+                counts[st] += cnt
+        return counts
+
+    def clear_jobs(self, statuses: list[str]) -> list[dict[str, Any]]:
+        target_statuses = [
+            s for s in dict.fromkeys(str(x).strip() for x in statuses)
+            if s in _TERMINAL_JOB_STATUSES
+        ]
+        if not target_statuses:
+            return []
+        placeholders = ",".join("?" for _ in target_statuses)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM ingest_jobs WHERE status IN ({placeholders})",
+                target_statuses,
+            ).fetchall()
+            if not rows:
+                return []
+            conn.execute(
+                f"DELETE FROM ingest_jobs WHERE status IN ({placeholders})",
+                target_statuses,
+            )
+            deleted = [dict(r) for r in rows]
+        self.publish({"type": "job_update", "job_id": "*", "status": "cleared"})
+        return deleted
+
+    def list_retained_staged_jobs(self, *, include_expired: bool = True) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            if include_expired:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM ingest_jobs
+                    WHERE staged_path IS NOT NULL AND staged_path != ''
+                    ORDER BY staged_expires_at ASC, created_at ASC
+                    """
+                ).fetchall()
+            else:
+                now = utc_now_iso()
+                rows = conn.execute(
+                    """
+                    SELECT * FROM ingest_jobs
+                    WHERE staged_path IS NOT NULL AND staged_path != ''
+                      AND (staged_expires_at IS NULL OR staged_expires_at > ?)
+                    ORDER BY staged_expires_at ASC, created_at ASC
+                    """,
+                    (now,),
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+    def clear_job_staged_metadata(self, job_id: str) -> None:
         now = utc_now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE ingest_jobs
+                SET staged_path = NULL, staged_expires_at = NULL, staged_size_bytes = 0, updated_at = ?
+                WHERE id = ?
+                """,
+                (now, job_id),
+            )
+
+    def claim_staged_job_for_cleanup(
+        self,
+        job_id: str,
+        *,
+        allowed_statuses: tuple[str, ...] = ("failed", "cancelled", "done"),
+        require_expired_before: str | None = None,
+    ) -> dict[str, Any] | None:
+        if not allowed_statuses:
+            return None
+        now = utc_now_iso()
+        placeholders = ",".join("?" for _ in allowed_statuses)
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM ingest_jobs WHERE id = ?", (job_id,)).fetchone()
+            if not row:
+                return None
+            job = dict(row)
+            status = str(job.get("status") or "")
+            staged_path = job.get("staged_path")
+            if status not in allowed_statuses or not staged_path:
+                return None
+            if require_expired_before is not None and status != "done":
+                exp = job.get("staged_expires_at")
+                if not exp or str(exp) > require_expired_before:
+                    return None
+            where_clauses = [
+                "id = ?",
+                f"status IN ({placeholders})",
+                "staged_path IS NOT NULL AND staged_path != ''",
+            ]
+            params: list[Any] = [now, job_id, *allowed_statuses]
+            if require_expired_before is not None:
+                where_clauses.append(
+                    "(status = 'done' OR (staged_expires_at IS NOT NULL AND staged_expires_at <= ?))"
+                )
+                params.append(require_expired_before)
+            cur = conn.execute(
+                f"""
+                UPDATE ingest_jobs
+                SET staged_path = NULL, staged_expires_at = NULL, staged_size_bytes = 0, updated_at = ?
+                WHERE {' AND '.join(where_clauses)}
+                """,
+                params,
+            )
+            if int(cur.rowcount or 0) != 1:
+                return None
+            return job
+
+    def recover_interrupted_jobs(
+        self,
+        message: str = "Interrupted by server restart",
+        *,
+        staged_retention_sec: int = 3600,
+    ) -> int:
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        exp_iso = (
+            (now_dt + timedelta(seconds=int(staged_retention_sec))).isoformat()
+            if int(staged_retention_sec) > 0
+            else now
+        )
         with self._connect() as conn:
             cur = conn.execute(
                 """
                 UPDATE ingest_jobs
-                SET status = 'failed', message = ?, updated_at = ?
+                SET status = 'failed',
+                    message = ?,
+                    staged_expires_at = CASE
+                        WHEN staged_path IS NOT NULL AND staged_path != '' AND staged_expires_at IS NULL
+                        THEN ?
+                        ELSE staged_expires_at
+                    END,
+                    updated_at = ?
                 WHERE status IN ('queued', 'downloading', 'allocating')
                 """,
-                (message, now),
+                (message, exp_iso, now),
             )
             count = int(cur.rowcount or 0)
         if count > 0:
@@ -652,6 +928,85 @@ class Database:
             item = self._hydrate_media(row)
             item["parts"] = self._resolve_parts_for_item(conn, item)
             return item
+
+    def count_media_by_size(self, size_bytes: int) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM media_items WHERE size_bytes = ?",
+                (int(size_bytes),),
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+    def find_media_by_source_urls(self, urls: list[str]) -> dict[str, dict[str, Any]]:
+        raw_inputs: list[str] = []
+        raw_set: set[str] = set()
+        norm_set: set[str] = set()
+        norm_by_raw: dict[str, str] = {}
+        for u in urls:
+            raw = (u or "").strip()
+            if not raw:
+                continue
+            if raw not in raw_set:
+                raw_set.add(raw)
+                raw_inputs.append(raw)
+            norm = normalize_source_url(raw) or raw
+            norm_by_raw[raw] = norm
+            norm_set.add(norm)
+
+        if not raw_set and not norm_set:
+            return {}
+
+        norm_list = sorted(norm_set)
+        raw_list = sorted(raw_set)
+        batch_size = 200
+
+        result: dict[str, dict[str, Any]] = {}
+        with self._connect() as conn:
+            matched_rows: list[sqlite3.Row] = []
+            seen_ids: set[str] = set()
+            for i in range(0, len(norm_list), batch_size):
+                chunk = norm_list[i : i + batch_size]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"SELECT * FROM media_items WHERE normalized_source_url IN ({placeholders}) ORDER BY created_at DESC",
+                    chunk,
+                ).fetchall()
+                for row in rows:
+                    mid = str(row["id"])
+                    if mid not in seen_ids:
+                        seen_ids.add(mid)
+                        matched_rows.append(row)
+            for i in range(0, len(raw_list), batch_size):
+                chunk = raw_list[i : i + batch_size]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"SELECT * FROM media_items WHERE source_url IN ({placeholders}) ORDER BY created_at DESC",
+                    chunk,
+                ).fetchall()
+                for row in rows:
+                    mid = str(row["id"])
+                    if mid not in seen_ids:
+                        seen_ids.add(mid)
+                        matched_rows.append(row)
+
+            matched_rows.sort(key=lambda r: str(r["created_at"] or ""), reverse=True)
+            for row in matched_rows:
+                item = self._hydrate_media(row)
+                item["parts"] = self._resolve_parts_for_item(conn, item)
+                norm_val = item.get("normalized_source_url")
+                raw_val = item.get("source_url")
+                if norm_val and norm_val not in result:
+                    result[norm_val] = item
+                if raw_val and raw_val not in result:
+                    result[raw_val] = item
+
+        for raw in raw_inputs:
+            if raw in result:
+                continue
+            norm = norm_by_raw.get(raw)
+            if norm and norm in result:
+                result[raw] = result[norm]
+        return result
 
     def update_media_topic(self, media_id: str, topic_id: int) -> None:
         with self._connect() as conn:
@@ -1427,6 +1782,283 @@ class Database:
                     message = 'Interrupted by server restart',
                     updated_at = ?
                 WHERE status = 'running'
+                """,
+                (now,),
+            )
+            return int(cur.rowcount or 0)
+
+    @staticmethod
+    def _parse_received_chunks(raw_json: Any, total_chunks: int) -> list[int]:
+        if not raw_json:
+            return []
+        try:
+            parsed = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+        except (json.JSONDecodeError, TypeError):
+            return []
+        if not isinstance(parsed, list):
+            return []
+        valid: set[int] = set()
+        for item in parsed:
+            try:
+                idx = int(item)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx < total_chunks:
+                valid.add(idx)
+        return sorted(valid)
+
+    @staticmethod
+    def _compute_received_bytes(
+        received_chunks: set[int] | list[int],
+        total_size: int,
+        chunk_size: int,
+        total_chunks: int,
+    ) -> int:
+        if total_size <= 0 or total_chunks <= 0 or chunk_size <= 0:
+            return 0
+        total = 0
+        for idx in received_chunks:
+            if 0 <= idx < total_chunks:
+                start = idx * chunk_size
+                end = min(total_size, start + chunk_size)
+                if end > start:
+                    total += end - start
+        return total
+
+    @classmethod
+    def _hydrate_upload_session(cls, row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        item = dict(row)
+        total_chunks = max(0, int(item.get("total_chunks") or 0))
+        received_chunks = cls._parse_received_chunks(
+            item.get("received_chunks_json"), total_chunks
+        )
+        received_set = set(received_chunks)
+        missing_chunks = [i for i in range(total_chunks) if i not in received_set]
+        item["total_size"] = int(item.get("total_size") or 0)
+        item["chunk_size"] = int(item.get("chunk_size") or 0)
+        item["total_chunks"] = total_chunks
+        item["received_chunks"] = received_chunks
+        item["missing_chunks"] = missing_chunks
+        item["received_bytes"] = int(item.get("received_bytes") or 0)
+        item["tags"] = normalize_tags(item.get("tags") or "")
+        item["forward_to_telegram"] = bool(item.get("forward_to_telegram"))
+        item["force"] = bool(item.get("force"))
+        return item
+
+    def create_upload_session(
+        self,
+        *,
+        session_id: str | None = None,
+        filename: str,
+        title: str | None = None,
+        folder: str | None = None,
+        tags: str | list[str] | None = None,
+        forward_to_telegram: bool = True,
+        force: bool = False,
+        total_size: int,
+        chunk_size: int,
+        total_chunks: int,
+        expected_sha256: str | None = None,
+        fingerprint: str | None = None,
+        staging_dir: str,
+        staging_file: str,
+        expires_at: str,
+        status: str = "uploading",
+    ) -> dict[str, Any]:
+        sid = session_id or uuid.uuid4().hex[:16]
+        now = utc_now_iso()
+        norm_tags = ",".join(normalize_tags(tags))
+        clean_sha = expected_sha256.strip().lower() if expected_sha256 else None
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO upload_sessions (
+                    id, filename, title, folder, tags, forward_to_telegram, force,
+                    total_size, chunk_size, total_chunks, received_chunks_json, received_bytes,
+                    expected_sha256, fingerprint, staging_dir, staging_file, status, job_id,
+                    created_at, updated_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', 0, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+                """,
+                (
+                    sid,
+                    filename,
+                    title,
+                    folder,
+                    norm_tags,
+                    1 if forward_to_telegram else 0,
+                    1 if force else 0,
+                    int(total_size),
+                    int(chunk_size),
+                    int(total_chunks),
+                    clean_sha,
+                    fingerprint,
+                    staging_dir,
+                    staging_file,
+                    status,
+                    now,
+                    now,
+                    expires_at,
+                ),
+            )
+            row = conn.execute("SELECT * FROM upload_sessions WHERE id = ?", (sid,)).fetchone()
+            assert row is not None
+            return self._hydrate_upload_session(row)
+
+    def get_upload_session(self, session_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM upload_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            return self._hydrate_upload_session(row) if row else None
+
+    def list_upload_sessions(
+        self, status: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        safe_limit = max(1, int(limit))
+        with self._connect() as conn:
+            if status and status != "all":
+                rows = conn.execute(
+                    "SELECT * FROM upload_sessions WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+                    (status, safe_limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM upload_sessions ORDER BY created_at DESC LIMIT ?",
+                    (safe_limit,),
+                ).fetchall()
+            return [self._hydrate_upload_session(r) for r in rows]
+
+    def update_upload_session(
+        self, session_id: str, **fields: Any
+    ) -> dict[str, Any] | None:
+        allowed = {
+            "filename",
+            "title",
+            "folder",
+            "tags",
+            "forward_to_telegram",
+            "force",
+            "expected_sha256",
+            "fingerprint",
+            "received_chunks_json",
+            "received_bytes",
+            "status",
+            "job_id",
+            "expires_at",
+            "updated_at",
+        }
+        updates: dict[str, Any] = {}
+        for k, v in fields.items():
+            if k == "received_chunks" and isinstance(v, (list, set, tuple)):
+                updates["received_chunks_json"] = json.dumps(sorted({int(x) for x in v}))
+                continue
+            if k not in allowed:
+                continue
+            if k == "tags":
+                updates["tags"] = ",".join(normalize_tags(v))
+            elif k in ("forward_to_telegram", "force"):
+                updates[k] = 1 if v else 0
+            elif k == "expected_sha256":
+                updates[k] = v.strip().lower() if isinstance(v, str) and v.strip() else None
+            else:
+                updates[k] = v
+
+        if "updated_at" not in updates:
+            updates["updated_at"] = utc_now_iso()
+
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT id FROM upload_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if not existing:
+                return None
+            sets = [f"{col} = ?" for col in updates]
+            sql_params = list(updates.values()) + [session_id]
+            conn.execute(
+                f"UPDATE upload_sessions SET {', '.join(sets)} WHERE id = ?",
+                sql_params,
+            )
+            row = conn.execute(
+                "SELECT * FROM upload_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            return self._hydrate_upload_session(row) if row else None
+
+    def mark_upload_chunk_received(
+        self,
+        session_id: str,
+        chunk_index: int,
+        chunk_bytes: int,
+        expires_at: str,
+    ) -> dict[str, Any] | None:
+        now = utc_now_iso()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM upload_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if not row:
+                return None
+            total_size = int(row["total_size"])
+            chunk_size = int(row["chunk_size"])
+            total_chunks = int(row["total_chunks"])
+            received_set = set(
+                self._parse_received_chunks(row["received_chunks_json"], total_chunks)
+            )
+            if 0 <= chunk_index < total_chunks:
+                received_set.add(int(chunk_index))
+            sorted_chunks = sorted(received_set)
+            received_bytes = self._compute_received_bytes(
+                received_set, total_size, chunk_size, total_chunks
+            )
+            conn.execute(
+                """
+                UPDATE upload_sessions
+                SET received_chunks_json = ?,
+                    received_bytes = ?,
+                    updated_at = ?,
+                    expires_at = ?
+                WHERE id = ?
+                """,
+                (json.dumps(sorted_chunks), received_bytes, now, expires_at, session_id),
+            )
+            updated_row = conn.execute(
+                "SELECT * FROM upload_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            return self._hydrate_upload_session(updated_row) if updated_row else None
+
+    def count_active_upload_sessions(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM upload_sessions WHERE status IN ('uploading', 'completing')"
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+    def sum_active_upload_reserved_bytes(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(total_size), 0) FROM upload_sessions WHERE status IN ('uploading', 'completing')"
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+    def list_expired_upload_sessions(self, now_iso: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM upload_sessions
+                WHERE status = 'uploading' AND expires_at <= ?
+                ORDER BY expires_at ASC
+                """,
+                (now_iso,),
+            ).fetchall()
+            return [self._hydrate_upload_session(r) for r in rows]
+
+    def recover_interrupted_upload_sessions(self) -> int:
+        now = utc_now_iso()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE upload_sessions
+                SET status = 'uploading', updated_at = ?
+                WHERE status = 'completing'
                 """,
                 (now,),
             )

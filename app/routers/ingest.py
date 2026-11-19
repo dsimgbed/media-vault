@@ -27,11 +27,39 @@ async def check_duplicate(
     ctx: AppContext = Depends(get_ctx),
 ):
     existing: dict[str, Any] | None = None
+    match_type: str | None = None
     if payload.sha256:
         existing = ctx.db.find_media_by_sha256(payload.sha256)
+        if existing:
+            match_type = "sha256"
     if not existing and payload.url:
         existing = ctx.db.find_media_by_source_url(payload.url)
-    return {"duplicate": existing is not None, "item": existing}
+        if existing:
+            match_type = "url"
+
+    response: dict[str, Any] = {
+        "duplicate": existing is not None,
+        "item": existing,
+        "match_type": match_type,
+    }
+
+    if payload.urls:
+        matches_by_url = ctx.db.find_media_by_source_urls(payload.urls)
+        url_matches: dict[str, dict[str, Any]] = {}
+        for u in payload.urls:
+            m = matches_by_url.get(u.strip())
+            url_matches[u] = {
+                "duplicate": m is not None,
+                "item": m,
+            }
+        response["url_matches"] = url_matches
+
+    if payload.size_bytes is not None and not payload.sha256 and not payload.url:
+        count = ctx.db.count_media_by_size(payload.size_bytes)
+        response["size_match_count"] = count
+        response["needs_hash_verification"] = count > 0
+
+    return response
 
 
 @router.post("/api/ingest/url", status_code=202, dependencies=[Depends(require_auth)])
@@ -144,7 +172,13 @@ async def ingest_upload(
     ctx: AppContext = Depends(get_ctx),
 ):
     cfg = ctx.settings
-    raw_name = Path(file.filename or "upload.bin").name
+    cleaned_raw = "".join(
+        ch for ch in (file.filename or "upload.bin") if ord(ch) >= 32 and ord(ch) != 127
+    ).strip()
+    parts = [seg for seg in cleaned_raw.replace("\\", "/").split("/") if seg]
+    raw_name = parts[-1] if parts else "upload.bin"
+    if raw_name in (".", "..") or not raw_name:
+        raise HTTPException(status_code=400, detail="Invalid upload filename")
     resolved_title = title or Path(raw_name).stem
     job_id = ctx.db.create_job(
         "web",
@@ -181,11 +215,25 @@ async def ingest_upload(
                 hasher.update(chunk)
                 await asyncio.to_thread(out.write, chunk)
 
+        sha256_hex = hasher.hexdigest()
+        resolved_staged = str(staged_path.resolve())
         ctx.db.update_job(
             job_id,
             status="queued",
             progress=50.0,
             message=f"Staged {raw_name}, queued for processing...",
+            staged_path=resolved_staged,
+            staged_size_bytes=written,
+            params={
+                "folder": folder,
+                "tags": tags,
+                "title": resolved_title,
+                "forward_to_telegram": forward_to_telegram,
+                "force": force,
+                "source_origin": "web",
+                "staged_path": resolved_staged,
+                "precomputed_sha256": sha256_hex,
+            },
         )
         ctx.ingest.submit_job(
             job_id,
@@ -198,7 +246,7 @@ async def ingest_upload(
                 title=resolved_title,
                 forward_to_telegram=forward_to_telegram,
                 force=force,
-                precomputed_sha256=hasher.hexdigest(),
+                precomputed_sha256=sha256_hex,
             ),
         )
         return {"job_id": job_id, "status": "queued"}
@@ -306,17 +354,30 @@ async def ingest_upload_folder(
                             )
                         await asyncio.to_thread(z_entry.write, chunk)
 
-        if zip_path.stat().st_size > cfg.max_upload_bytes:
+        zip_size = int(zip_path.stat().st_size)
+        if zip_size > cfg.max_upload_bytes:
             raise HTTPException(
                 status_code=413,
                 detail=f"Folder archive exceeds {cfg.max_upload_mb} MB limit.",
             )
 
+        resolved_zip = str(zip_path.resolve())
         ctx.db.update_job(
             job_id,
             status="queued",
             progress=50.0,
             message=f"Staged {zip_filename}, queued for processing...",
+            staged_path=resolved_zip,
+            staged_size_bytes=zip_size,
+            params={
+                "folder": folder,
+                "tags": tags,
+                "title": folder_title,
+                "forward_to_telegram": forward_to_telegram,
+                "force": force,
+                "source_origin": "web",
+                "staged_path": resolved_zip,
+            },
         )
         ctx.ingest.submit_job(
             job_id,

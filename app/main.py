@@ -22,8 +22,10 @@ from app.routers import maintenance as maintenance_router
 from app.routers import media as media_router
 from app.routers import pwa as pwa_router
 from app.routers import system as system_router
+from app.routers import uploads as uploads_router
 from app.routers import zip_explorer as zip_explorer_router
 from app.telegram_mtproto import TelegramPool
+from app.uploads import UploadSessionService
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,6 +53,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     db = Database(cfg.db_path)
     allocator = DriveAllocator(cfg)
     ingest = IngestService(cfg, db, allocator)
+    uploads = UploadSessionService(cfg, db, ingest)
+    ingest.upload_service = uploads
     tg_pool = TelegramPool(cfg, db, allocator, ingest)
     backup = BackupService(cfg, db, tg_pool)
     integrity = IntegrityService(cfg, db, ingest, tg_pool)
@@ -64,6 +68,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         zip_cache=zip_cache,
         backup=backup,
         integrity=integrity,
+        uploads=uploads,
     )
     ingest.recover_on_startup()
     db.recover_interrupted_maintenance_runs()
@@ -74,11 +79,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         db.recover_interrupted_maintenance_runs()
         await tg_pool.start()
         backup.start_scheduler()
+        uploads.start_gc()
         try:
             yield
         finally:
             await backup.stop_scheduler()
             await integrity.shutdown()
+            await uploads.stop_gc()
             await ingest.shutdown()
             await tg_pool.stop()
             db.close()
@@ -93,11 +100,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.zip_cache = zip_cache
     app.state.backup = backup
     app.state.integrity = integrity
+    app.state.uploads = uploads
 
     app.include_router(system_router.router)
     app.include_router(maintenance_router.router)
     app.include_router(jobs_router.router)
     app.include_router(ingest_router.router)
+    app.include_router(uploads_router.router)
     app.include_router(media_router.router)
     app.include_router(zip_explorer_router.router)
 

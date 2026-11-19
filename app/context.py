@@ -23,3 +23,4 @@ class AppContext:
     zip_cache: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     backup: Any = None
     integrity: Any = None
+    uploads: Any = None
