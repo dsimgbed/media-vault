@@ -132,7 +132,7 @@ def test_prepare_stream_falls_back_across_workers_and_aligns_range(tmp_path: Pat
     assert media == b"media-obj"
     assert calls == ["bot1", "bot2"]
 
-    # Range starting at unaligned offset 5000 aligns GetFileRequest down to 4096 and trims cleanly
+    # Range starting at unaligned offset 5000 aligns to canonical block boundary (0) when block cache is enabled
     async def _collect():
         out = bytearray()
         async for chunk in pool.iter_telegram_range(c2, media, 5000, 5099):
@@ -140,9 +140,17 @@ def test_prepare_stream_falls_back_across_workers_and_aligns_range(tmp_path: Pat
         return bytes(out)
 
     got = asyncio.run(_collect())
-    assert c2.seen_offsets == [4096]
+    assert c2.seen_offsets == [0]
     expected = bytes(i % 256 for i in range(5000, 5100))
     assert got == expected
+
+    # When block cache is disabled, pass-through aligns GetFileRequest down to 4096 and trims cleanly
+    c2.seen_offsets.clear()
+    settings.telegram_stream_cache_mb = 0
+    settings.telegram_disk_cache_mb = 0
+    got_direct = asyncio.run(_collect())
+    assert c2.seen_offsets == [4096]
+    assert got_direct == expected
 
 
 def test_ensure_topic_id_uses_bot_api_and_caches(tmp_path: Path, monkeypatch):

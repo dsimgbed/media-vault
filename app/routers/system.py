@@ -69,6 +69,11 @@ async def system_status(ctx: AppContext = Depends(get_ctx)):
         },
         "integrity": ctx.integrity.get_status() if ctx.integrity else {},
         "uploads": ctx.uploads.get_status_summary() if ctx.uploads else {},
+        "zip_cache": (
+            ctx.zip_cache.stats()
+            if hasattr(ctx.zip_cache, "stats")
+            else {"l1_entries": len(ctx.zip_cache)}
+        ),
         "ingest": {
             "concurrency": cfg.ingest_concurrency,
             "active_jobs": ctx.ingest.has_active_jobs(),

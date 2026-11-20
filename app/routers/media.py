@@ -10,6 +10,7 @@ from app.allocator import sanitize_folder
 from app.context import AppContext
 from app.db import normalize_tags
 from app.media_ops import (
+    _call_iter_telegram_range,
     _iter_file_range,
     _parse_range_header,
     _telegram_media_actual_size,
@@ -316,7 +317,9 @@ async def stream_media(
                 parts, start, end, prefetched=prefetched_parts
             )
         else:
-            body = ctx.tg_pool.iter_telegram_range(tg_client, tg_media, start, end)
+            body = _call_iter_telegram_range(
+                ctx.tg_pool, tg_client, tg_media, start, end, total_size=file_size
+            )
         return StreamingResponse(
             body,
             status_code=206,
@@ -334,7 +337,9 @@ async def stream_media(
             parts, 0, file_size - 1, prefetched=prefetched_parts
         )
     else:
-        body = ctx.tg_pool.iter_telegram_range(tg_client, tg_media, 0, file_size - 1)
+        body = _call_iter_telegram_range(
+            ctx.tg_pool, tg_client, tg_media, 0, file_size - 1, total_size=file_size
+        )
 
     return StreamingResponse(
         body,

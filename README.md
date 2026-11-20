@@ -27,6 +27,10 @@ A self-hosted server that gives you **both**:
   - **Pre-Flight Deduplication on HTTP & HTTPS**: Zero-dependency pure-JS streaming SHA-256 (`static/js/crypto/sha256.js`) + two-tier size-candidate verification catches duplicates before uploading—even on plain HTTP LAN or Tailscale origins where `crypto.subtle` is disabled.
   - **Playlist Preview / Cherry-Picker (`POST /api/ytdlp/playlist`)**: Inspects playlists before queuing, highlights items already in your vault, and lets you filter, select, and assign folder/tags/format.
   - **Retryable Failed Uploads & Smart Job Center**: Retains failed staged uploads within `FAILED_UPLOAD_RETENTION_SEC` / `FAILED_UPLOAD_MAX_RETAINED_MB` for one-click retry without re-uploading, plus status counts, filter tabs, paginated history, `Clear Completed`, `Retry All Failed`, and clickable links straight to finished media.
+- **Zero-Buffer Streaming & Hot-Cache Overhaul**:
+  - **Zero-Buffer Bulk ZIP64 Streaming (`GET/POST /api/media/bulk/download`)**: Pure-stdlib APPNOTE 6.3.x `ZIP_STORED` async streaming (`app/streaming_zip.py`) with automatic ZIP64 support and immediate chunked TTFB (no `SpooledTemporaryFile` buffering or client-disconnect leaks).
+  - **Persisted Two-Tier ZIP Directory Cache**: Bounded L1 RAM + zlib-compressed SQLite (`zip_entries_cache`, `ZIP_CACHE_DB_MAX_ROWS=500`, `ZIP_CACHE_DB_MAX_MB=16`) with fingerprint verification and transactional invalidation so ZIP explorer survives restarts without bloating backups.
+  - **Two-Tier Hot-Block Cache, Coalescing & Sequential Prefetch**: Canonical fixed-grid blocking with RAM L1 + optional opt-in L2 sharded `.blk` disk cache (`TELEGRAM_DISK_CACHE_MB`), single-flight deduplication, bounded read-ahead prefetch (`TELEGRAM_PREFETCH_BLOCKS`), multipart next-part warming, stream-aware worker routing, and `POST /api/system/cache/purge` + Health UI controls.
 
 ## Quick Start
 

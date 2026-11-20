@@ -48,8 +48,15 @@ class Settings(BaseSettings):
     telegram_archive_chat_id: str = ""
     telegram_stream_chunk_kb: int = 512
     telegram_stream_cache_mb: int = 64
+    telegram_disk_cache_mb: int = 0
+    telegram_disk_cache_dir: Path | None = None
+    telegram_prefetch_blocks: int = 2
+    telegram_prefetch_max_concurrency: int = 4
     telegram_upload_concurrency: int = 4
     telegram_compress_photos: bool = False
+    zip_cache_max_items: int = 256
+    zip_cache_db_max_rows: int = 500
+    zip_cache_db_max_mb: int = 16
 
     ytdlp_cookies_file: Path = Path("./data/cookies.txt")
     ytdlp_proxy: str = ""
@@ -91,6 +98,10 @@ class Settings(BaseSettings):
         return self.backup_dir if self.backup_dir is not None else (self.data_dir / "backups")
 
     @property
+    def stream_cache_dir(self) -> Path:
+        return self.telegram_disk_cache_dir if self.telegram_disk_cache_dir is not None else (self.data_dir / "stream_cache")
+
+    @property
     def min_free_buffer_bytes(self) -> int:
         return self.min_free_buffer_mb * 1024 * 1024
 
@@ -128,6 +139,14 @@ class Settings(BaseSettings):
     def telegram_stream_cache_bytes(self) -> int:
         return max(0, int(self.telegram_stream_cache_mb)) * 1024 * 1024
 
+    @property
+    def telegram_disk_cache_bytes(self) -> int:
+        return max(0, int(self.telegram_disk_cache_mb)) * 1024 * 1024
+
+    @property
+    def zip_cache_db_max_bytes(self) -> int:
+        return max(0, int(self.zip_cache_db_max_mb)) * 1024 * 1024
+
     def get_drives(self) -> list[DriveConfig]:
         raw = json.loads(self.drives_json or "[]")
         return [DriveConfig(**item) for item in raw]
@@ -150,3 +169,5 @@ class Settings(BaseSettings):
         self.thumbs_dir.mkdir(parents=True, exist_ok=True)
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         self.backups_dir.mkdir(parents=True, exist_ok=True)
+        if self.telegram_disk_cache_bytes > 0:
+            self.stream_cache_dir.mkdir(parents=True, exist_ok=True)

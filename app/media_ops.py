@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import io
 import logging
 import shutil
-import tempfile
+import threading
 import uuid
 import zipfile
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,12 @@ from app.allocator import sanitize_folder
 from app.context import AppContext
 from app.db import normalize_tags
 from app.ingest import classify_media
+from app.streaming_zip import (
+    StreamingZipEntry,
+    deduplicate_arcname,
+    iter_streaming_zip64,
+)
+from app.zip_cache import compute_zip_fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +128,77 @@ def _iter_file_range(path: Path, start: int, end: int, chunk_size: int = 1024 * 
                 break
             remaining -= len(data)
             yield data
+
+
+async def _aiter_file_range(
+    path: Path, start: int, end: int, chunk_size: int = 1024 * 1024
+) -> AsyncIterator[bytes]:
+    remaining = end - start + 1
+    if remaining <= 0:
+        return
+    fh = await asyncio.to_thread(path.open, "rb")
+    fh_lock = threading.Lock()
+    closed = False
+
+    def _seek_sync(pos: int) -> None:
+        with fh_lock:
+            if not closed:
+                fh.seek(pos)
+
+    def _read_sync(n: int) -> bytes:
+        with fh_lock:
+            if closed:
+                return b""
+            return fh.read(n)
+
+    def _close_sync() -> None:
+        nonlocal closed
+        with fh_lock:
+            if not closed:
+                closed = True
+                fh.close()
+
+    try:
+        if start > 0:
+            await asyncio.to_thread(_seek_sync, start)
+        while remaining > 0:
+            data = await asyncio.to_thread(_read_sync, min(chunk_size, remaining))
+            if not data:
+                break
+            remaining -= len(data)
+            yield data
+    finally:
+        try:
+            await asyncio.shield(asyncio.to_thread(_close_sync))
+        except BaseException:
+            # Ensure descriptor closes off the event loop even if outer cancellation fires again
+            try:
+                asyncio.get_running_loop().run_in_executor(None, _close_sync)
+            except RuntimeError:
+                _close_sync()
+            raise
+
+
+def _call_iter_telegram_range(
+    tg_pool: Any,
+    client: Any,
+    media: Any,
+    start: int,
+    end: int,
+    total_size: int | None = None,
+):
+    fn = tg_pool.iter_telegram_range
+    if total_size is not None:
+        try:
+            sig = inspect.signature(fn)
+            if "total_size" in sig.parameters or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in sig.parameters.values()
+            ):
+                return fn(client, media, start, end, total_size=total_size)
+        except (TypeError, ValueError):
+            pass
+    return fn(client, media, start, end)
 
 
 def _sanitize_archive_relpath(raw_rel: str, fallback_name: str) -> str:
@@ -265,7 +344,12 @@ async def get_zip_entries(
     ctx: AppContext, item: dict[str, Any], source: dict[str, Any] | None = None
 ) -> list[dict[str, Any]]:
     media_id = item["id"]
-    cached = ctx.zip_cache.get(media_id)
+    fp = compute_zip_fingerprint(item)
+    get_entries_fn = getattr(ctx.zip_cache, "get_entries", None)
+    if callable(get_entries_fn):
+        cached = get_entries_fn(media_id, fingerprint=fp)
+    else:
+        cached = ctx.zip_cache.get(media_id)
     if cached is not None:
         return cached
 
@@ -303,7 +387,11 @@ async def get_zip_entries(
                             "mime_type": mime,
                         }
                     )
-                ctx.zip_cache[media_id] = entries
+                set_entries_fn = getattr(ctx.zip_cache, "set_entries", None)
+                if callable(set_entries_fn):
+                    set_entries_fn(media_id, entries, fingerprint=fp)
+                else:
+                    ctx.zip_cache[media_id] = entries
                 return entries
         except _NeedEarlierOffset as need:
             new_start = max(0, min(need.needed_offset, tail_start))
@@ -324,7 +412,11 @@ async def delete_media_item(ctx: AppContext, media_id: str) -> dict[str, Any] | 
     item = ctx.db.delete_media(media_id)
     if not item:
         return None
-    ctx.zip_cache.pop(media_id, None)
+    invalidate_fn = getattr(ctx.zip_cache, "invalidate", None)
+    if callable(invalidate_fn):
+        invalidate_fn(media_id)
+    else:
+        ctx.zip_cache.pop(media_id, None)
 
     raw_path = (item.get("file_path") or "").strip()
     if raw_path:
@@ -456,6 +548,12 @@ async def move_or_rename_media_item(
     )
     if not updated:
         raise HTTPException(status_code=404, detail="Media item not found")
+    if new_file_path or tg_updates:
+        invalidate_fn = getattr(ctx.zip_cache, "invalidate", None)
+        if callable(invalidate_fn):
+            invalidate_fn(media_id)
+        else:
+            ctx.zip_cache.pop(media_id, None)
     return updated
 
 
@@ -477,60 +575,63 @@ async def build_bulk_download_response(
     if not resolved:
         raise HTTPException(status_code=404, detail="No matching media items found")
 
-    spooled = tempfile.SpooledTemporaryFile(max_size=32 * 1024 * 1024)
+    entries: list[StreamingZipEntry] = []
     used_names: set[str] = set()
-    try:
-        with zipfile.ZipFile(
-            spooled, "w", compression=zipfile.ZIP_STORED, allowZip64=True
-        ) as zf:
-            for idx, (item, src) in enumerate(resolved):
-                raw_name = Path(item.get("filename") or f"{item['id']}.bin").name
-                arcname = raw_name
-                if arcname in used_names:
-                    p = Path(raw_name)
-                    arcname = f"{p.stem}_{idx + 1}_{item['id'][:6]}{p.suffix}"
-                used_names.add(arcname)
+    for idx, (item, src) in enumerate(resolved):
+        raw_name = item.get("filename") or f"{item['id']}.bin"
+        arcname = deduplicate_arcname(
+            raw_name,
+            used_names,
+            index=idx,
+            media_id=item["id"],
+        )
+        size = int(src["size"])
 
-                with zf.open(arcname, "w", force_zip64=True) as z_entry:
-                    size = int(src["size"])
-                    if size > 0:
-                        if src["kind"] == "local":
-                            for chunk in _iter_file_range(src["path"], 0, size - 1):
-                                await asyncio.to_thread(z_entry.write, chunk)
-                        elif src["kind"] == "multipart":
-                            prefetched = await prefetch_multipart_first(ctx, src, 0, size - 1)
-                            async for chunk in ctx.tg_pool.iter_telegram_multipart_range(
-                                src["parts"], 0, size - 1, prefetched=prefetched
-                            ):
-                                await asyncio.to_thread(z_entry.write, chunk)
-                        else:
-                            async for chunk in ctx.tg_pool.iter_telegram_range(
-                                src["client"], src["media"], 0, size - 1
-                            ):
-                                await asyncio.to_thread(z_entry.write, chunk)
+        def _make_factory(source: dict[str, Any] = src, expected_size: int = size):
+            if expected_size <= 0:
+                async def _empty_stream() -> AsyncIterator[bytes]:
+                    if False:
+                        yield b""
 
-        spooled.seek(0, io.SEEK_END)
-        bundle_size = spooled.tell()
-        spooled.seek(0)
-    except Exception:
-        spooled.close()
-        raise
+                return _empty_stream()
+            if source["kind"] == "local":
+                return _aiter_file_range(source["path"], 0, expected_size - 1)
+            if source["kind"] == "multipart":
+                async def _multipart_stream() -> AsyncIterator[bytes]:
+                    prefetched = await prefetch_multipart_first(
+                        ctx, source, 0, expected_size - 1
+                    )
+                    return ctx.tg_pool.iter_telegram_multipart_range(
+                        source["parts"],
+                        0,
+                        expected_size - 1,
+                        prefetched=prefetched,
+                    )
 
-    def _iter_bundle():
-        try:
-            while True:
-                chunk = spooled.read(1024 * 1024)
-                if not chunk:
-                    break
-                yield chunk
-        finally:
-            spooled.close()
+                return _multipart_stream()
+            return _call_iter_telegram_range(
+                ctx.tg_pool,
+                source["client"],
+                source["media"],
+                0,
+                expected_size - 1,
+                total_size=expected_size,
+            )
+
+        entries.append(
+            StreamingZipEntry(
+                arcname=arcname,
+                stream_factory=_make_factory,
+                expected_size=size,
+            )
+        )
 
     return StreamingResponse(
-        _iter_bundle(),
+        iter_streaming_zip64(entries),
         media_type="application/zip",
         headers={
             "Content-Disposition": 'attachment; filename="media_bundle.zip"',
-            "Content-Length": str(bundle_size),
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
         },
     )

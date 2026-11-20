@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import io
 import json
 import logging
@@ -8,7 +9,6 @@ import math
 import re
 import shutil
 import tempfile
-import threading
 import time
 import uuid
 import weakref
@@ -38,6 +38,7 @@ from app.allocator import DriveAllocator, fmt_size, sanitize_folder
 from app.config import Settings, TelegramApiConfig
 from app.db import Database, normalize_tags
 from app.ingest import IMAGE_EXTS, IngestService, classify_media
+from app.stream_cache import StreamFetchCoordinator, TelegramBlockCache, TwoTierBlockCache
 from app.thumbnails import generate_thumbnail
 
 logger = logging.getLogger(__name__)
@@ -385,154 +386,6 @@ def parse_folder_from_text(text: str, fallback: str) -> str:
     return fallback
 
 
-class TelegramBlockCache:
-    """Thread-safe bounded LRU block cache for Telegram streaming range chunks."""
-
-    def __init__(self, max_bytes: int, block_size: int = 512 * 1024) -> None:
-        self._max_bytes = max(0, int(max_bytes))
-        self._block_size = max(4096, int(block_size))
-        self._entries: OrderedDict[tuple[Any, int], bytes] = OrderedDict()
-        self._index: dict[Any, dict[int, int]] = {}
-        self._total_bytes = 0
-        self._hits: int = 0
-        self._misses: int = 0
-        self._evictions: int = 0
-        self._lock = threading.RLock()
-
-    @property
-    def enabled(self) -> bool:
-        return self._max_bytes > 0
-
-    @property
-    def max_bytes(self) -> int:
-        return self._max_bytes
-
-    @property
-    def block_size(self) -> int:
-        return self._block_size
-
-    @property
-    def total_bytes(self) -> int:
-        with self._lock:
-            return self._total_bytes
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._entries)
-
-    def configure(self, max_bytes: int, block_size: int) -> None:
-        max_bytes = max(0, int(max_bytes))
-        block_size = max(4096, int(block_size))
-        with self._lock:
-            self._max_bytes = max_bytes
-            self._block_size = block_size
-            if max_bytes <= 0:
-                self._entries.clear()
-                self._index.clear()
-                self._total_bytes = 0
-                return
-            self._evict_to_limit()
-
-    def _evict_to_limit(self) -> None:
-        while self._total_bytes > self._max_bytes and self._entries:
-            evicted_key, evicted_data = self._entries.popitem(last=False)
-            self._total_bytes -= len(evicted_data)
-            self._evictions += 1
-            ev_ns, ev_off = evicted_key
-            ns_map = self._index.get(ev_ns)
-            if ns_map is not None:
-                ns_map.pop(ev_off, None)
-                if not ns_map:
-                    self._index.pop(ev_ns, None)
-
-    def get_span(self, cache_ns: Any, cursor: int, end: int) -> bytes | None:
-        with self._lock:
-            if self._max_bytes <= 0 or cursor > end:
-                return None
-            segs = self._index.get(cache_ns)
-            if not segs:
-                self._misses += 1
-                return None
-            best_start: int | None = None
-            best_reach = cursor
-            for seg_start, seg_len in segs.items():
-                seg_end = seg_start + seg_len
-                if seg_start <= cursor < seg_end and seg_end > best_reach:
-                    best_start = seg_start
-                    best_reach = seg_end
-            if best_start is None:
-                self._misses += 1
-                return None
-            key = (cache_ns, best_start)
-            data = self._entries.get(key)
-            if data is None:
-                self._misses += 1
-                return None
-            self._entries.move_to_end(key)
-            rel_start = cursor - best_start
-            rel_end = min(len(data), end - best_start + 1)
-            if rel_end <= rel_start:
-                self._misses += 1
-                return None
-            self._hits += 1
-            return data[rel_start:rel_end]
-
-    def put(self, cache_ns: Any, offset: int, data: bytes) -> None:
-        if self._max_bytes <= 0 or not data:
-            return
-        if len(data) > self._max_bytes:
-            return
-        off = int(offset)
-        key = (cache_ns, off)
-        with self._lock:
-            existing = self._entries.get(key)
-            if existing is not None:
-                if len(data) <= len(existing):
-                    self._entries.move_to_end(key)
-                    return
-                self._total_bytes -= len(existing)
-            self._entries[key] = data
-            self._entries.move_to_end(key)
-            self._index.setdefault(cache_ns, {})[off] = len(data)
-            self._total_bytes += len(data)
-            self._evict_to_limit()
-
-    def invalidate(self, cache_ns: Any) -> int:
-        with self._lock:
-            segs = self._index.pop(cache_ns, None)
-            if not segs:
-                return 0
-            removed = 0
-            for seg_start in segs:
-                evicted = self._entries.pop((cache_ns, seg_start), None)
-                if evicted is not None:
-                    self._total_bytes -= len(evicted)
-                    removed += 1
-            return removed
-
-    def clear(self) -> None:
-        with self._lock:
-            self._entries.clear()
-            self._index.clear()
-            self._total_bytes = 0
-
-    def stats(self) -> dict[str, Any]:
-        with self._lock:
-            total_lookups = self._hits + self._misses
-            return {
-                "enabled": self._max_bytes > 0,
-                "used_bytes": self._total_bytes,
-                "max_bytes": self._max_bytes,
-                "utilization_pct": round((self._total_bytes / self._max_bytes) * 100.0, 2) if self._max_bytes > 0 else 0.0,
-                "entries": len(self._entries),
-                "block_size": self._block_size,
-                "hits": self._hits,
-                "misses": self._misses,
-                "evictions": self._evictions,
-                "hit_rate_pct": round((self._hits / total_lookups) * 100.0, 2) if total_lookups > 0 else 0.0,
-            }
-
-
 class TelegramPool:
     def __init__(
         self,
@@ -561,9 +414,16 @@ class TelegramPool:
         self._stream_media_cache: dict[tuple[str, int, str], tuple[float, Any]] = {}
         self._stream_cache_ttl = 300.0
         self._media_cache_keys: OrderedDict[int, tuple[weakref.ref[Any] | None, tuple[str, int]]] = OrderedDict()
-        self._block_cache = TelegramBlockCache(
+        self._block_cache = TwoTierBlockCache(
             max_bytes=settings.telegram_stream_cache_bytes,
             block_size=settings.telegram_stream_chunk_bytes,
+            disk_max_bytes=settings.telegram_disk_cache_bytes,
+            disk_dir=settings.stream_cache_dir,
+        )
+        self._stream_coordinator = StreamFetchCoordinator(
+            self._block_cache,
+            prefetch_blocks=settings.telegram_prefetch_blocks,
+            max_prefetch_concurrency=settings.telegram_prefetch_max_concurrency,
         )
 
         # Wire mirror hook so both Web and Telegram uploads can forward to the shared Forum Supergroup
@@ -610,13 +470,17 @@ class TelegramPool:
                     "last_error_at": err.get("at") if err else None,
                 }
             )
+        bc_stats = self._block_cache.stats()
+        coord_stats = self._stream_coordinator.stats()
+        bc_stats["coalesced_waits"] = coord_stats["coalesced_waits"]
+        bc_stats["prefetch"] = coord_stats["prefetch"]
         return {
             "worker_count": len(workers),
             "online_count": sum(1 for w in workers if w["online"]),
             "cooldown_count": sum(1 for w in workers if w["in_cooldown"]),
             "archive_enabled": bool(self.settings.telegram_archive_chat_id.strip() and self.clients),
             "workers": workers,
-            "block_cache": self._block_cache.stats(),
+            "block_cache": bc_stats,
             "stream_media_cache_entries": len(self._stream_media_cache),
         }
 
@@ -652,6 +516,7 @@ class TelegramPool:
             self._tasks.append(asyncio.create_task(client.run_until_disconnected()))
 
     async def stop(self) -> None:
+        await self._stream_coordinator.stop()
         for task in self._tasks:
             task.cancel()
         for _, client in self.clients:
@@ -679,7 +544,12 @@ class TelegramPool:
         except ValueError:
             return raw
 
-    def _ordered_clients(self, preferred_worker: str | None = None) -> list[tuple[TelegramApiConfig, TelegramClient]]:
+    def _ordered_clients(
+        self,
+        preferred_worker: str | None = None,
+        *,
+        purpose: str = "upload",
+    ) -> list[tuple[TelegramApiConfig, TelegramClient]]:
         if not self.clients:
             return []
         ordered = list(self.clients)
@@ -688,12 +558,15 @@ class TelegramPool:
         rotated = ordered[idx:] + ordered[:idx]
         now = time.monotonic()
 
-        def _sort_key(pair: tuple[TelegramApiConfig, TelegramClient]) -> tuple[int, int, int]:
+        def _sort_key(pair: tuple[TelegramApiConfig, TelegramClient]) -> tuple[int, int, int] | tuple[int, int, int, int]:
             name = pair[0].name
             in_cooldown = 1 if now < self._cooldown_until.get(name, 0.0) else 0
             pref_rank = 0 if (preferred_worker and name == preferred_worker and in_cooldown == 0) else 1
-            active = self._active_uploads.get(name, 0)
-            return (in_cooldown, pref_rank, active)
+            active_uploads = self._active_uploads.get(name, 0)
+            active_streams = self._active_streams.get(name, 0)
+            if purpose == "stream":
+                return (in_cooldown, pref_rank, active_streams + active_uploads * 2)
+            return (in_cooldown, pref_rank, active_uploads, active_streams)
 
         rotated.sort(key=_sort_key)
         return rotated
@@ -1115,6 +988,12 @@ class TelegramPool:
         self._block_cache.configure(
             max_bytes=self.settings.telegram_stream_cache_bytes,
             block_size=self.settings.telegram_stream_chunk_bytes,
+            disk_max_bytes=self.settings.telegram_disk_cache_bytes,
+            disk_dir=self.settings.stream_cache_dir,
+        )
+        self._stream_coordinator.configure(
+            prefetch_blocks=self.settings.telegram_prefetch_blocks,
+            max_prefetch_concurrency=self.settings.telegram_prefetch_max_concurrency,
         )
 
     def _remember_media_key(self, media: Any, chat_id: str, msg_id: int) -> None:
@@ -1143,11 +1022,31 @@ class TelegramPool:
         chat_str = str(chat_id)
         mid_int = int(msg_id)
         target_ns = (chat_str, mid_int)
+        self._stream_coordinator.invalidate_namespace(target_ns)
         self._block_cache.invalidate(target_ns)
         for key in [k for k in self._stream_media_cache if k[0] == chat_str and k[1] == mid_int]:
             self._stream_media_cache.pop(key, None)
         for obj_id in [k for k, (_, ns) in self._media_cache_keys.items() if ns == target_ns]:
             self._media_cache_keys.pop(obj_id, None)
+
+    async def purge_stream_caches(
+        self, *, clear_ram: bool = True, clear_disk: bool = True
+    ) -> dict[str, Any]:
+        await self._stream_coordinator.cancel_all_background()
+        if clear_disk:
+            result: dict[str, Any] = await asyncio.to_thread(
+                self._block_cache.purge, clear_ram=clear_ram, clear_disk=clear_disk
+            )
+        else:
+            result = self._block_cache.purge(clear_ram=clear_ram, clear_disk=False)
+        if clear_ram:
+            media_entries = len(self._stream_media_cache)
+            self._stream_media_cache.clear()
+            self._media_cache_keys.clear()
+            result["stream_media_cache_cleared"] = media_entries
+        else:
+            result["stream_media_cache_cleared"] = 0
+        return result
 
     async def prepare_stream(
         self, chat_id: str, msg_id: int, worker_name: str | None = None
@@ -1161,7 +1060,7 @@ class TelegramPool:
 
         now = time.monotonic()
         self._prune_stream_cache(now)
-        ordered = self._ordered_clients(preferred_worker=worker_name)
+        ordered = self._ordered_clients(preferred_worker=worker_name, purpose="stream")
 
         for cfg, client in ordered:
             if now < self._cooldown_until.get(cfg.name, 0.0):
@@ -1213,6 +1112,16 @@ class TelegramPool:
             raise RuntimeError(str(last_err))
         raise FileNotFoundError("Media message no longer exists in Telegram archive.")
 
+    @staticmethod
+    async def _close_download_iterator(iterator: Any) -> None:
+        close_fn = getattr(iterator, "aclose", None)
+        if not callable(close_fn):
+            close_fn = getattr(iterator, "close", None)
+        if callable(close_fn):
+            res = close_fn()
+            if inspect.isawaitable(res):
+                await res
+
     async def iter_telegram_range(
         self,
         client: TelegramClient,
@@ -1221,97 +1130,155 @@ class TelegramPool:
         end: int,
         *,
         cache_key: Any = None,
+        total_size: int | None = None,
     ):
         if end < start:
             return
         self._sync_block_cache_limits()
-        resolved_key = self._resolve_media_cache_key(media, cache_key=cache_key)
-        block_size = self._block_cache.block_size
-        cursor = start
+        wname = self._worker_name_for_client(client)
 
-        # Serve any leading consecutive cached blocks directly from memory
-        if self._block_cache.enabled:
-            while cursor <= end:
-                cached_slice = self._block_cache.get_span(resolved_key, cursor, end)
-                if not cached_slice:
-                    break
-                yield cached_slice
-                cursor += len(cached_slice)
-
-        if cursor > end:
+        if not self._block_cache.enabled:
+            remaining = end - start + 1
+            aligned_offset = (start // 4096) * 4096
+            skip = start - aligned_offset
+            request_size = self.settings.telegram_stream_chunk_bytes
+            iterator = client.iter_download(media, offset=aligned_offset, request_size=request_size)
+            if wname:
+                self._active_streams[wname] = self._active_streams.get(wname, 0) + 1
+            try:
+                async for chunk in iterator:
+                    if remaining <= 0:
+                        break
+                    data = bytes(chunk)
+                    if not data:
+                        continue
+                    if skip > 0:
+                        if len(data) <= skip:
+                            skip -= len(data)
+                            continue
+                        data = data[skip:]
+                        skip = 0
+                    if len(data) > remaining:
+                        yield data[:remaining]
+                        remaining = 0
+                        break
+                    remaining -= len(data)
+                    yield data
+            except FloodWaitError as fw:
+                if wname:
+                    self._record_flood_wait(wname, fw.seconds)
+                raise
+            except Exception as exc:
+                if wname:
+                    self._record_worker_error(wname, exc)
+                raise
+            finally:
+                if wname:
+                    self._active_streams[wname] = max(0, self._active_streams.get(wname, 1) - 1)
+                await self._close_download_iterator(iterator)
             return
 
-        remaining = end - cursor + 1
-        aligned_offset = (cursor // 4096) * 4096
-        skip = cursor - aligned_offset
-        request_size = self.settings.telegram_stream_chunk_bytes
-        iterator = client.iter_download(media, offset=aligned_offset, request_size=request_size)
+        resolved_key = self._resolve_media_cache_key(media, cache_key=cache_key)
+        block_size = self._block_cache.block_size
 
-        buf_offset = aligned_offset
-        pending = bytearray()
-
-        def _flush_pending_blocks(*, flush_partial: bool = False) -> None:
-            nonlocal buf_offset
-            if not self._block_cache.enabled or not pending:
-                return
-            while len(pending) >= block_size:
-                block = bytes(pending[:block_size])
-                del pending[:block_size]
-                self._block_cache.put(resolved_key, buf_offset, block)
-                buf_offset += block_size
-            if flush_partial and pending:
-                self._block_cache.put(resolved_key, buf_offset, bytes(pending))
-                buf_offset += len(pending)
-                pending.clear()
-
-        errored = False
-        wname = self._worker_name_for_client(client)
-        if wname:
-            self._active_streams[wname] = self._active_streams.get(wname, 0) + 1
-        try:
-            async for chunk in iterator:
-                if remaining <= 0:
-                    break
-                raw = bytes(chunk)
-                if not raw:
-                    continue
-                if self._block_cache.enabled:
-                    pending.extend(raw)
-                    _flush_pending_blocks(flush_partial=False)
-
-                data = raw
-                if skip > 0:
-                    if len(data) <= skip:
-                        skip -= len(data)
+        async def _download_canonical_block(block_offset: int) -> bytes:
+            iterator = client.iter_download(media, offset=block_offset, request_size=block_size)
+            buf = bytearray()
+            if wname:
+                self._active_streams[wname] = self._active_streams.get(wname, 0) + 1
+            try:
+                async for chunk in iterator:
+                    if not chunk:
                         continue
-                    data = data[skip:]
-                    skip = 0
-                if len(data) > remaining:
-                    yield data[:remaining]
-                    remaining = 0
+                    buf.extend(chunk)
+                    if len(buf) >= block_size:
+                        break
+                return bytes(buf[:block_size])
+            except FloodWaitError as fw:
+                if wname:
+                    self._record_flood_wait(wname, fw.seconds)
+                raise
+            except Exception as exc:
+                if wname:
+                    self._record_worker_error(wname, exc)
+                raise
+            finally:
+                if wname:
+                    self._active_streams[wname] = max(0, self._active_streams.get(wname, 1) - 1)
+                await self._close_download_iterator(iterator)
+
+        def _can_prefetch_worker() -> bool:
+            if wname:
+                return time.monotonic() >= self._cooldown_until.get(wname, 0.0)
+            return True
+
+        def _on_prefetch_error(exc: Exception) -> None:
+            logger.debug("Stream prefetch error for %s: %s", resolved_key, exc)
+
+        should_prefetch = self._stream_coordinator.should_prefetch(
+            resolved_key, start, end, block_size
+        )
+        prefetch_ahead = max(0, int(self.settings.telegram_prefetch_blocks))
+        cursor = start
+        reached_eof = False
+
+        try:
+            while cursor <= end:
+                block_idx = cursor // block_size
+                block_offset = block_idx * block_size
+                data, _tier = await self._block_cache.get_block_async(resolved_key, block_offset)
+                if data is not None:
+                    if (
+                        len(data) < block_size
+                        and total_size is not None
+                        and (block_offset + len(data)) < total_size
+                    ):
+                        # Stale/truncated cached block; re-fetch cleanly from upstream
+                        data, _ = await self._stream_coordinator.fetch_block(
+                            resolved_key,
+                            block_offset,
+                            lambda off=block_offset: _download_canonical_block(off),
+                        )
+                    else:
+                        self._stream_coordinator.note_cache_hit(resolved_key, block_offset)
+                else:
+                    data, _ = await self._stream_coordinator.fetch_block(
+                        resolved_key,
+                        block_offset,
+                        lambda off=block_offset: _download_canonical_block(off),
+                    )
+
+                if not data:
+                    reached_eof = True
                     break
-                remaining -= len(data)
-                yield data
-        except FloodWaitError as fw:
-            errored = True
-            if wname:
-                self._record_flood_wait(wname, fw.seconds)
-            raise
-        except Exception as exc:
-            errored = True
-            if wname:
-                self._record_worker_error(wname, exc)
-            raise
+
+                if should_prefetch and prefetch_ahead > 0:
+                    for step in range(1, prefetch_ahead + 1):
+                        next_off = (block_idx + step) * block_size
+                        if total_size is not None and next_off >= total_size:
+                            break
+                        self._stream_coordinator.schedule_prefetch(
+                            resolved_key,
+                            next_off,
+                            lambda off=next_off: _download_canonical_block(off),
+                            can_run_fn=_can_prefetch_worker,
+                            on_error=_on_prefetch_error,
+                        )
+
+                rel_start = cursor - block_offset
+                rel_end = min(len(data), end - block_offset + 1)
+                if rel_end <= rel_start:
+                    reached_eof = True
+                    break
+                out_slice = data[rel_start:rel_end]
+                cursor += len(out_slice)
+                yield out_slice
+                if len(data) < block_size:
+                    reached_eof = True
+                    break
         finally:
-            if wname:
-                self._active_streams[wname] = max(0, self._active_streams.get(wname, 1) - 1)
-            if not errored:
-                _flush_pending_blocks(flush_partial=True)
-            close_fn = getattr(iterator, "close", None)
-            if callable(close_fn):
-                res = close_fn()
-                if asyncio.iscoroutine(res):
-                    await res
+            if should_prefetch and cursor <= end and not reached_eof:
+                self._stream_coordinator.cancel_prefetch_for_namespace(resolved_key)
 
     async def iter_telegram_multipart_range(
         self,
@@ -1323,8 +1290,9 @@ class TelegramPool:
     ):
         if end < start:
             return
+        self._sync_block_cache_limits()
         ordered_parts = sorted(parts, key=lambda p: int(p["part_index"]))
-        for part in ordered_parts:
+        for idx_pos, part in enumerate(ordered_parts):
             p_start = int(part["start_byte"])
             p_end = int(part["end_byte"])
             p_size = int(part["size_bytes"])
@@ -1343,8 +1311,51 @@ class TelegramPool:
                     int(part["telegram_msg_id"]),
                     worker_name=None,
                 )
-            async for chunk in self.iter_telegram_range(client, media, local_start, local_end):
-                yield chunk
+
+            next_part = ordered_parts[idx_pos + 1] if (idx_pos + 1) < len(ordered_parts) else None
+            prefetch_blocks = max(0, int(self.settings.telegram_prefetch_blocks))
+            if next_part is not None and prefetch_blocks > 0:
+                next_idx = int(next_part["part_index"])
+                next_chat = str(next_part["telegram_chat_id"])
+                next_mid = int(next_part["telegram_msg_id"])
+                near_part_end = local_end >= max(
+                    0, p_size - self._block_cache.block_size * max(1, prefetch_blocks)
+                )
+                if end > p_end or near_part_end:
+                    now = time.monotonic()
+                    in_prefetched = bool(prefetched and next_idx in prefetched)
+                    already_warm = any(
+                        k[0] == next_chat
+                        and k[1] == next_mid
+                        and now < exp
+                        and now >= self._cooldown_until.get(k[2], 0.0)
+                        for k, (exp, _) in self._stream_media_cache.items()
+                    )
+                    has_available_worker = any(
+                        now >= self._cooldown_until.get(cfg.name, 0.0)
+                        for cfg, _ in self.clients
+                    )
+                    if not in_prefetched and not already_warm and has_available_worker:
+                        self._stream_coordinator.schedule_background_warm(
+                            key=("prepare_part", next_chat, next_mid),
+                            coro_factory=lambda c=next_chat, m=next_mid: self.prepare_stream(
+                                c, m, worker_name=None
+                            ),
+                            namespace=(str(part["telegram_chat_id"]), int(part["telegram_msg_id"])),
+                        )
+
+            inner_iter = self.iter_telegram_range(
+                client, media, local_start, local_end, total_size=p_size
+            )
+            try:
+                async for chunk in inner_iter:
+                    yield chunk
+            finally:
+                aclose_fn = getattr(inner_iter, "aclose", None)
+                if callable(aclose_fn):
+                    res = aclose_fn()
+                    if inspect.isawaitable(res):
+                        await res
 
     async def delete_archive_message(
         self, chat_id: str, msg_id: int, worker_name: str | None = None

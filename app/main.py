@@ -26,6 +26,7 @@ from app.routers import uploads as uploads_router
 from app.routers import zip_explorer as zip_explorer_router
 from app.telegram_mtproto import TelegramPool
 from app.uploads import UploadSessionService
+from app.zip_cache import ZipDirectoryCache
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,7 +59,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     tg_pool = TelegramPool(cfg, db, allocator, ingest)
     backup = BackupService(cfg, db, tg_pool)
     integrity = IntegrityService(cfg, db, ingest, tg_pool)
-    zip_cache: dict[str, list[dict[str, Any]]] = {}
+    zip_cache = ZipDirectoryCache(
+        db=db,
+        max_l1_items=cfg.zip_cache_max_items,
+        max_db_rows=cfg.zip_cache_db_max_rows,
+        max_db_bytes=cfg.zip_cache_db_max_bytes,
+    )
     ctx = AppContext(
         settings=cfg,
         db=db,

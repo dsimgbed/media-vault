@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 
 from app.context import AppContext
 from app.routers.deps import get_ctx, require_auth
-from app.schemas import BackupCreateRequest, IntegrityAuditRequest, IntegrityRepairRequest
+from app.schemas import (
+    BackupCreateRequest,
+    CachePurgeRequest,
+    IntegrityAuditRequest,
+    IntegrityRepairRequest,
+)
 
 router = APIRouter()
 
@@ -136,3 +143,32 @@ async def run_integrity_repair(
         raise HTTPException(status_code=409, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Integrity repair failed to start: {exc}")
+
+
+@router.post("/api/system/cache/purge", dependencies=[Depends(require_auth)])
+async def purge_caches(
+    payload: CachePurgeRequest | None = Body(default=None),
+    ctx: AppContext = Depends(get_ctx),
+):
+    req = payload or CachePurgeRequest()
+    cleared: dict[str, Any] = {}
+    if req.scope in ("all", "stream", "stream_ram", "stream_disk"):
+        clear_ram = req.scope in ("all", "stream", "stream_ram")
+        clear_disk = req.scope in ("all", "stream", "stream_disk")
+        if hasattr(ctx.tg_pool, "purge_stream_caches"):
+            cleared["stream"] = await ctx.tg_pool.purge_stream_caches(
+                clear_ram=clear_ram, clear_disk=clear_disk
+            )
+        else:
+            cleared["stream"] = ctx.tg_pool._block_cache.purge(
+                clear_ram=clear_ram, clear_disk=clear_disk
+            )
+    if req.scope in ("all", "zip"):
+        if hasattr(ctx.zip_cache, "purge"):
+            cleared["zip"] = ctx.zip_cache.purge()
+        else:
+            n = len(ctx.zip_cache)
+            ctx.zip_cache.clear()
+            cleared["zip"] = {"l1_cleared": n, "l2_cleared": 0}
+    return {"purged": True, "scope": req.scope, "cleared": cleared}
+

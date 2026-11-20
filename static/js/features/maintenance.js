@@ -23,6 +23,7 @@ let integrityCache = null;
 let auditBusy = false;
 let repairStarting = false;
 let backupCreating = false;
+let purgingCaches = false;
 let authRejected = false;
 
 const loadLocks = new Map();
@@ -153,6 +154,9 @@ function renderHealthView(view, data) {
   const tg = data?.telegram || {};
   const workers = Array.isArray(tg.workers) ? tg.workers : [];
   const bc = tg.block_cache || {};
+  const l2 = bc.l2 || {};
+  const pf = bc.prefetch || {};
+  const zc = data?.zip_cache || {};
   const db = data?.database || {};
   const st = data?.storage || {};
   const ingest = data?.ingest || {};
@@ -218,7 +222,10 @@ function renderHealthView(view, data) {
     <div class="sys-card">
       <div class="sys-card-head">
         <strong>Block Cache</strong>
-        <span class="pill ${bc.enabled ? "ok" : ""}">${bc.enabled ? "Enabled" : "Disabled"}</span>
+        <div class="sys-actions-row">
+          <span class="pill ${bc.enabled ? "ok" : ""}">${bc.enabled ? "Enabled" : "Disabled"}</span>
+          <button type="button" class="secondary btn-xs" data-sys-action="purge-caches" ${purgingCaches ? "disabled" : ""}>${purgingCaches ? "Purging…" : "Purge Caches"}</button>
+        </div>
       </div>
       <div class="sys-progress-row">
         <div class="bar"><div style="width:${bcPct.toFixed(1)}%"></div></div>
@@ -228,6 +235,21 @@ function renderHealthView(view, data) {
         <span>Used: <strong>${escapeHtml(fmtSize(bc.used_bytes || 0))}</strong> / ${escapeHtml(fmtSize(bc.max_bytes || 0))}</span>
         <span>Entries: <strong>${Number(bc.entries || 0)}</strong></span>
         <span>Hit rate: <strong>${fmtPct(bc.hit_rate_pct)}</strong> (${Number(bc.hits || 0)} hits / ${Number(bc.misses || 0)} misses / ${Number(bc.evictions || 0)} evictions)</span>
+      </div>
+      <div class="sys-kv-row">
+        <span>L2 Disk Cache: <strong>${l2.enabled ? "Enabled" : "Disabled"}</strong></span>
+        <span>Used: <strong>${escapeHtml(fmtSize(l2.used_bytes || 0))}</strong> / ${escapeHtml(fmtSize(l2.max_bytes || 0))}</span>
+        <span>Entries: <strong>${Number(l2.entries || 0)}</strong></span>
+        <span>Hit rate: <strong>${fmtPct(l2.hit_rate_pct)}</strong> (${Number(l2.evictions || 0)} evictions)</span>
+      </div>
+      <div class="sys-kv-row">
+        <span>Coalescing &amp; Prefetch: coalesced waits <strong>${Number(bc.coalesced_waits || 0)}</strong></span>
+        <span>Prefetch hits / scheduled / drops: <strong>${Number(pf.hits || 0)}</strong> / <strong>${Number(pf.scheduled || 0)}</strong> / <strong>${Number(pf.drops || 0)}</strong></span>
+      </div>
+      <div class="sys-kv-row">
+        <span>ZIP Directory Cache: L1 entries <strong>${Number(zc.l1_entries || 0)}</strong></span>
+        <span>L2 persisted: <strong>${Number(zc.l2_entries || 0)} · ${escapeHtml(fmtSize(zc.l2_bytes || 0))}</strong></span>
+        <span>Hit rate: <strong>${fmtPct(zc.hit_rate_pct)}</strong></span>
       </div>
     </div>
 
@@ -254,6 +276,7 @@ function renderHealthView(view, data) {
           <div><span>Thumbnails (${Number(st.thumbs_count || 0)})</span><strong>${escapeHtml(fmtSize(st.thumbs_bytes || 0))}</strong></div>
           <div><span>Staging (${Number(st.staging_entries || 0)})</span><strong>${escapeHtml(fmtSize(st.staging_bytes || 0))}</strong></div>
           <div><span>Backups (${Number(st.backups_count ?? backups.count ?? 0)})</span><strong>${escapeHtml(fmtSize(st.backups_bytes || 0))}</strong></div>
+          <div><span>Stream Cache (${Number(st.stream_cache_entries || 0)})</span><strong>${escapeHtml(fmtSize(st.stream_cache_bytes || 0))}</strong></div>
         </div>
       </div>
     </div>
@@ -807,6 +830,41 @@ async function handleRunRepair() {
   }
 }
 
+async function handlePurgeCaches() {
+  if (isLocked() || purgingCaches) return;
+  purgingCaches = true;
+  const view = $("sysHealthView");
+  const btn = view?.querySelector('[data-sys-action="purge-caches"]');
+  if (btn) btn.disabled = true;
+  try {
+    const ok = await confirmDialog({
+      title: "Purge Caches",
+      message: "Purge RAM/disk stream caches and persisted ZIP directory cache? Active streams may re-fetch blocks from Telegram.",
+      confirmLabel: "Purge Caches",
+      danger: true,
+    });
+    if (!ok) return;
+    if (btn) btn.textContent = "Purging…";
+    await apiFetch("/api/system/cache/purge", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scope: "all" }),
+    });
+    toast("Caches purged.", { type: "success" });
+    await loadHealthTab({ silent: false });
+  } catch (err) {
+    toast(err.message, { type: "error" });
+  } finally {
+    purgingCaches = false;
+    if (statusCache && view && activeTab === "health") {
+      renderHealthView(view, statusCache);
+    } else if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Purge Caches";
+    }
+  }
+}
+
 function wireEvents() {
   const tabsEl = $("systemTabs");
   tabsEl?.addEventListener("click", (e) => {
@@ -868,6 +926,7 @@ function wireEvents() {
       if (action === "refresh-health") loadHealthTab({ silent: false });
       else if (action === "refresh-backups") loadBackupsTab({ silent: false });
       else if (action === "refresh-integrity") loadIntegrityTab({ silent: false });
+      else if (action === "purge-caches") handlePurgeCaches();
       return;
     }
 

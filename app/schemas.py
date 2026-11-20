@@ -120,3 +120,7 @@ class IntegrityRepairRequest(BaseModel):
     max_telegram_item_mb: int = Field(default=250, ge=1, le=2048)
     media_ids: list[str] | None = None
 
+
+class CachePurgeRequest(BaseModel):
+    scope: Literal["all", "stream", "stream_ram", "stream_disk", "zip"] = "all"
+

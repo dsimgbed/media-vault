@@ -314,6 +314,35 @@ class IntegrityService:
             except OSError:
                 pass
 
+        stream_cache_entries = 0
+        stream_cache_bytes = 0
+        if (
+            hasattr(self.tg_pool, "_block_cache")
+            and hasattr(self.tg_pool._block_cache, "get_disk_footprint")
+            and self.settings.telegram_disk_cache_bytes > 0
+        ):
+            entries, bytes_ = self.tg_pool._block_cache.get_disk_footprint()
+            stream_cache_entries = int(entries)
+            stream_cache_bytes = int(bytes_)
+        else:
+            stream_cache_dir = self.settings.stream_cache_dir
+            if stream_cache_dir.exists():
+                try:
+                    for root, _dirs, files in os.walk(stream_cache_dir):
+                        for fname in files:
+                            if not fname.endswith(".blk") or fname.startswith(".tmp_"):
+                                continue
+                            fpath = Path(root) / fname
+                            try:
+                                if fpath.is_symlink() or not fpath.is_file():
+                                    continue
+                                stream_cache_entries += 1
+                                stream_cache_bytes += int(fpath.stat().st_size)
+                            except OSError:
+                                continue
+                except OSError:
+                    pass
+
         return {
             "thumbs_count": thumbs_count,
             "thumbs_bytes": thumbs_bytes,
@@ -321,6 +350,8 @@ class IntegrityService:
             "staging_bytes": staging_bytes,
             "backups_count": backups_count,
             "backups_bytes": backups_bytes,
+            "stream_cache_entries": stream_cache_entries,
+            "stream_cache_bytes": stream_cache_bytes,
         }
 
     def _scan_orphaned_thumbs(

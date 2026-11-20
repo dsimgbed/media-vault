@@ -360,6 +360,18 @@ class Database:
                     updated_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_maintenance_runs_created_at ON maintenance_runs(created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS zip_entries_cache (
+                    media_id TEXT PRIMARY KEY,
+                    fingerprint TEXT NOT NULL,
+                    entry_count INTEGER NOT NULL DEFAULT 0,
+                    payload_bytes INTEGER NOT NULL DEFAULT 0,
+                    entries_blob BLOB NOT NULL,
+                    created_at TEXT NOT NULL,
+                    last_accessed_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_zip_entries_cache_accessed
+                    ON zip_entries_cache(last_accessed_at ASC);
                 """
             )
             # Safe migration for existing DBs created before folder / Telegram storage support
@@ -1115,6 +1127,15 @@ class Database:
                         ),
                     )
 
+            if (
+                file_path is not None
+                or telegram_chat_id is not None
+                or telegram_msg_id is not None
+                or part_count is not None
+                or parts is not None
+            ):
+                conn.execute("DELETE FROM zip_entries_cache WHERE media_id = ?", (media_id,))
+
             row = conn.execute("SELECT * FROM media_items WHERE id = ?", (media_id,)).fetchone()
             assert row is not None
             conn.execute("DELETE FROM media_fts WHERE media_id = ?", (media_id,))
@@ -1366,6 +1387,7 @@ class Database:
             conn.execute("DELETE FROM media_parts WHERE media_id = ?", (media_id,))
             conn.execute("DELETE FROM media_tags WHERE media_id = ?", (media_id,))
             conn.execute("DELETE FROM media_fts WHERE media_id = ?", (media_id,))
+            conn.execute("DELETE FROM zip_entries_cache WHERE media_id = ?", (media_id,))
             conn.execute("DELETE FROM media_items WHERE id = ?", (media_id,))
             item = self._hydrate_media(row)
             item["parts"] = parts
@@ -1455,6 +1477,9 @@ class Database:
                 conn.execute("SELECT COUNT(DISTINCT tag) FROM media_tags WHERE tag != ''").fetchone()[0]
             )
             backups_count = int(conn.execute("SELECT COUNT(*) FROM vault_backups").fetchone()[0])
+            zip_cache_entries = int(
+                conn.execute("SELECT COUNT(*) FROM zip_entries_cache").fetchone()[0]
+            )
         folders_count = len(self.list_folders())
         return {
             "db_path": str(self.db_path),
@@ -1467,7 +1492,148 @@ class Database:
             "folders_count": folders_count,
             "tags_count": tags_count,
             "backups_count": backups_count,
+            "zip_cache_entries": zip_cache_entries,
         }
+
+    def get_zip_cache_entry(self, media_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT media_id, fingerprint, entry_count, payload_bytes, entries_blob, created_at, last_accessed_at
+                FROM zip_entries_cache
+                WHERE media_id = ?
+                """,
+                (media_id,),
+            ).fetchone()
+            if not row:
+                return None
+            now = utc_now_iso()
+            conn.execute(
+                "UPDATE zip_entries_cache SET last_accessed_at = ? WHERE media_id = ?",
+                (now, media_id),
+            )
+            return {
+                "media_id": str(row["media_id"]),
+                "fingerprint": str(row["fingerprint"]),
+                "entry_count": int(row["entry_count"]),
+                "payload_bytes": int(row["payload_bytes"]),
+                "entries_blob": bytes(row["entries_blob"]),
+                "created_at": str(row["created_at"]),
+                "last_accessed_at": now,
+            }
+
+    def has_zip_cache_entry(self, media_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM zip_entries_cache WHERE media_id = ? LIMIT 1",
+                (media_id,),
+            ).fetchone()
+            return row is not None
+
+    def list_zip_cache_media_ids(self) -> list[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT media_id FROM zip_entries_cache ORDER BY last_accessed_at DESC, media_id ASC"
+            ).fetchall()
+            return [str(r["media_id"]) for r in rows]
+
+    def put_zip_cache_entry(
+        self,
+        media_id: str,
+        *,
+        fingerprint: str,
+        entry_count: int,
+        entries_blob: bytes,
+        max_rows: int = 500,
+        max_bytes: int = 16 * 1024 * 1024,
+    ) -> int:
+        blob = bytes(entries_blob)
+        payload_bytes = len(blob)
+        with self._connect() as conn:
+            if max_rows <= 0 or max_bytes <= 0 or payload_bytes > max_bytes:
+                conn.execute("DELETE FROM zip_entries_cache WHERE media_id = ?", (media_id,))
+                return 0
+
+            now = utc_now_iso()
+            conn.execute(
+                """
+                INSERT INTO zip_entries_cache (
+                    media_id, fingerprint, entry_count, payload_bytes, entries_blob, created_at, last_accessed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(media_id) DO UPDATE SET
+                    fingerprint = excluded.fingerprint,
+                    entry_count = excluded.entry_count,
+                    payload_bytes = excluded.payload_bytes,
+                    entries_blob = excluded.entries_blob,
+                    created_at = excluded.created_at,
+                    last_accessed_at = excluded.last_accessed_at
+                """,
+                (
+                    media_id,
+                    fingerprint,
+                    int(entry_count),
+                    payload_bytes,
+                    sqlite3.Binary(blob),
+                    now,
+                    now,
+                ),
+            )
+
+            stats_row = conn.execute(
+                "SELECT COUNT(*) AS cnt, COALESCE(SUM(payload_bytes), 0) AS total_bytes FROM zip_entries_cache"
+            ).fetchone()
+            total_rows = int(stats_row["cnt"])
+            total_bytes = int(stats_row["total_bytes"])
+            evicted = 0
+            if total_rows > max_rows or total_bytes > max_bytes:
+                candidates = conn.execute(
+                    """
+                    SELECT media_id, payload_bytes
+                    FROM zip_entries_cache
+                    WHERE media_id != ?
+                    ORDER BY last_accessed_at ASC, media_id ASC
+                    """,
+                    (media_id,),
+                ).fetchall()
+                to_delete: list[str] = []
+                for cand in candidates:
+                    if total_rows <= max_rows and total_bytes <= max_bytes:
+                        break
+                    to_delete.append(str(cand["media_id"]))
+                    total_rows -= 1
+                    total_bytes -= int(cand["payload_bytes"])
+                for i in range(0, len(to_delete), 500):
+                    chunk = to_delete[i : i + 500]
+                    placeholders = ",".join("?" for _ in chunk)
+                    cur = conn.execute(
+                        f"DELETE FROM zip_entries_cache WHERE media_id IN ({placeholders})",
+                        chunk,
+                    )
+                    evicted += int(cur.rowcount or 0)
+            return evicted
+
+    def delete_zip_cache_entry(self, media_id: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM zip_entries_cache WHERE media_id = ?",
+                (media_id,),
+            )
+            return bool(cur.rowcount and cur.rowcount > 0)
+
+    def clear_zip_cache(self) -> int:
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM zip_entries_cache")
+            return int(cur.rowcount or 0)
+
+    def get_zip_cache_db_stats(self) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS cnt, COALESCE(SUM(payload_bytes), 0) AS total_bytes FROM zip_entries_cache"
+            ).fetchone()
+            return {
+                "entries": int(row["cnt"]) if row else 0,
+                "total_bytes": int(row["total_bytes"]) if row else 0,
+            }
 
     def list_all_media_for_audit(self) -> list[dict[str, Any]]:
         with self._connect() as conn:

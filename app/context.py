@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import MutableMapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,7 @@ class AppContext:
     allocator: DriveAllocator
     ingest: IngestService
     tg_pool: TelegramPool
-    zip_cache: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    zip_cache: MutableMapping[str, list[dict[str, Any]]] = field(default_factory=dict)
     backup: Any = None
     integrity: Any = None
     uploads: Any = None
