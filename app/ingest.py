@@ -262,6 +262,7 @@ async def _download_ddl(
 
 
 _ytdlp_update_lock = asyncio.Lock()
+_YTDLP_PLUGINS_DIR = Path(__file__).resolve().parent / "ytdlp_plugins"
 
 
 def _ytdlp_cmd() -> list[str]:
@@ -281,6 +282,8 @@ def _ytdlp_base_args(
     no_playlist: bool = True,
 ) -> list[str]:
     args: list[str] = [*_ytdlp_cmd(), "--no-playlist" if no_playlist else "--yes-playlist"]
+    if _YTDLP_PLUGINS_DIR.is_dir():
+        args.extend(["--plugin-dirs", str(_YTDLP_PLUGINS_DIR)])
     venv_deno = Path(sys.executable).parent / "deno"
     if venv_deno.is_file():
         args.extend(["--js-runtimes", f"deno:{venv_deno}"])
@@ -342,13 +345,19 @@ async def list_ytdlp_formats(
         if not fid:
             continue
         ext = str(fmt.get("ext") or "")
-        vcodec = str(fmt.get("vcodec") or "none")
-        acodec = str(fmt.get("acodec") or "none")
-        if ext == "mhtml" or (vcodec == "none" and acodec == "none"):
+        raw_vcodec = fmt.get("vcodec")
+        raw_acodec = fmt.get("acodec")
+        vcodec = str(raw_vcodec or "none")
+        acodec = str(raw_acodec or "none")
+        video_ext = str(fmt.get("video_ext") or "none")
+        audio_ext = str(fmt.get("audio_ext") or "none")
+        unprobed_video = raw_vcodec is None and raw_acodec is None and video_ext != "none"
+        unprobed_audio = raw_vcodec is None and raw_acodec is None and video_ext == "none" and audio_ext != "none"
+        if ext == "mhtml" or (vcodec == "none" and acodec == "none" and not unprobed_video and not unprobed_audio):
             continue
 
-        has_v = vcodec != "none"
-        has_a = acodec != "none"
+        has_v = vcodec != "none" or unprobed_video
+        has_a = acodec != "none" or unprobed_video or unprobed_audio
         if has_v and has_a:
             kind = "video+audio"
             select_spec = fid

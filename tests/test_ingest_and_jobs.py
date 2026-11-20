@@ -902,3 +902,58 @@ def test_job_cancel_retry_telegram_force_and_ui_hooks(tmp_path: Path, monkeypatc
         assert done_job["status"] == "done"
         assert len(done_job["media_ids"]) == 1
         assert client.get("/api/media?folder=Inbox").json()["total"] == 1
+
+
+def test_ytdlp_txxx_mirrors_plugin_and_unprobed_formats(monkeypatch):
+    import asyncio
+    import importlib.util
+    from app.ingest import _YTDLP_PLUGINS_DIR, _ytdlp_base_args, list_ytdlp_formats
+
+    args = _ytdlp_base_args()
+    assert "--plugin-dirs" in args
+    plugin_idx = args.index("--plugin-dirs")
+    assert Path(args[plugin_idx + 1]) == _YTDLP_PLUGINS_DIR
+
+    plugin_file = (
+        _YTDLP_PLUGINS_DIR
+        / "media_vault"
+        / "yt_dlp_plugins"
+        / "extractor"
+        / "txxx_mirrors.py"
+    )
+    assert plugin_file.is_file()
+    spec = importlib.util.spec_from_file_location("test_txxx_mirrors_plugin", plugin_file)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ie_cls = mod.TxxxMirrorsIE
+    assert ie_cls.suitable("https://txxx.me/videos/8860561/catfight-facesitting-humiliation/")
+    assert ie_cls.suitable("https://m.txxx.me/embed/8860561")
+    assert ie_cls.suitable("https://txxxporn.tube/videos/8860561/example/")
+    assert not ie_cls.suitable("https://example.com/videos/8860561/")
+
+    async def fake_subproc(*_args: str):
+        payload = {
+            "title": "Mirror Video",
+            "duration": 517,
+            "webpage_url": "https://txxx.me/videos/8860561/catfight-facesitting-humiliation/",
+            "formats": [
+                {"format_id": "sb0", "ext": "mhtml", "vcodec": "none", "acodec": "none"},
+                {
+                    "format_id": "hq.mp4",
+                    "ext": "mp4",
+                    "video_ext": "mp4",
+                    "audio_ext": "none",
+                },
+            ],
+        }
+        return 0, json.dumps(payload), ""
+
+    monkeypatch.setattr("app.ingest._run_subprocess", fake_subproc)
+    res = asyncio.run(
+        list_ytdlp_formats("https://txxx.me/videos/8860561/catfight-facesitting-humiliation/")
+    )
+    assert [f["id"] for f in res["formats"]] == ["hq.mp4"]
+    assert res["formats"][0]["kind"] == "video+audio"
+    assert res["formats"][0]["select_spec"] == "hq.mp4"
+
