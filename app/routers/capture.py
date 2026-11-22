@@ -257,6 +257,7 @@ async def capture_config(ctx: AppContext = Depends(get_ctx)):
         "cors_enabled": bool(cfg.get_capture_cors_origins() or cfg.capture_cors_allow_extensions),
         "cors_allow_extensions": bool(cfg.capture_cors_allow_extensions),
         "cors_origins_count": len(cfg.get_capture_cors_origins()),
+        "webdav": cfg.get_webdav_status_summary(),
     }
 
 

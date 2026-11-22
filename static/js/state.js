@@ -1,6 +1,9 @@
 export const state = {
   token: localStorage.getItem("vault_token") || "",
   authRequired: false,
+  webdavEnabled: true,
+  webdavAuthRequired: false,
+  webdavConfigured: false,
   storageMode: "telegram",
   defaultFolder: "General",
   maxUploadMb: 20480,

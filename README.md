@@ -34,6 +34,7 @@ A self-hosted server that gives you **both**:
 - **One-Tap Capture Ecosystem**: Quick-capture popup & bookmarklet (`GET /capture`), a zero-build Manifest V3 companion browser extension (`GET /api/system/extension.zip`), and Android/iOS share recipes via `POST /api/capture/quick`, with controlled CORS (`CAPTURE_CORS_ORIGINS`, `CAPTURE_CORS_ALLOW_EXTENSIONS`).
 - **Channel / Playlist / RSS Watch Subscriptions (Auto-Archiver)**: Automated polling scheduler (`/api/subscriptions`) supporting YouTube channels/playlists (Atom RSS fast-path with automatic `yt-dlp` fallback), standard RSS/Atom/RDF feeds via hardened stdlib `expat` XML parsing, first-run flood protection (`seed_only`, `initial_backfill_limit`, `dry_run`), dual deduplication ledger (`subscription_entries` + `media_items`), ReDoS-screened title regex filters, exponential backoff + auto-pause, System Sheet Subscriptions UI, and Telegram `/subs` commands.
 - **Built-in TLS ClientHello Fragmenting Proxy (`YTDLP_TLS_FRAGMENT_PROXY`)**: Lightweight loopback HTTP/CONNECT proxy (`app/tls_proxy.py`) that fragments initial TLS ClientHello packets across TCP segments when `YTDLP_PROXY` is unset, plus `yt-dlp[default,curl-cffi]` impersonation support.
+- **Read-Only WebDAV & External Players (`/webdav/`, `/webdav.m3u`)**: Mount the whole vault as a read-only WebDAV drive or open an auto-generated M3U playlist in VLC, Infuse, Kodi, MPV, and other players, with optional Basic Auth or anonymous LAN access and fail-closed defaults.
 
 ## Quick Start
 
@@ -118,4 +119,55 @@ Open `http://localhost:8080` (or your Tailscale IP) on your phone or laptop.
 2. **First-Run Flood Protection**: New subscriptions default to `seed_only=true` (`initial_backfill_limit=0`) so existing catalogs are seeded without triggering a download storm; optional `initial_backfill_limit` lets you queue only the newest N items on creation.
 3. **Telegram Commands**: Run `/subs` to view watched feeds and `/subs check <id>` to trigger an immediate check from Telegram.
 4. **Security & SSRF**: Outbound feed fetches, redirect hops, and subscription-triggered downloads block private/loopback/link-local/metadata IPs unless `SUBSCRIPTIONS_ALLOW_PRIVATE_HOSTS=true`; XML parsing forbids DTD/ENTITY/NOTATION declarations; title regexes are AST-screened against ReDoS. See [`docs/decisions/subscriptions.md`](docs/decisions/subscriptions.md) for architecture details.
+
+### 10. External Players & Read-Only WebDAV (/webdav/)
+
+Media Vault exposes your library as a **read-only** WebDAV share so external players and file managers can browse and stream media in place without copying or modifying anything. A generated M3U playlist is also available for one-tap playback.
+
+**Endpoints**
+- `GET /webdav/` — WebDAV root (browse folders and play media).
+- `GET /webdav.m3u` — M3U playlist of all playable media.
+- `GET /webdav.m3u?folder=Movies` — Playlist limited to a specific folder.
+
+**Supported clients**
+- **VLC** (desktop & mobile): open network stream and point it at the WebDAV URL or the M3U playlist.
+- **Infuse** (Apple TV / iOS / macOS): add a WebDAV share with the server URL and credentials.
+- **Kodi**: add a "Video → Network location" WebDAV source.
+- **MPV**: play the M3U playlist directly (`mpv "<base>/webdav.m3u"`).
+- **Nova Video Player** (Android / Android TV): add a WebDAV network source.
+- **Finder / Explorer / file managers**: mount the WebDAV URL as a read-only network drive (macOS ⌘K "Connect to Server", Windows "Map a network drive").
+- **rclone**: configure a `webdav` remote and mount it read-only (see below).
+
+**.env settings**
+
+```env
+WEBDAV_ENABLED=true                 # master switch (default: true)
+WEBDAV_USERNAME=vault               # username presented to clients (default: vault)
+WEBDAV_PASSWORD=<strong-password>   # dedicated WebDAV password -> Basic Auth
+WEB_AUTH_TOKEN=<your-token>         # alternative: reuse the vault token for WebDAV Basic Auth
+WEBDAV_ALLOW_ANONYMOUS=true         # allow unauthenticated access (LAN only!)
+```
+
+The share is **fail-closed by default**: with `WEBDAV_ENABLED=true` but none of `WEBDAV_PASSWORD`, `WEB_AUTH_TOKEN`, or `WEBDAV_ALLOW_ANONYMOUS=true` set, the endpoint refuses requests until you configure an auth method. For safety, only use `WEBDAV_ALLOW_ANONYMOUS=true` on a trusted LAN, never on a public host. Passwords and tokens are never exposed by the status endpoints (`/api/health`, `/api/system/status`, `/api/capture/config`).
+
+**Quick examples**
+
+VLC / MPV — open the playlist (add `user:password@` to the URL or use the player's auth prompt when Basic Auth is enabled):
+
+```bash
+vlc "http://your-host:8080/webdav.m3u"
+mpv "http://your-host:8080/webdav.m3u?folder=Movies"
+```
+
+Infuse / Kodi — in the app, choose "Add Network Share / Source", protocol **WebDAV**, address `http://your-host:8080/webdav/`, username `vault`, and the configured WebDAV password (or leave the password empty for anonymous LAN access).
+
+rclone — configure and mount read-only:
+
+```bash
+rclone config create mediavault webdav url "http://your-host:8080/webdav/" vendor other user "vault" pass "<PASSWORD>"
+rclone mount mediavault: ~/MediaVault --read-only --vfs-cache-mode full
+```
+
+The **Capture Tools → External Players & WebDAV Mount (Read-Only)** card in the System sheet shows the live status, copyable endpoints, and ready-to-paste client snippets. Your real WebDAV password is never shown or embedded; the vault token only appears in copied recipes when the existing "Include my active auth token in recipes" opt-in is enabled.
+
 

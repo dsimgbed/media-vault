@@ -26,6 +26,7 @@ from app.routers import pwa as pwa_router
 from app.routers import subscriptions as subscriptions_router
 from app.routers import system as system_router
 from app.routers import uploads as uploads_router
+from app.routers import webdav as webdav_router
 from app.routers import zip_explorer as zip_explorer_router
 from app.subscriptions import SubscriptionService
 from app.telegram_mtproto import TelegramPool
@@ -144,6 +145,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(subscriptions_router.router)
     app.include_router(media_router.router)
     app.include_router(zip_explorer_router.router)
+    app.include_router(webdav_router.router)
 
     if STATIC_DIR.exists():
         app.mount("/static", RevalidatingStaticFiles(directory=str(STATIC_DIR)), name="static")

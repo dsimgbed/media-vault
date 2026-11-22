@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel
@@ -42,6 +42,15 @@ class Settings(BaseSettings):
     capture_cors_origins: str = ""
     # Allow any well-formed Chrome/Firefox extension origin (use only if needed).
     capture_cors_allow_extensions: bool = False
+
+    # Read-Only WebDAV access for external players (e.g. VLC / foobar2000 / Plex).
+    webdav_enabled: bool = True
+    webdav_username: str = "vault"
+    # Optional dedicated HTTP Basic Auth password; if empty, falls back to WEB_AUTH_TOKEN when set.
+    webdav_password: str = ""
+    # Fail-closed anonymous access: only enable on trusted LAN/Tailscale networks.
+    webdav_allow_anonymous: bool = False
+
     max_upload_mb: int = 20480
     telegram_part_size_mb: int = 1900
 
@@ -225,6 +234,48 @@ class Settings(BaseSettings):
             seen.add(origin)
             origins.append(origin)
         return origins
+
+    def get_webdav_auth_config(self) -> dict[str, Any]:
+        enabled = bool(self.webdav_enabled)
+        username = (self.webdav_username or "").strip()
+        explicit_password = (self.webdav_password or "").strip()
+        token_password = (self.web_auth_token or "").strip()
+        if not enabled:
+            auth_mode = "disabled"
+            password = ""
+        elif explicit_password:
+            auth_mode = "basic_password"
+            password = explicit_password
+        elif token_password:
+            auth_mode = "basic_token"
+            password = token_password
+        elif self.webdav_allow_anonymous:
+            auth_mode = "anonymous"
+            password = ""
+        else:
+            auth_mode = "unconfigured"
+            password = ""
+        return {
+            "enabled": enabled,
+            "username": username,
+            "password": password,
+            "auth_mode": auth_mode,
+            "auth_required": auth_mode in ("basic_password", "basic_token"),
+            "configured": auth_mode in ("basic_password", "basic_token", "anonymous"),
+        }
+
+    def get_webdav_status_summary(self) -> dict[str, Any]:
+        cfg = self.get_webdav_auth_config()
+        return {
+            "enabled": cfg["enabled"],
+            "path": "/webdav/",
+            "playlist_path": "/webdav.m3u",
+            "username": cfg["username"] or "vault",
+            "auth_mode": cfg["auth_mode"],
+            "auth_required": cfg["auth_required"],
+            "configured": cfg["configured"],
+            "read_only": True,
+        }
 
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)

@@ -28,6 +28,7 @@ async def health(ctx: AppContext = Depends(get_ctx)):
         ytdlp_ver = "unknown"
     telemetry = ctx.tg_pool.get_telemetry()
     latest_backup = ctx.db.get_latest_backup_record()
+    webdav_summary = cfg.get_webdav_status_summary()
     return {
         "ok": True,
         "storage_mode": cfg.storage_mode,
@@ -49,6 +50,9 @@ async def health(ctx: AppContext = Depends(get_ctx)):
         "ytdlp_cookies_configured": cookies_ok,
         "ytdlp_version": ytdlp_ver,
         "subscriptions_enabled": bool(cfg.subscriptions_enabled),
+        "webdav_enabled": webdav_summary["enabled"],
+        "webdav_auth_required": webdav_summary["auth_required"],
+        "webdav_configured": webdav_summary["configured"],
     }
 
 
@@ -81,6 +85,7 @@ async def system_status(ctx: AppContext = Depends(get_ctx)):
             "active_jobs": ctx.ingest.has_active_jobs(),
             "active_staging_dirs": len(ctx.ingest.get_active_staging_dirs()),
         },
+        "webdav": cfg.get_webdav_status_summary(),
     }
 
 

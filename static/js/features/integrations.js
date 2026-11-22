@@ -73,6 +73,80 @@ function captureFolder() {
 }
 
 /**
+ * Read the WebDAV status summary exposed by /api/capture/config.
+ * While locked or still loading, fall back to the unauthenticated
+ * /api/health values mirrored onto `state`. The summary never contains
+ * passwords or tokens.
+ */
+function webdavInfo() {
+  const raw = configCache?.webdav || {};
+  const authMode = String(raw.auth_mode || "").trim();
+  const hasSummary = Boolean(authMode);
+  return {
+    enabled: hasSummary ? Boolean(raw.enabled) : Boolean(state.webdavEnabled),
+    configured: hasSummary ? Boolean(raw.configured) : Boolean(state.webdavConfigured),
+    authRequired: hasSummary
+      ? Boolean(raw.auth_required)
+      : Boolean(state.webdavAuthRequired),
+    authMode: hasSummary ? authMode : "",
+    username: hasSummary ? String(raw.username || "vault") : "vault",
+    path: hasSummary ? String(raw.path || "/webdav/") : "/webdav/",
+    playlistPath: hasSummary
+      ? String(raw.playlist_path || "/webdav.m3u")
+      : "/webdav.m3u",
+    readOnly: hasSummary ? Boolean(raw.read_only) : true,
+  };
+}
+
+function webdavStatusPill(info) {
+  if (info.authMode) {
+    switch (info.authMode) {
+      case "disabled":
+        return `<span class="pill">Disabled</span>`;
+      case "basic_password":
+        return `<span class="pill ok">Basic Auth (Dedicated)</span>`;
+      case "basic_token":
+        return `<span class="pill ok">Basic Auth (Vault Token)</span>`;
+      case "anonymous":
+        return `<span class="pill warn">Anonymous (LAN)</span>`;
+      case "unconfigured":
+        return `<span class="pill warn">Setup Needed</span>`;
+      default:
+        break;
+    }
+  }
+  const label = info.enabled
+    ? info.configured
+      ? "Enabled"
+      : "Setup Needed"
+    : "Disabled";
+  const cls = !info.enabled ? "" : info.configured ? " ok" : " warn";
+  return `<span class="pill${cls}">${label}</span>`;
+}
+
+/** Password shown in client recipes — never a real secret. */
+function webdavPasswordPlaceholder(info) {
+  if (info.authMode === "anonymous") return "(none — anonymous)";
+  if (info.authMode === "basic_token") return recipeToken();
+  return "<WEBDAV_PASSWORD>";
+}
+
+function webdavPlaylistCommand(info, base) {
+  const url = `${base}${info.playlistPath}`;
+  if (info.authRequired) {
+    return `vlc http://vault:<WEBDAV_PASSWORD>@${url.replace(/^https?:\/\//, "")}`;
+  }
+  return `vlc "${url}"`;
+}
+
+function webdavRcloneSnippet(info, base) {
+  return [
+    `rclone config create mediavault webdav url "${base}${info.path}" vendor other user "${info.username}" pass "<PASSWORD>"`,
+    `rclone mount mediavault: ~/MediaVault --read-only --vfs-cache-mode full`,
+  ].join("\n");
+}
+
+/**
  * Build a compact bookmarklet that opens the in-app capture popup.
  *
  * The bookmarklet deliberately never contains the auth token: the capture
@@ -131,6 +205,24 @@ function captureTextFor(key) {
       return `Authorization: Bearer ${recipeToken()}`;
     case "ios-body":
       return buildIosBody();
+    case "webdav-url": {
+      const info = webdavInfo();
+      return `${base}${info.path}`;
+    }
+    case "webdav-m3u": {
+      const info = webdavInfo();
+      return `${base}${info.playlistPath}`;
+    }
+    case "webdav-user":
+      return webdavInfo().username;
+    case "webdav-rclone": {
+      const info = webdavInfo();
+      return webdavRcloneSnippet(info, base);
+    }
+    case "webdav-vlc": {
+      const info = webdavInfo();
+      return webdavPlaylistCommand(info, base);
+    }
     default:
       return null;
   }
@@ -153,6 +245,16 @@ function captureLabelFor(key) {
       return "Authorization header";
     case "ios-body":
       return "Sample JSON body";
+    case "webdav-url":
+      return "WebDAV URL";
+    case "webdav-m3u":
+      return "M3U Playlist URL";
+    case "webdav-user":
+      return "WebDAV username";
+    case "webdav-rclone":
+      return "rclone setup snippet";
+    case "webdav-vlc":
+      return "VLC / MPV playlist command";
     default:
       return "Value";
   }
@@ -298,6 +400,19 @@ function renderCaptureView(view) {
   const androidCurl = buildAndroidCurl();
   const iosBody = buildIosBody();
   const iosAuth = `Authorization: Bearer ${recipeToken()}`;
+
+  const webdav = webdavInfo();
+  const webdavUrl = `${base}${webdav.path}`;
+  const webdavM3u = `${base}${webdav.playlistPath}`;
+  const webdavPassword = webdavPasswordPlaceholder(webdav);
+  const webdavStatus = webdavStatusPill(webdav);
+  const webdavNeedsSetup = webdav.enabled && (!webdav.configured || webdav.authMode === "unconfigured");
+  const webdavSetupHint = webdavNeedsSetup
+    ? `<div class="sys-hint-box">
+         WebDAV is fail-closed until you set <code>WEBDAV_PASSWORD</code>,
+         <code>WEB_AUTH_TOKEN</code>, or <code>WEBDAV_ALLOW_ANONYMOUS=true</code> in <code>.env</code>.
+       </div>`
+    : "";
 
   const versionLabel = locked
     ? "Unlock to view version"
@@ -489,6 +604,77 @@ function renderCaptureView(view) {
         <p class="small-muted sys-card-copy">
           The header stays masked as <code>${escapeHtml(TOKEN_PLACEHOLDER)}</code> unless you
           enable "Include my active auth token in recipes" above.
+        </p>
+      </div>
+
+      <div class="sys-card capture-tools-card">
+        <div class="sys-card-head">
+          <strong>External Players &amp; WebDAV Mount (Read-Only)</strong>
+          ${webdavStatus}
+        </div>
+        <p class="small-muted sys-card-copy">
+          Mount your vault as a read-only network drive or point a media player at the
+          WebDAV endpoint to stream and browse your library in place. Nothing can be
+          written back to the vault.
+        </p>
+        ${webdavSetupHint}
+        <div class="capture-copy-list">
+          <div class="capture-copy-row">
+            <div class="capture-copy-label">
+              <span>WebDAV URL</span>
+              <code>${escapeHtml(webdavUrl)}</code>
+            </div>
+            <button type="button" class="secondary btn-xs" data-capture-copy="webdav-url">Copy</button>
+          </div>
+          <div class="capture-copy-row">
+            <div class="capture-copy-label">
+              <span>M3U Playlist URL</span>
+              <code>${escapeHtml(webdavM3u)}</code>
+            </div>
+            <button type="button" class="secondary btn-xs" data-capture-copy="webdav-m3u">Copy</button>
+          </div>
+          <div class="capture-copy-row">
+            <div class="capture-copy-label">
+              <span>Username</span>
+              <code>${escapeHtml(webdav.username)}</code>
+            </div>
+            <button type="button" class="secondary btn-xs" data-capture-copy="webdav-user">Copy</button>
+          </div>
+        </div>
+
+        <div class="capture-subhead">
+          <strong>VLC / MPV / Kodi / Infuse</strong>
+          <span class="small-muted">Quick setup</span>
+        </div>
+        <ul class="capture-feature-list">
+          <li>Protocol: <code>WebDAV (HTTP/HTTPS)</code></li>
+          <li>Address / Path: <code>${escapeHtml(webdavUrl)}</code></li>
+          <li>Username: <code>${escapeHtml(webdav.username)}</code></li>
+          <li>Password: <code>${escapeHtml(webdavPassword)}</code></li>
+        </ul>
+
+        <div class="capture-code-head">
+          <span class="small-muted">rclone config + read-only mount</span>
+          <button type="button" class="secondary btn-xs" data-capture-copy="webdav-rclone">Copy rclone snippet</button>
+        </div>
+        <pre class="capture-code-block"><code>${escapeHtml(webdavRcloneSnippet(webdav, base))}</code></pre>
+
+        <div class="capture-code-head">
+          <span class="small-muted">MPV / VLC playlist command</span>
+          <button type="button" class="secondary btn-xs" data-capture-copy="webdav-vlc">Copy command</button>
+        </div>
+        <pre class="capture-code-block"><code>${escapeHtml(webdavPlaylistCommand(webdav, base))}</code></pre>
+        ${
+          webdav.authRequired
+            ? `<div class="sys-hint-box">
+                 This server requires authentication. Replace <code>&lt;WEBDAV_PASSWORD&gt;</code>
+                 with your WebDAV password (or use the vault token when "Vault Token" auth is active).
+               </div>`
+            : ""
+        }
+        <p class="small-muted sys-card-copy">
+          Tip: append <code>?folder=Movies</code> to the playlist URL to stream a specific folder,
+          e.g. <code>${escapeHtml(webdavM3u)}?folder=Movies</code>.
         </p>
       </div>
     </div>

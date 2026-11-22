@@ -18,6 +18,9 @@ function syncAuthBoxes() {
 export async function loadHealth() {
   const data = await fetch("/api/health").then((r) => r.json());
   state.authRequired = data.auth_required;
+  state.webdavEnabled = Boolean(data.webdav_enabled);
+  state.webdavAuthRequired = Boolean(data.webdav_auth_required);
+  state.webdavConfigured = Boolean(data.webdav_configured);
   state.storageMode = data.storage_mode || "telegram";
   state.defaultFolder = data.default_folder || "General";
   state.maxUploadMb = data.max_upload_mb || 20480;

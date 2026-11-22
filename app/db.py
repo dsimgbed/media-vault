@@ -1402,6 +1402,123 @@ class Database:
                     deduped[key] = name
             return sorted(deduped.values(), key=str.casefold)
 
+    def list_webdav_folder_stats(self) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            media_rows = conn.execute(
+                """
+                SELECT folder, COUNT(*) AS item_count, MAX(created_at) AS latest_created_at
+                FROM media_items
+                WHERE folder IS NOT NULL AND folder != ''
+                GROUP BY folder
+                ORDER BY item_count DESC, folder ASC
+                """
+            ).fetchall()
+            topic_rows = conn.execute(
+                """
+                SELECT DISTINCT folder_name AS folder
+                FROM folder_topics
+                WHERE folder_name IS NOT NULL AND folder_name != ''
+                ORDER BY folder_name ASC
+                """
+            ).fetchall()
+
+            merged: dict[str, dict[str, Any]] = {}
+            for row in media_rows:
+                name = str(row["folder"])
+                key = name.casefold()
+                item_count = int(row["item_count"] or 0)
+                latest_created_at = row["latest_created_at"]
+                if key in merged:
+                    merged[key]["item_count"] += item_count
+                    current_latest = merged[key]["latest_created_at"]
+                    if current_latest is None or (
+                        latest_created_at is not None and str(latest_created_at) > str(current_latest)
+                    ):
+                        merged[key]["latest_created_at"] = latest_created_at
+                else:
+                    merged[key] = {
+                        "folder": name,
+                        "item_count": item_count,
+                        "latest_created_at": latest_created_at,
+                    }
+
+            for row in topic_rows:
+                name = str(row["folder"])
+                key = name.casefold()
+                if key not in merged:
+                    merged[key] = {
+                        "folder": name,
+                        "item_count": 0,
+                        "latest_created_at": None,
+                    }
+
+            stats: list[dict[str, Any]] = []
+            for entry in merged.values():
+                stats.append(
+                    {
+                        "folder": entry["folder"],
+                        "item_count": int(entry["item_count"]),
+                        "latest_created_at": entry["latest_created_at"],
+                    }
+                )
+            stats.sort(key=lambda e: str(e["folder"]).casefold())
+            return stats
+
+    def list_webdav_folder_items(self, folder: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM media_items
+                WHERE LOWER(folder) = LOWER(?)
+                ORDER BY LOWER(filename) ASC, created_at ASC, id ASC
+                """,
+                (folder,),
+            ).fetchall()
+            return [self._hydrate_media(r) for r in rows]
+
+    def list_webdav_playlist_items(
+        self,
+        *,
+        folder: str | None = None,
+        media_type: str | None = None,
+        tag: str | None = None,
+    ) -> list[dict[str, Any]]:
+        base_where: list[str] = []
+        base_params: list[Any] = []
+
+        clean_folder: str | None = None
+        if folder and folder != "all":
+            clean_folder = str(folder).strip().strip("/")
+            if clean_folder:
+                escaped_folder = clean_folder.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                base_where.append(
+                    "(LOWER(folder) = LOWER(?) OR LOWER(folder) LIKE LOWER(?) ESCAPE '\\')"
+                )
+                base_params.append(clean_folder)
+                base_params.append(f"{escaped_folder}/%")
+
+        if media_type and media_type != "all":
+            base_where.append("media_type = ?")
+            base_params.append(media_type)
+
+        if tag and tag != "all":
+            clean_tags = normalize_tags(tag)
+            for t in clean_tags:
+                base_where.append(
+                    "EXISTS (SELECT 1 FROM media_tags mt WHERE mt.media_id = media_items.id AND mt.tag = ?)"
+                )
+                base_params.append(t)
+
+        where_sql = f"WHERE {' AND '.join(base_where)}" if base_where else ""
+        order_sql = "ORDER BY LOWER(folder) ASC, LOWER(filename) ASC, created_at ASC, id ASC"
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM media_items {where_sql} {order_sql}",
+                base_params,
+            ).fetchall()
+            return [self._hydrate_media(r) for r in rows]
+
     def list_tags(self) -> list[str]:
         with self._connect() as conn:
             rows = conn.execute(

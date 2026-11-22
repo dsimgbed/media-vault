@@ -337,7 +337,14 @@ def iter_source_range(
         return ctx.tg_pool.iter_telegram_multipart_range(
             source["parts"], start, end, prefetched=prefetched
         )
-    return ctx.tg_pool.iter_telegram_range(source["client"], source["media"], start, end)
+    return _call_iter_telegram_range(
+        ctx.tg_pool,
+        source["client"],
+        source["media"],
+        start,
+        end,
+        total_size=source.get("size"),
+    )
 
 
 async def get_zip_entries(
