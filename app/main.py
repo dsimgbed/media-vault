@@ -23,9 +23,11 @@ from app.routers import jobs as jobs_router
 from app.routers import maintenance as maintenance_router
 from app.routers import media as media_router
 from app.routers import pwa as pwa_router
+from app.routers import subscriptions as subscriptions_router
 from app.routers import system as system_router
 from app.routers import uploads as uploads_router
 from app.routers import zip_explorer as zip_explorer_router
+from app.subscriptions import SubscriptionService
 from app.telegram_mtproto import TelegramPool
 from app.uploads import UploadSessionService
 from app.zip_cache import ZipDirectoryCache
@@ -61,6 +63,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     tg_pool = TelegramPool(cfg, db, allocator, ingest)
     backup = BackupService(cfg, db, tg_pool)
     integrity = IntegrityService(cfg, db, ingest, tg_pool)
+    subscriptions = SubscriptionService(cfg, db, ingest)
+    tg_pool.subscriptions = subscriptions
     zip_cache = ZipDirectoryCache(
         db=db,
         max_l1_items=cfg.zip_cache_max_items,
@@ -77,9 +81,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         backup=backup,
         integrity=integrity,
         uploads=uploads,
+        subscriptions=subscriptions,
     )
     ingest.recover_on_startup()
     db.recover_interrupted_maintenance_runs()
+    db.reconcile_subscription_entries_with_jobs()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -88,9 +94,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await tg_pool.start()
         backup.start_scheduler()
         uploads.start_gc()
+        subscriptions.start_scheduler()
         try:
             yield
         finally:
+            await subscriptions.stop_scheduler()
             await backup.stop_scheduler()
             await integrity.shutdown()
             await uploads.stop_gc()
@@ -126,12 +134,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.backup = backup
     app.state.integrity = integrity
     app.state.uploads = uploads
+    app.state.subscriptions = subscriptions
 
     app.include_router(system_router.router)
     app.include_router(maintenance_router.router)
     app.include_router(jobs_router.router)
     app.include_router(ingest_router.router)
     app.include_router(uploads_router.router)
+    app.include_router(subscriptions_router.router)
     app.include_router(media_router.router)
     app.include_router(zip_explorer_router.router)
 

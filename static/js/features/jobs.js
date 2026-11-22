@@ -385,6 +385,8 @@ export function connectEvents() {
         emit("maintenance:update", payload);
       } else if (payload.type === "backup_update") {
         emit("backup:update", payload);
+      } else if (payload.type === "subscription_update") {
+        emit("subscriptions:update", payload);
       }
     } catch (err) {
       console.warn("SSE event error:", err);

@@ -48,6 +48,7 @@ async def health(ctx: AppContext = Depends(get_ctx)):
         "ingest_concurrency": cfg.ingest_concurrency,
         "ytdlp_cookies_configured": cookies_ok,
         "ytdlp_version": ytdlp_ver,
+        "subscriptions_enabled": bool(cfg.subscriptions_enabled),
     }
 
 
@@ -69,6 +70,7 @@ async def system_status(ctx: AppContext = Depends(get_ctx)):
         },
         "integrity": ctx.integrity.get_status() if ctx.integrity else {},
         "uploads": ctx.uploads.get_status_summary() if ctx.uploads else {},
+        "subscriptions": ctx.subscriptions.get_health_summary() if ctx.subscriptions else {},
         "zip_cache": (
             ctx.zip_cache.stats()
             if hasattr(ctx.zip_cache, "stats")
@@ -131,10 +133,11 @@ async def inspect_ytdlp_formats(
     if not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
     try:
+        effective_proxy = await ctx.ingest.get_effective_proxy()
         return await list_ytdlp_formats(
             url,
             cookies_file=ctx.settings.ytdlp_cookies_file,
-            proxy=ctx.settings.ytdlp_proxy,
+            proxy=effective_proxy,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -149,10 +152,11 @@ async def inspect_ytdlp_playlist(
     if not url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
     try:
+        effective_proxy = await ctx.ingest.get_effective_proxy()
         res = await expand_ytdlp_playlist(
             url,
             cookies_file=ctx.settings.ytdlp_cookies_file,
-            proxy=ctx.settings.ytdlp_proxy,
+            proxy=effective_proxy,
             max_items=max(1, min(500, int(payload.max_items))),
         )
     except Exception as exc:

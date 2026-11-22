@@ -25,3 +25,4 @@ class AppContext:
     backup: Any = None
     integrity: Any = None
     uploads: Any = None
+    subscriptions: Any = None

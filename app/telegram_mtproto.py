@@ -398,6 +398,7 @@ class TelegramPool:
         self.db = db
         self.allocator = allocator
         self.ingest = ingest
+        self.subscriptions: Any = None
         self.clients: list[tuple[TelegramApiConfig, TelegramClient]] = []
         self._tasks: list[asyncio.Task] = []
         self._topic_lock = asyncio.Lock()
@@ -1834,6 +1835,51 @@ class TelegramPool:
                     pass
         return user_default
 
+    async def handle_subs_command(self, raw_args: str = "") -> str:
+        svc = self.subscriptions
+        if svc is None:
+            return "Subscriptions service is unavailable."
+        parts = raw_args.strip().split()
+        if not parts:
+            subs = svc.list_subscriptions()
+            if not subs:
+                return "No subscriptions configured yet."
+            lines = [f"**Subscriptions ({len(subs)}):**"]
+            for s in subs[:25]:
+                status = str(s.get("last_status") or "pending")
+                state_lbl = status if s.get("enabled") else f"paused/{status}"
+                short_id = str(s.get("id") or "")[:12]
+                lines.append(
+                    f"• `{short_id}` **{s.get('name') or s.get('source_url')}** "
+                    f"(`{state_lbl}`, every {s.get('interval_minutes')}m, "
+                    f"{int(s.get('items_ingested_count') or 0)} archived)"
+                )
+            lines.append("\nRun `/subs check <id>` to check one now.")
+            return "\n".join(lines)
+
+        cmd = parts[0].lower()
+        if cmd == "check" and len(parts) >= 2:
+            target = parts[1].strip()
+            subs = svc.list_subscriptions()
+            match = next(
+                (s for s in subs if str(s.get("id")) == target or str(s.get("id", "")).startswith(target)),
+                None,
+            )
+            if not match:
+                return f"Subscription `{target}` not found."
+            try:
+                res = await svc.check_subscription(match["id"], dry_run=False, trigger="telegram")
+                return (
+                    f"Checked **{match.get('name') or match['id']}**: "
+                    f"{int(res.get('discovered_count', 0))} discovered, "
+                    f"{int(res.get('queued_count', 0))} queued, "
+                    f"{int(res.get('seeded_count', 0))} seeded."
+                )
+            except Exception as exc:
+                return f"Check failed for `{match['id']}`: {exc}"
+
+        return "Usage: `/subs` or `/subs check <id>`"
+
     def _register_handlers(self, cfg: TelegramApiConfig, client: TelegramClient) -> None:
         @client.on(events.NewMessage(pattern=r"^/(start|help)$"))
         async def on_help(event):
@@ -1855,10 +1901,19 @@ class TelegramPool:
                 "• Optional quality: `format:1080p`, `format:720p`, `format:480p`, `format:audio`.\n"
                 "• Bypass duplicate check with `--force` or `force:true`.\n"
                 "• Set sticky folder: `/folder Movies`\n"
-                "• List folders: `/folders` | Status: `/status` | Recent: `/recent`\n"
+                "• List folders: `/folders` | Status: `/status` | Recent: `/recent` | Subscriptions: `/subs`\n"
                 "• Cancel active job: `/cancel [job_id]` | Retry job: `/retry [job_id]`\n\n"
                 f"Gallery: {self._gallery_link()}"
             )
+
+        @client.on(events.NewMessage(pattern=r"^/subs(?:\s+(.*))?$"))
+        async def on_subs(event):
+            if not self._is_authorized(event.sender_id):
+                return
+            if self._is_archive_chat(event.chat_id) and not await self._claim_group_message(event.chat_id, event.id):
+                return
+            reply = await self.handle_subs_command(event.pattern_match.group(1) or "")
+            await event.reply(reply)
 
         @client.on(events.NewMessage(pattern=r"^/folder(?:\s+(.+))?$"))
         async def on_folder(event):

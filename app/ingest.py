@@ -17,7 +17,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
 
@@ -25,6 +25,7 @@ from app.allocator import DriveAllocator, fmt_size, sanitize_folder
 from app.config import Settings
 from app.db import Database, normalize_tags
 from app.thumbnails import extract_media_metadata, generate_thumbnail, generate_video_preview
+from app.tls_proxy import TlsFragmentProxy
 
 logger = logging.getLogger(__name__)
 
@@ -84,12 +85,51 @@ def classify_media(path: Path) -> tuple[str, str]:
     return "file", mime or "application/octet-stream"
 
 
-async def is_direct_download(url: str) -> bool:
+_DDL_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+
+async def _assert_public_url(url: str) -> str:
+    from app.subscriptions import assert_safe_public_url
+
+    return await assert_safe_public_url(url, allow_private=False)
+
+
+async def is_direct_download(
+    url: str, *, proxy: str = "", block_private_hosts: bool = False
+) -> bool:
+    if block_private_hosts:
+        await _assert_public_url(url)
     ext = Path(urlparse(url).path).suffix.lower()
     if ext in DDL_EXTENSIONS:
         return True
+    clean_proxy = proxy.strip()
+    proxy_url = clean_proxy if clean_proxy.startswith(("http://", "https://")) else None
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
+        if block_private_hosts:
+            current = url
+            async with httpx.AsyncClient(
+                proxy=proxy_url,
+                follow_redirects=False,
+                timeout=10.0,
+            ) as client:
+                for _ in range(6):
+                    resp = await client.head(current)
+                    if resp.status_code in _DDL_REDIRECT_STATUSES:
+                        location = (resp.headers.get("location") or "").strip()
+                        if not location:
+                            return False
+                        current = await _assert_public_url(urljoin(current, location))
+                        continue
+                    ctype = resp.headers.get("content-type", "").lower()
+                    if ctype and not ctype.startswith(("text/html", "application/xhtml")):
+                        return True
+                    return False
+            return False
+        async with httpx.AsyncClient(
+            proxy=proxy_url,
+            follow_redirects=True,
+            timeout=10.0,
+        ) as client:
             resp = await client.head(url)
             ctype = resp.headers.get("content-type", "").lower()
             if ctype and not ctype.startswith(("text/html", "application/xhtml")):
@@ -197,10 +237,14 @@ async def _download_ddl(
     url: str,
     job_dir: Path,
     *,
+    proxy: str = "",
     on_progress: ProgressHook | None = None,
     on_proc: ProcHook | None = None,
+    block_private_hosts: bool = False,
 ) -> list[Path]:
     last_report = 0.0
+    clean_proxy = proxy.strip()
+    http_proxy = clean_proxy if clean_proxy.startswith(("http://", "https://")) else None
 
     async def report(pct: float, msg: str) -> None:
         nonlocal last_report
@@ -209,7 +253,7 @@ async def _download_ddl(
             last_report = now
             await on_progress(pct, msg)
 
-    aria2c = shutil.which("aria2c")
+    aria2c = None if block_private_hosts else shutil.which("aria2c")
     if aria2c:
         async def handle_aria_line(line: str) -> None:
             m = _ARIA_PCT_RE.search(line)
@@ -218,7 +262,7 @@ async def _download_ddl(
                 speed = f" ({m.group(2)})" if m.group(2) else ""
                 await report(pct, f"Downloading{speed}: {pct:.0f}%")
 
-        code, tail = await _invoke_streaming(
+        aria_args: list[str] = [
             aria2c,
             "--dir",
             str(job_dir),
@@ -226,14 +270,62 @@ async def _download_ddl(
             "--content-disposition-default-utf8=true",
             "--auto-file-renaming=true",
             "--summary-interval=1",
-            url,
+        ]
+        if http_proxy:
+            aria_args.extend(["--all-proxy", http_proxy])
+        aria_args.append(url)
+        code, tail = await _invoke_streaming(
+            *aria_args,
             on_line=handle_aria_line,
             on_proc=on_proc,
         )
         if code != 0:
             raise RuntimeError(f"aria2c failed: {' | '.join(tail[-5:])[-300:]}")
+    elif block_private_hosts:
+        current = await _assert_public_url(url)
+        redirects_left = 5
+        async with httpx.AsyncClient(
+            proxy=http_proxy,
+            follow_redirects=False,
+            timeout=None,
+        ) as client:
+            while True:
+                async with client.stream("GET", current) as resp:
+                    if resp.status_code in _DDL_REDIRECT_STATUSES:
+                        location = (resp.headers.get("location") or "").strip()
+                        if not location:
+                            raise RuntimeError(f"HTTP {resp.status_code} redirect without Location")
+                        if redirects_left <= 0:
+                            raise RuntimeError("Too many redirects while downloading media")
+                        redirects_left -= 1
+                        current = await _assert_public_url(urljoin(current, location))
+                        continue
+                    resp.raise_for_status()
+                    total = int(resp.headers.get("content-length") or 0)
+                    filename = ""
+                    cd = resp.headers.get("content-disposition", "")
+                    if "filename=" in cd:
+                        filename = cd.split("filename=")[-1].strip('"; ')
+                    if not filename:
+                        filename = Path(unquote(urlparse(str(resp.url)).path)).name or f"download_{uuid.uuid4().hex[:8]}"
+                    target = job_dir / Path(filename).name
+                    received = 0
+                    with target.open("wb") as f:
+                        async for chunk in resp.aiter_bytes(chunk_size=1024 * 1024):
+                            f.write(chunk)
+                            received += len(chunk)
+                            if total > 0:
+                                pct = (received / total) * 100.0
+                                await report(pct, f"Downloading: {pct:.0f}% ({fmt_size(received)} / {fmt_size(total)})")
+                            else:
+                                await report(25.0, f"Downloading: {fmt_size(received)}")
+                    break
     else:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=None) as client:
+        async with httpx.AsyncClient(
+            proxy=http_proxy,
+            follow_redirects=True,
+            timeout=None,
+        ) as client:
             async with client.stream("GET", url) as resp:
                 resp.raise_for_status()
                 total = int(resp.headers.get("content-length") or 0)
@@ -501,7 +593,7 @@ async def update_ytdlp() -> dict[str, Any]:
             "pip",
             "install",
             "--upgrade",
-            "yt-dlp[default]",
+            "yt-dlp[default,curl-cffi]",
         )
         if code != 0:
             detail = (err or out).strip()[-500:]
@@ -606,6 +698,15 @@ class IngestService:
         self._active_slots = 0
         self._staging_lock = threading.Lock()
         self._active_staging_dirs: set[Path] = set()
+        self._tls_proxy = TlsFragmentProxy()
+
+    async def get_effective_proxy(self) -> str:
+        explicit = (self.settings.ytdlp_proxy or "").strip()
+        if explicit:
+            return explicit
+        if getattr(self.settings, "ytdlp_tls_fragment_proxy", True):
+            return await self._tls_proxy.start()
+        return ""
 
     @staticmethod
     def _parse_iso_utc(raw: str | None) -> datetime | None:
@@ -1024,22 +1125,24 @@ class IngestService:
                 raise asyncio.TimeoutError("Timed out waiting for ingest jobs")
 
     async def shutdown(self) -> None:
-        for procs in list(self._active_procs.values()):
-            for proc in list(procs):
-                if proc.returncode is None:
-                    try:
-                        proc.terminate()
-                    except ProcessLookupError:
-                        pass
-        tasks = list(self._background_tasks)
-        if not tasks:
-            return
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        self._background_tasks.clear()
-        self._job_tasks.clear()
-        self._active_procs.clear()
+        try:
+            for procs in list(self._active_procs.values()):
+                for proc in list(procs):
+                    if proc.returncode is None:
+                        try:
+                            proc.terminate()
+                        except ProcessLookupError:
+                            pass
+            tasks = list(self._background_tasks)
+            if tasks:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                self._background_tasks.clear()
+                self._job_tasks.clear()
+                self._active_procs.clear()
+        finally:
+            await self._tls_proxy.stop()
 
     def record_media(
         self,
@@ -1225,10 +1328,19 @@ class IngestService:
         format_spec: str | None = None,
         on_progress: ProgressHook | None = None,
         force: bool = False,
+        block_private_hosts: bool = False,
     ) -> list[dict[str, Any]]:
         if job_id in self._cancelled_jobs:
             self.db.update_job(job_id, status="cancelled", message="Cancelled by user")
             raise asyncio.CancelledError()
+
+        enforce_public = bool(
+            block_private_hosts
+            or (
+                source_origin == "subscription"
+                and not bool(getattr(self.settings, "subscriptions_allow_private_hosts", False))
+            )
+        )
 
         if not force:
             existing = self.db.find_media_by_source_url(url)
@@ -1273,7 +1385,15 @@ class IngestService:
                 job_dir = Path(tempfile.mkdtemp(dir=self.settings.staging_dir))
                 self.register_staging_dir(job_dir)
                 try:
-                    ddl = await is_direct_download(url)
+                    if enforce_public:
+                        await _assert_public_url(url)
+                    effective_proxy = await self.get_effective_proxy()
+                    ddl_check_kwargs: dict[str, Any] = {}
+                    if effective_proxy and _accepts_kwarg(is_direct_download, "proxy"):
+                        ddl_check_kwargs["proxy"] = effective_proxy
+                    if enforce_public and _accepts_kwarg(is_direct_download, "block_private_hosts"):
+                        ddl_check_kwargs["block_private_hosts"] = True
+                    ddl = await is_direct_download(url, **ddl_check_kwargs)
                     kind = "ddl" if ddl else "ytdlp"
                     self.db.update_job(
                         job_id,
@@ -1286,11 +1406,15 @@ class IngestService:
                         ddl_kwargs: dict[str, Any] = {"on_progress": report_dl}
                         if _accepts_kwarg(_download_ddl, "on_proc"):
                             ddl_kwargs["on_proc"] = _on_proc
+                        if effective_proxy and _accepts_kwarg(_download_ddl, "proxy"):
+                            ddl_kwargs["proxy"] = effective_proxy
+                        if enforce_public and _accepts_kwarg(_download_ddl, "block_private_hosts"):
+                            ddl_kwargs["block_private_hosts"] = True
                         files = await _download_ddl(url, job_dir, **ddl_kwargs)
                     else:
                         yt_kwargs: dict[str, Any] = {
                             "cookies_file": self.settings.ytdlp_cookies_file,
-                            "proxy": self.settings.ytdlp_proxy,
+                            "proxy": effective_proxy,
                             "format_spec": format_spec,
                             "concurrent_fragments": self.settings.ytdlp_concurrent_fragments,
                             "on_progress": report_dl,

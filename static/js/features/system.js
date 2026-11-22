@@ -156,6 +156,12 @@ export function initSystem() {
   $("sheetCaptureBtn")?.addEventListener("click", () => {
     openSystemSheet("capture");
   });
+  $("subscriptionsBtn")?.addEventListener("click", () => {
+    openSystemSheet("subscriptions");
+  });
+  $("sheetSubscriptionsBtn")?.addEventListener("click", () => {
+    openSystemSheet("subscriptions");
+  });
   $("closeSystemSheetBtn")?.addEventListener("click", () => $("systemSheet")?.close());
   $("systemSheet")?.addEventListener("click", (e) => {
     if (e.target === $("systemSheet")) $("systemSheet").close();

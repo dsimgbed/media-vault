@@ -372,8 +372,104 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_zip_entries_cache_accessed
                     ON zip_entries_cache(last_accessed_at ASC);
+
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    normalized_source_url TEXT NOT NULL,
+                    source_kind TEXT NOT NULL DEFAULT 'auto',
+                    folder TEXT NOT NULL DEFAULT 'General',
+                    tags TEXT NOT NULL DEFAULT '',
+                    format_spec TEXT,
+                    forward_to_telegram INTEGER NOT NULL DEFAULT 1,
+                    interval_minutes INTEGER NOT NULL DEFAULT 60,
+                    max_items_per_check INTEGER NOT NULL DEFAULT 10,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    seed_only INTEGER NOT NULL DEFAULT 1,
+                    initial_backfill_limit INTEGER NOT NULL DEFAULT 0,
+                    seeded_at TEXT,
+                    title_include_regex TEXT,
+                    title_exclude_regex TEXT,
+                    last_checked_at TEXT,
+                    next_check_at TEXT,
+                    last_status TEXT NOT NULL DEFAULT 'pending',
+                    last_error TEXT,
+                    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                    items_ingested_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS subscription_entries (
+                    subscription_id TEXT NOT NULL,
+                    entry_key TEXT NOT NULL,
+                    title TEXT NOT NULL DEFAULT '',
+                    url TEXT NOT NULL,
+                    normalized_url TEXT,
+                    status TEXT NOT NULL DEFAULT 'seen',
+                    media_id TEXT,
+                    job_id TEXT,
+                    error TEXT,
+                    published_at TEXT,
+                    first_seen_at TEXT NOT NULL,
+                    last_attempt_at TEXT,
+                    PRIMARY KEY (subscription_id, entry_key),
+                    FOREIGN KEY (subscription_id) REFERENCES subscriptions(id) ON DELETE CASCADE
+                );
                 """
             )
+            # Safe migration for subscription tables created by an earlier schema revision.
+            subscription_cols = {
+                r["name"] for r in conn.execute("PRAGMA table_info(subscriptions)").fetchall()
+            }
+            for col_name, col_ddl in (
+                ("normalized_source_url", "TEXT NOT NULL DEFAULT ''"),
+                ("source_kind", "TEXT NOT NULL DEFAULT 'auto'"),
+                ("folder", "TEXT NOT NULL DEFAULT 'General'"),
+                ("tags", "TEXT NOT NULL DEFAULT ''"),
+                ("format_spec", "TEXT"),
+                ("forward_to_telegram", "INTEGER NOT NULL DEFAULT 1"),
+                ("interval_minutes", "INTEGER NOT NULL DEFAULT 60"),
+                ("max_items_per_check", "INTEGER NOT NULL DEFAULT 10"),
+                ("enabled", "INTEGER NOT NULL DEFAULT 1"),
+                ("seed_only", "INTEGER NOT NULL DEFAULT 1"),
+                ("initial_backfill_limit", "INTEGER NOT NULL DEFAULT 0"),
+                ("seeded_at", "TEXT"),
+                ("title_include_regex", "TEXT"),
+                ("title_exclude_regex", "TEXT"),
+                ("last_checked_at", "TEXT"),
+                ("next_check_at", "TEXT"),
+                ("last_status", "TEXT NOT NULL DEFAULT 'pending'"),
+                ("last_error", "TEXT"),
+                ("consecutive_failures", "INTEGER NOT NULL DEFAULT 0"),
+                ("items_ingested_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if col_name not in subscription_cols:
+                    conn.execute(f"ALTER TABLE subscriptions ADD COLUMN {col_name} {col_ddl}")
+            subscription_entry_cols = {
+                r["name"] for r in conn.execute("PRAGMA table_info(subscription_entries)").fetchall()
+            }
+            for col_name, col_ddl in (
+                ("title", "TEXT NOT NULL DEFAULT ''"),
+                ("url", "TEXT NOT NULL DEFAULT ''"),
+                ("normalized_url", "TEXT"),
+                ("status", "TEXT NOT NULL DEFAULT 'seen'"),
+                ("media_id", "TEXT"),
+                ("job_id", "TEXT"),
+                ("error", "TEXT"),
+                ("published_at", "TEXT"),
+                ("first_seen_at", "TEXT NOT NULL DEFAULT ''"),
+                ("last_attempt_at", "TEXT"),
+            ):
+                if col_name not in subscription_entry_cols:
+                    conn.execute(f"ALTER TABLE subscription_entries ADD COLUMN {col_name} {col_ddl}")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_subscriptions_due ON subscriptions(enabled, next_check_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_subscriptions_created ON subscriptions(created_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_sub_entries_sub_seen ON subscription_entries(subscription_id, first_seen_at DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_sub_entries_job ON subscription_entries(job_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_sub_entries_norm_url ON subscription_entries(subscription_id, normalized_url)")
             # Safe migration for existing DBs created before folder / Telegram storage support
             cols = {r["name"] for r in conn.execute("PRAGMA table_info(media_items)").fetchall()}
             if "folder" not in cols:
@@ -1480,6 +1576,9 @@ class Database:
             zip_cache_entries = int(
                 conn.execute("SELECT COUNT(*) FROM zip_entries_cache").fetchone()[0]
             )
+            subscriptions_count = int(
+                conn.execute("SELECT COUNT(*) FROM subscriptions").fetchone()[0]
+            )
         folders_count = len(self.list_folders())
         return {
             "db_path": str(self.db_path),
@@ -1493,6 +1592,7 @@ class Database:
             "tags_count": tags_count,
             "backups_count": backups_count,
             "zip_cache_entries": zip_cache_entries,
+            "subscriptions_count": subscriptions_count,
         }
 
     def get_zip_cache_entry(self, media_id: str) -> dict[str, Any] | None:
@@ -2229,4 +2329,480 @@ class Database:
                 (now,),
             )
             return int(cur.rowcount or 0)
+
+    @staticmethod
+    def _hydrate_subscription(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        item = dict(row)
+        item["tags"] = normalize_tags(item.get("tags") or "")
+        for key in ("forward_to_telegram", "enabled", "seed_only"):
+            item[key] = bool(item.get(key))
+        for key in (
+            "interval_minutes",
+            "max_items_per_check",
+            "initial_backfill_limit",
+            "consecutive_failures",
+            "items_ingested_count",
+        ):
+            item[key] = int(item.get(key) or 0)
+        return item
+
+    def create_subscription(
+        self,
+        *,
+        name: str,
+        source_url: str,
+        source_kind: str = "auto",
+        folder: str = "General",
+        tags: str | list[str] | None = None,
+        format_spec: str | None = None,
+        forward_to_telegram: bool = True,
+        interval_minutes: int = 60,
+        max_items_per_check: int = 10,
+        enabled: bool = True,
+        seed_only: bool = True,
+        initial_backfill_limit: int = 0,
+        title_include_regex: str | None = None,
+        title_exclude_regex: str | None = None,
+        next_check_at: str | None = None,
+    ) -> dict[str, Any]:
+        sub_id = uuid.uuid4().hex[:12]
+        now = utc_now_iso()
+        normalized_source_url = normalize_source_url(source_url) or str(source_url or "").strip()
+        if not enabled:
+            resolved_next_check_at = None
+        elif next_check_at is None:
+            resolved_next_check_at = now
+        else:
+            resolved_next_check_at = next_check_at
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO subscriptions (
+                    id, name, source_url, normalized_source_url, source_kind, folder, tags,
+                    format_spec, forward_to_telegram, interval_minutes, max_items_per_check,
+                    enabled, seed_only, initial_backfill_limit, next_check_at,
+                    title_include_regex, title_exclude_regex, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    sub_id,
+                    name,
+                    source_url,
+                    normalized_source_url,
+                    source_kind,
+                    folder,
+                    ",".join(normalize_tags(tags)),
+                    format_spec,
+                    1 if forward_to_telegram else 0,
+                    int(interval_minutes),
+                    int(max_items_per_check),
+                    1 if enabled else 0,
+                    1 if seed_only else 0,
+                    int(initial_backfill_limit),
+                    resolved_next_check_at,
+                    title_include_regex,
+                    title_exclude_regex,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute("SELECT * FROM subscriptions WHERE id = ?", (sub_id,)).fetchone()
+            assert row is not None
+            sub = self._hydrate_subscription(row)
+        self.publish({"type": "subscription_update", "subscription_id": sub_id, "action": "created"})
+        return sub
+
+    def get_subscription(self, subscription_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM subscriptions WHERE id = ?", (subscription_id,)
+            ).fetchone()
+            return self._hydrate_subscription(row) if row else None
+
+    def list_subscriptions(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            if enabled_only:
+                rows = conn.execute(
+                    "SELECT * FROM subscriptions WHERE enabled = 1 ORDER BY created_at DESC"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM subscriptions ORDER BY created_at DESC"
+                ).fetchall()
+            return [self._hydrate_subscription(r) for r in rows]
+
+    def list_due_subscriptions(self, now_iso: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        safe_limit = max(1, int(limit))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM subscriptions
+                WHERE enabled = 1 AND (next_check_at IS NULL OR next_check_at <= ?)
+                ORDER BY COALESCE(next_check_at, '') ASC, created_at ASC
+                LIMIT ?
+                """,
+                (now_iso, safe_limit),
+            ).fetchall()
+            return [self._hydrate_subscription(r) for r in rows]
+
+    def update_subscription(
+        self, subscription_id: str, *, publish: bool = True, **fields: Any
+    ) -> dict[str, Any] | None:
+        allowed = {
+            "name",
+            "source_url",
+            "normalized_source_url",
+            "source_kind",
+            "folder",
+            "tags",
+            "format_spec",
+            "forward_to_telegram",
+            "interval_minutes",
+            "max_items_per_check",
+            "enabled",
+            "seed_only",
+            "initial_backfill_limit",
+            "seeded_at",
+            "title_include_regex",
+            "title_exclude_regex",
+            "last_checked_at",
+            "next_check_at",
+            "last_status",
+            "last_error",
+            "consecutive_failures",
+            "items_ingested_count",
+            "updated_at",
+        }
+        updates: dict[str, Any] = {}
+        for key, value in fields.items():
+            if key not in allowed:
+                continue
+            if key == "source_url" and "normalized_source_url" not in fields:
+                updates["normalized_source_url"] = normalize_source_url(value) or str(
+                    value or ""
+                ).strip()
+            if key == "tags":
+                updates["tags"] = ",".join(normalize_tags(value))
+            elif key in ("forward_to_telegram", "enabled", "seed_only"):
+                updates[key] = 1 if value else 0
+            else:
+                updates[key] = value
+        if "updated_at" not in updates:
+            updates["updated_at"] = utc_now_iso()
+
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT id FROM subscriptions WHERE id = ?", (subscription_id,)
+            ).fetchone()
+            if not existing:
+                return None
+            sets = [f"{col} = ?" for col in updates]
+            params: list[Any] = [*updates.values(), subscription_id]
+            conn.execute(
+                f"UPDATE subscriptions SET {', '.join(sets)} WHERE id = ?",
+                params,
+            )
+            row = conn.execute(
+                "SELECT * FROM subscriptions WHERE id = ?", (subscription_id,)
+            ).fetchone()
+            sub = self._hydrate_subscription(row) if row else None
+        if publish and sub is not None:
+            self.publish(
+                {
+                    "type": "subscription_update",
+                    "subscription_id": subscription_id,
+                    "action": "updated",
+                }
+            )
+        return sub
+
+    def increment_subscription_ingested(self, subscription_id: str, delta: int = 1) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE subscriptions
+                SET items_ingested_count = items_ingested_count + ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (int(delta), utc_now_iso(), subscription_id),
+            )
+
+    def delete_subscription(self, subscription_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM subscriptions WHERE id = ?", (subscription_id,)
+            ).fetchone()
+            if not row:
+                return None
+            sub = self._hydrate_subscription(row)
+            conn.execute(
+                "DELETE FROM subscription_entries WHERE subscription_id = ?", (subscription_id,)
+            )
+            conn.execute("DELETE FROM subscriptions WHERE id = ?", (subscription_id,))
+        self.publish(
+            {
+                "type": "subscription_update",
+                "subscription_id": subscription_id,
+                "action": "deleted",
+            }
+        )
+        return sub
+
+    def get_subscription_entries_map(
+        self,
+        subscription_id: str,
+        entry_keys: list[str],
+        normalized_urls: list[str] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        keys = list(dict.fromkeys(str(k) for k in entry_keys if k))
+        urls = list(dict.fromkeys(str(u) for u in (normalized_urls or []) if u))
+        if not keys and not urls:
+            return {}
+
+        matched: dict[str, dict[str, Any]] = {}
+        batch_size = 200
+        with self._connect() as conn:
+            for i in range(0, len(keys), batch_size):
+                chunk = keys[i : i + batch_size]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT * FROM subscription_entries
+                    WHERE subscription_id = ? AND entry_key IN ({placeholders})
+                    """,
+                    [subscription_id, *chunk],
+                ).fetchall()
+                for row in rows:
+                    matched.setdefault(str(row["entry_key"]), dict(row))
+            for i in range(0, len(urls), batch_size):
+                chunk = urls[i : i + batch_size]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT * FROM subscription_entries
+                    WHERE subscription_id = ? AND normalized_url IN ({placeholders})
+                    """,
+                    [subscription_id, *chunk],
+                ).fetchall()
+                for row in rows:
+                    matched.setdefault(str(row["entry_key"]), dict(row))
+
+        result: dict[str, dict[str, Any]] = {}
+        for entry_key, entry in matched.items():
+            result[entry_key] = entry
+            norm = entry.get("normalized_url")
+            if norm:
+                result.setdefault(str(norm), entry)
+        return result
+
+    def upsert_subscription_entry(
+        self,
+        subscription_id: str,
+        entry_key: str,
+        *,
+        title: str,
+        url: str,
+        normalized_url: str | None = None,
+        status: str = "seen",
+        media_id: str | None = None,
+        job_id: str | None = None,
+        error: str | None = None,
+        published_at: str | None = None,
+        last_attempt_at: str | None = None,
+    ) -> dict[str, Any]:
+        now = utc_now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO subscription_entries (
+                    subscription_id, entry_key, title, url, normalized_url, status,
+                    media_id, job_id, error, published_at, first_seen_at, last_attempt_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(subscription_id, entry_key) DO UPDATE SET
+                    title = excluded.title,
+                    url = excluded.url,
+                    normalized_url = excluded.normalized_url,
+                    status = excluded.status,
+                    media_id = COALESCE(excluded.media_id, subscription_entries.media_id),
+                    job_id = excluded.job_id,
+                    error = excluded.error,
+                    published_at = excluded.published_at,
+                    last_attempt_at = excluded.last_attempt_at
+                """,
+                (
+                    subscription_id,
+                    entry_key,
+                    title,
+                    url,
+                    normalized_url,
+                    status,
+                    media_id,
+                    job_id,
+                    error,
+                    published_at,
+                    now,
+                    last_attempt_at,
+                ),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM subscription_entries
+                WHERE subscription_id = ? AND entry_key = ?
+                """,
+                (subscription_id, entry_key),
+            ).fetchone()
+            assert row is not None
+            return dict(row)
+
+    def update_subscription_entry_status(
+        self,
+        subscription_id: str,
+        entry_key: str,
+        *,
+        status: str,
+        media_id: str | None = None,
+        job_id: str | None = None,
+        error: str | None = None,
+        last_attempt_at: str | None = None,
+    ) -> None:
+        sets = ["status = ?", "error = ?", "last_attempt_at = ?"]
+        params: list[Any] = [status, error, last_attempt_at or utc_now_iso()]
+        if media_id is not None:
+            sets.append("media_id = ?")
+            params.append(media_id)
+        if job_id is not None:
+            sets.append("job_id = ?")
+            params.append(job_id)
+        params.extend([subscription_id, entry_key])
+        with self._connect() as conn:
+            conn.execute(
+                f"""
+                UPDATE subscription_entries
+                SET {', '.join(sets)}
+                WHERE subscription_id = ? AND entry_key = ?
+                """,
+                params,
+            )
+
+    def list_subscription_entries(
+        self,
+        subscription_id: str,
+        *,
+        status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        where = "subscription_id = ?"
+        params: list[Any] = [subscription_id]
+        if status and status != "all":
+            where += " AND status = ?"
+            params.append(status)
+        safe_limit = max(1, int(limit))
+        safe_offset = max(0, int(offset))
+        with self._connect() as conn:
+            total = int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM subscription_entries WHERE {where}", params
+                ).fetchone()[0]
+            )
+            rows = conn.execute(
+                f"""
+                SELECT * FROM subscription_entries WHERE {where}
+                ORDER BY COALESCE(last_attempt_at, first_seen_at) DESC, first_seen_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                [*params, safe_limit, safe_offset],
+            ).fetchall()
+            return [dict(r) for r in rows], total
+
+    def reconcile_subscription_entries_with_jobs(self) -> int:
+        now = utc_now_iso()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT e.subscription_id, e.entry_key,
+                       j.status AS job_status, j.message AS job_message,
+                       j.media_ids_json AS job_media_ids_json
+                FROM subscription_entries e
+                LEFT JOIN ingest_jobs j ON j.id = e.job_id
+                WHERE e.status = 'queued' AND e.job_id IS NOT NULL
+                """
+            ).fetchall()
+            reconciled = 0
+            for row in rows:
+                job_status = str(row["job_status"] or "")
+                sub_id = str(row["subscription_id"])
+                entry_key = str(row["entry_key"])
+                if job_status == "done":
+                    media_id: str | None = None
+                    raw_ids = row["job_media_ids_json"]
+                    if raw_ids:
+                        try:
+                            parsed = json.loads(raw_ids)
+                        except (json.JSONDecodeError, TypeError):
+                            parsed = []
+                        if isinstance(parsed, list) and parsed:
+                            media_id = str(parsed[0])
+                    conn.execute(
+                        """
+                        UPDATE subscription_entries
+                        SET status = 'ingested', media_id = ?, error = NULL, last_attempt_at = ?
+                        WHERE subscription_id = ? AND entry_key = ?
+                        """,
+                        (media_id, now, sub_id, entry_key),
+                    )
+                elif job_status == "cancelled":
+                    conn.execute(
+                        """
+                        UPDATE subscription_entries
+                        SET status = 'skipped', error = 'Cancelled', last_attempt_at = ?
+                        WHERE subscription_id = ? AND entry_key = ?
+                        """,
+                        (now, sub_id, entry_key),
+                    )
+                elif not job_status or job_status == "failed":
+                    conn.execute(
+                        """
+                        UPDATE subscription_entries
+                        SET status = 'failed', error = ?, last_attempt_at = ?
+                        WHERE subscription_id = ? AND entry_key = ?
+                        """,
+                        (str(row["job_message"] or "") or "Job failed", now, sub_id, entry_key),
+                    )
+                else:
+                    continue
+                reconciled += 1
+            return reconciled
+
+    def get_subscriptions_summary(self) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    COALESCE(SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END), 0) AS enabled,
+                    COALESCE(SUM(CASE WHEN enabled = 0 AND COALESCE(last_status, '') != 'paused_error'
+                        THEN 1 ELSE 0 END), 0) AS paused,
+                    COALESCE(SUM(CASE WHEN last_status = 'error'
+                        OR (enabled = 1 AND consecutive_failures > 0) THEN 1 ELSE 0 END), 0) AS errored,
+                    COALESCE(SUM(CASE WHEN last_status = 'paused_error' THEN 1 ELSE 0 END), 0) AS paused_error,
+                    COALESCE(SUM(items_ingested_count), 0) AS total_ingested,
+                    MIN(CASE WHEN enabled = 1 THEN next_check_at ELSE NULL END) AS next_check_at
+                FROM subscriptions
+                """
+            ).fetchone()
+            total_entries = int(
+                conn.execute("SELECT COUNT(*) FROM subscription_entries").fetchone()[0]
+            )
+        return {
+            "total": int(row["total"] or 0),
+            "enabled": int(row["enabled"] or 0),
+            "paused": int(row["paused"] or 0),
+            "errored": int(row["errored"] or 0),
+            "paused_error": int(row["paused_error"] or 0),
+            "total_entries": total_entries,
+            "total_ingested": int(row["total_ingested"] or 0),
+            "next_check_at": row["next_check_at"] or None,
+        }
 

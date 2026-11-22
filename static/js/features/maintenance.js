@@ -9,9 +9,18 @@ import {
   handleCaptureInput,
   handleCaptureChange,
 } from "/static/js/features/integrations.js";
+import {
+  loadSubscriptionsTab,
+  handleSubscriptionsClick,
+  handleSubscriptionsInput,
+  handleSubscriptionsChange,
+  handleSubscriptionsSubmit,
+  resetSubscriptionsCache,
+} from "/static/js/features/subscriptions.js";
 
 const TABS = [
   { id: "settings", label: "Settings" },
+  { id: "subscriptions", label: "Subscriptions" },
   { id: "capture", label: "Capture" },
   { id: "health", label: "Health" },
   { id: "backups", label: "Backups" },
@@ -168,6 +177,10 @@ function renderHealthView(view, data) {
   const st = data?.storage || {};
   const ingest = data?.ingest || {};
   const backups = data?.backups || {};
+  const subs = data?.subscriptions || {};
+  const subsTotal = Number(subs.total || 0);
+  const subsEnabled = Number(subs.enabled || 0);
+  const subsErrored = Number(subs.errored || 0) + Number(subs.paused_error || 0);
 
   const bcPct = Math.max(0, Math.min(100, Number(bc.utilization_pct || 0)));
   const onlineCount = Number(tg.online_count ?? 0);
@@ -213,6 +226,7 @@ function renderHealthView(view, data) {
         <span class="pill ${workerCount > 0 ? "ok" : ""}">Workers: ${onlineCount}/${workerCount}</span>
         ${cooldownCount > 0 ? `<span class="pill warn">${cooldownCount} in cooldown</span>` : ""}
         <span class="pill">Ingest: ${Number(ingest.concurrency || 0)} slots (${ingest.active_jobs ? "active" : "idle"})</span>
+        <span class="pill ${subsErrored > 0 ? "err" : subsEnabled > 0 ? "ok" : ""}">Subscriptions: ${subsEnabled}/${subsTotal}${subsErrored > 0 ? ` (${subsErrored} err)` : ""}</span>
         <span class="pill">Last backup: ${backups.latest ? escapeHtml(fmtDate(backups.latest.created_at)) : "None"}</span>
       </div>
       <button type="button" class="secondary btn-xs" data-sys-action="refresh-health">Refresh</button>
@@ -270,7 +284,7 @@ function renderHealthView(view, data) {
           <div><span>DB Size</span><strong>${escapeHtml(fmtSize(db.size_bytes || 0))}</strong></div>
           <div><span>WAL Size</span><strong>${escapeHtml(fmtSize(db.wal_size_bytes || 0))}</strong></div>
           <div><span>Media / Parts</span><strong>${Number(db.media_count || 0)} / ${Number(db.parts_count || 0)}</strong></div>
-          <div><span>Jobs / Folders / Tags</span><strong>${Number(db.jobs_count || 0)} / ${Number(db.folders_count || 0)} / ${Number(db.tags_count || 0)}</strong></div>
+          <div><span>Jobs / Folders / Tags / Subs</span><strong>${Number(db.jobs_count || 0)} / ${Number(db.folders_count || 0)} / ${Number(db.tags_count || 0)} / ${Number(db.subscriptions_count || 0)}</strong></div>
         </div>
       </div>
 
@@ -682,6 +696,7 @@ function loadTab(tab) {
     renderLockedState(view);
     return;
   }
+  if (tab === "subscriptions") return loadSubscriptionsTab(view);
   if (tab === "health") return loadHealthTab();
   if (tab === "backups") return loadBackupsTab();
   if (tab === "integrity") return loadIntegrityTab();
@@ -902,6 +917,10 @@ function wireEvents() {
       handleCaptureInput(e);
       return;
     }
+    if (activeTab === "subscriptions") {
+      handleSubscriptionsInput(e);
+      return;
+    }
     const t = e.target;
     if (t.id === "sysBackupNote") backupDraft.note = t.value;
     else if (t.id === "sysMaxTgDownloads") integrityDraft.maxTelegramDownloads = Number(t.value) || 0;
@@ -911,6 +930,10 @@ function wireEvents() {
   view?.addEventListener("change", (e) => {
     if (activeTab === "capture") {
       handleCaptureChange(e);
+      return;
+    }
+    if (activeTab === "subscriptions") {
+      handleSubscriptionsChange(e);
       return;
     }
     const t = e.target;
@@ -923,16 +946,26 @@ function wireEvents() {
     else if (t.id === "sysPurgeOrphanStaging") integrityDraft.purgeOrphanStaging = t.checked;
   });
 
-  view?.addEventListener("click", (e) => {
-    if (activeTab === "capture") {
-      handleCaptureClick(e);
-      return;
+  view?.addEventListener("submit", (e) => {
+    if (activeTab === "subscriptions") {
+      handleSubscriptionsSubmit(e);
     }
+  });
+
+  view?.addEventListener("click", (e) => {
     const gotoBtn = e.target.closest("[data-sys-goto]");
     if (gotoBtn) {
       const target = gotoBtn.dataset.sysGoto;
       switchTab(target);
       if (target === "settings") $("sheetTokenInput")?.focus();
+      return;
+    }
+    if (activeTab === "capture") {
+      handleCaptureClick(e);
+      return;
+    }
+    if (activeTab === "subscriptions") {
+      handleSubscriptionsClick(e);
       return;
     }
 
@@ -985,6 +1018,7 @@ function wireEvents() {
     statusCache = null;
     backupsCache = null;
     integrityCache = null;
+    resetSubscriptionsCache();
     if (isSheetOpen() && activeTab !== "settings") {
       if (activeTab === "capture") {
         loadCaptureTab($("systemMaintenanceView"));
@@ -999,6 +1033,7 @@ function wireEvents() {
     statusCache = null;
     backupsCache = null;
     integrityCache = null;
+    resetSubscriptionsCache();
     stopRepairPoll();
     if (isSheetOpen() && activeTab !== "settings") {
       const maintView = $("systemMaintenanceView");
@@ -1026,6 +1061,15 @@ function wireEvents() {
     if (!isSheetOpen() || isLocked()) return;
     if (activeTab === "backups") {
       await loadBackupsTab({ silent: true });
+    } else if (activeTab === "health") {
+      await loadHealthTab({ silent: true });
+    }
+  });
+
+  on("subscriptions:update", async () => {
+    if (!isSheetOpen() || isLocked()) return;
+    if (activeTab === "subscriptions") {
+      await loadSubscriptionsTab($("systemMaintenanceView"), { silent: true });
     } else if (activeTab === "health") {
       await loadHealthTab({ silent: true });
     }

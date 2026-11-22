@@ -136,3 +136,41 @@ class IntegrityRepairRequest(BaseModel):
 class CachePurgeRequest(BaseModel):
     scope: Literal["all", "stream", "stream_ram", "stream_disk", "zip"] = "all"
 
+
+class SubscriptionCreateRequest(BaseModel):
+    name: str | None = Field(default=None, max_length=200)
+    source_url: str = Field(..., min_length=1, max_length=2048)
+    source_kind: Literal["auto", "rss", "ytdlp"] = "auto"
+    folder: str | None = Field(default=None, max_length=120)
+    tags: list[str] | str | None = None
+    format_spec: str | None = Field(default=None, max_length=100)
+    forward_to_telegram: bool = True
+    interval_minutes: int = Field(default=60, ge=5, le=10080)
+    max_items_per_check: int = Field(default=10, ge=1, le=100)
+    enabled: bool = True
+    seed_only: bool = True
+    initial_backfill_limit: int = Field(default=0, ge=0, le=50)
+    title_include_regex: str | None = Field(default=None, max_length=256)
+    title_exclude_regex: str | None = Field(default=None, max_length=256)
+
+
+class SubscriptionUpdateRequest(BaseModel):
+    name: str | None = None
+    source_url: str | None = None
+    source_kind: Literal["auto", "rss", "ytdlp"] | None = None
+    folder: str | None = None
+    tags: list[str] | str | None = None
+    format_spec: str | None = None
+    forward_to_telegram: bool | None = None
+    interval_minutes: int | None = Field(default=None, ge=5, le=10080)
+    max_items_per_check: int | None = Field(default=None, ge=1, le=100)
+    enabled: bool | None = None
+    seed_only: bool | None = None
+    initial_backfill_limit: int | None = Field(default=None, ge=0, le=50)
+    title_include_regex: str | None = Field(default=None, max_length=256)
+    title_exclude_regex: str | None = Field(default=None, max_length=256)
+
+
+class SubscriptionCheckRequest(BaseModel):
+    dry_run: bool = False
+

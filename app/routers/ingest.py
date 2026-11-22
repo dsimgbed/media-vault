@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from app.allocator import sanitize_folder
 from app.context import AppContext
-from app.ingest import expand_ytdlp_playlist, is_direct_download, resolve_format_spec
+from app.ingest import _accepts_kwarg, expand_ytdlp_playlist, is_direct_download, resolve_format_spec
 from app.media_ops import _sanitize_archive_relpath
 from app.routers.deps import get_ctx, require_auth
 from app.schemas import CheckDuplicateRequest, UrlIngestRequest
@@ -94,34 +94,43 @@ async def ingest_url(
 
     base_folder = payload.folder
     queue_items: list[tuple[str, str | None, str | None]] = []
+    effective_proxy = (
+        await ctx.ingest.get_effective_proxy() if payload.expand_playlist else ""
+    )
     for u in raw_urls:
-        if payload.expand_playlist and not await is_direct_download(u):
-            try:
-                pl_info = await expand_ytdlp_playlist(
-                    u,
-                    cookies_file=cfg.ytdlp_cookies_file,
-                    proxy=cfg.ytdlp_proxy,
-                    max_items=max(1, min(500, int(payload.max_playlist_items))),
-                )
-            except Exception as exc:
-                raise HTTPException(status_code=400, detail=str(exc))
-            if pl_info.get("is_playlist") and pl_info.get("entries"):
-                pl_title = (pl_info.get("playlist_title") or "").strip()
-                entry_folder = base_folder
-                if payload.use_playlist_folder and pl_title:
-                    clean_base = (base_folder or "").strip()
-                    if (
-                        not clean_base
-                        or sanitize_folder(clean_base, cfg.default_folder) == cfg.default_folder
-                    ):
-                        entry_folder = sanitize_folder(pl_title, cfg.default_folder)
-                    else:
-                        entry_folder = sanitize_folder(
-                            f"{clean_base}/{pl_title}", cfg.default_folder
-                        )
-                for entry in pl_info["entries"]:
-                    queue_items.append((entry["url"], entry.get("title"), entry_folder))
-                continue
+        if payload.expand_playlist:
+            is_ddl = (
+                await is_direct_download(u, proxy=effective_proxy)
+                if effective_proxy and _accepts_kwarg(is_direct_download, "proxy")
+                else await is_direct_download(u)
+            )
+            if not is_ddl:
+                try:
+                    pl_info = await expand_ytdlp_playlist(
+                        u,
+                        cookies_file=cfg.ytdlp_cookies_file,
+                        proxy=effective_proxy,
+                        max_items=max(1, min(500, int(payload.max_playlist_items))),
+                    )
+                except Exception as exc:
+                    raise HTTPException(status_code=400, detail=str(exc))
+                if pl_info.get("is_playlist") and pl_info.get("entries"):
+                    pl_title = (pl_info.get("playlist_title") or "").strip()
+                    entry_folder = base_folder
+                    if payload.use_playlist_folder and pl_title:
+                        clean_base = (base_folder or "").strip()
+                        if (
+                            not clean_base
+                            or sanitize_folder(clean_base, cfg.default_folder) == cfg.default_folder
+                        ):
+                            entry_folder = sanitize_folder(pl_title, cfg.default_folder)
+                        else:
+                            entry_folder = sanitize_folder(
+                                f"{clean_base}/{pl_title}", cfg.default_folder
+                            )
+                    for entry in pl_info["entries"]:
+                        queue_items.append((entry["url"], entry.get("title"), entry_folder))
+                    continue
         queue_items.append((u, payload.title if len(raw_urls) == 1 else None, base_folder))
 
     job_ids: list[str] = []

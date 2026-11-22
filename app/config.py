@@ -71,6 +71,7 @@ class Settings(BaseSettings):
 
     ytdlp_cookies_file: Path = Path("./data/cookies.txt")
     ytdlp_proxy: str = ""
+    ytdlp_tls_fragment_proxy: bool = True
     ingest_concurrency: int = 3
     ytdlp_concurrent_fragments: int = 4
 
@@ -91,6 +92,15 @@ class Settings(BaseSettings):
     failed_upload_retention_sec: int = 3600
     failed_upload_max_retained_mb: int = 4096
     staging_gc_interval_sec: int = 300
+
+    # Channel / Playlist / RSS watch subscriptions (backwards-compatible defaults)
+    subscriptions_enabled: bool = True
+    subscriptions_poll_tick_sec: int = 30
+    subscriptions_max_concurrent_polls: int = 2
+    subscriptions_http_timeout_sec: float = 20.0
+    subscriptions_max_feed_bytes: int = 5 * 1024 * 1024
+    subscriptions_failure_pause_threshold: int = 5
+    subscriptions_allow_private_hosts: bool = False
 
     @property
     def db_path(self) -> Path:
