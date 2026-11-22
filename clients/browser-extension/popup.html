@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Media Vault Companion</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <img class="brand-icon" src="icons/icon-32.png" alt="" width="28" height="28" />
+        <div class="brand-text">
+          <h1>Media Vault</h1>
+          <p id="serverLabel" class="subtle">Companion</p>
+        </div>
+      </div>
+      <div class="top-actions">
+        <span id="connPill" class="pill pill-setup" role="status">Setup</span>
+        <a id="openVaultBtn" class="btn btn-ghost btn-sm" href="#" target="_blank" rel="noopener noreferrer">Open Vault</a>
+        <button
+          id="settingsToggle"
+          class="icon-btn"
+          type="button"
+          aria-label="Toggle settings"
+          aria-expanded="false"
+          aria-controls="settingsPanel"
+          title="Settings"
+        >
+          <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true" focusable="false">
+            <path
+              fill="currentColor"
+              d="M19.14 12.94a7.5 7.5 0 0 0 .05-.94 7.5 7.5 0 0 0-.05-.94l2.03-1.58a.5.5 0 0 0 .12-.62l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.1 7.1 0 0 0-1.62-.94l-.36-2.54a.5.5 0 0 0-.5-.43h-3.84a.5.5 0 0 0-.5.43l-.36 2.54c-.58.24-1.12.56-1.62.94l-2.39-.96a.5.5 0 0 0-.6.22L2.66 8.86a.5.5 0 0 0 .12.62l2.03 1.58c-.03.31-.05.63-.05.94s.02.63.05.94l-2.03 1.58a.5.5 0 0 0-.12.62l1.92 3.32c.14.24.42.32.66.22l2.39-.96c.5.38 1.04.7 1.62.94l.36 2.54c.04.25.25.43.5.43h3.84c.25 0 .46-.18.5-.43l.36-2.54c.58-.24 1.12-.56 1.62-.94l2.39.96c.24.1.52.02.66-.22l1.92-3.32a.5.5 0 0 0-.12-.62l-2.03-1.58ZM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7Z"
+            />
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <div id="statusBanner" class="banner" role="status" aria-live="polite" hidden></div>
+
+    <section id="settingsPanel" class="panel settings-panel" hidden aria-label="Connection settings">
+      <div class="panel-head">
+        <h2>Connection &amp; Settings</h2>
+        <button id="closeSettingsBtn" class="link-btn" type="button">Close</button>
+      </div>
+
+      <form id="settingsForm" class="form" novalidate>
+        <label class="field" for="serverUrlInput">
+          <span class="label">Server URL</span>
+          <input
+            id="serverUrlInput"
+            type="url"
+            inputmode="url"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="http://localhost:8080"
+          />
+          <span class="hint">Use your Tailscale or LAN address when accessing from another device.</span>
+        </label>
+
+        <label class="field" for="authTokenInput">
+          <span class="label">Auth Token <span class="label-optional">(optional)</span></span>
+          <span class="input-with-btn">
+            <input
+              id="authTokenInput"
+              type="password"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="WEB_AUTH_TOKEN"
+            />
+            <button id="toggleTokenBtn" class="mini-btn" type="button" aria-pressed="false">Show</button>
+          </span>
+        </label>
+
+        <label class="check" for="rememberFolderCheck">
+          <input id="rememberFolderCheck" type="checkbox" checked />
+          <span>Remember last chosen folder</span>
+        </label>
+
+        <button id="saveSettingsBtn" class="btn btn-primary btn-block" type="submit" data-busy-label="Testing…">
+          Save &amp; Test Connection
+        </button>
+      </form>
+
+      <div class="cookie-card">
+        <div class="cookie-head">
+          <h3>YouTube Cookie Sync</h3>
+          <span id="cookiePermPill" class="pill pill-muted">Not granted</span>
+        </div>
+        <dl class="kv">
+          <div class="kv-row">
+            <dt>Vault</dt>
+            <dd id="cookieVaultStatus">Unknown</dd>
+          </div>
+          <div class="kv-row">
+            <dt>Extension access</dt>
+            <dd id="cookieExtStatus">Not granted</dd>
+          </div>
+        </dl>
+        <p class="hint">
+          Opt-in only: grants temporary access to YouTube / Google cookies so yt-dlp can fetch
+          sign-in-required videos. You can revoke access at any time.
+        </p>
+        <div class="row">
+          <button id="syncCookiesBtn" class="btn btn-ghost btn-sm" type="button" data-busy-label="Syncing…">
+            Sync YouTube Cookies to Vault
+          </button>
+          <button id="revokeCookiesBtn" class="btn btn-danger btn-sm" type="button" hidden>
+            Revoke Cookie Access
+          </button>
+        </div>
+        <p id="cookieDetail" class="hint cookie-detail" hidden></p>
+      </div>
+    </section>
+
+    <nav class="tabs" role="tablist" aria-label="Capture mode">
+      <button
+        id="tabBtnUrl"
+        class="tab is-active"
+        type="button"
+        role="tab"
+        aria-selected="true"
+        aria-controls="tabUrl"
+        data-tab="url"
+      >
+        URL / Page
+      </button>
+      <button
+        id="tabBtnShot"
+        class="tab"
+        type="button"
+        role="tab"
+        aria-selected="false"
+        aria-controls="tabShot"
+        data-tab="shot"
+      >
+        Screenshot / Photo
+      </button>
+      <button
+        id="tabBtnFile"
+        class="tab"
+        type="button"
+        role="tab"
+        aria-selected="false"
+        aria-controls="tabFile"
+        data-tab="file"
+      >
+        File / PDF
+      </button>
+    </nav>
+
+    <section id="tabUrl" class="tab-panel" role="tabpanel" aria-labelledby="tabBtnUrl">
+      <div id="dupBanner" class="banner banner-warn dup-banner" hidden>
+        <div class="dup-text">
+          <strong>Already in Vault</strong>
+          <span id="dupDetail"></span>
+        </div>
+        <label class="check check-inline" for="forceReingest">
+          <input id="forceReingest" type="checkbox" />
+          <span>Force re-ingest</span>
+        </label>
+      </div>
+
+      <label class="field" for="urlInput">
+        <span class="label">URL</span>
+        <input
+          id="urlInput"
+          type="url"
+          inputmode="url"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="https://example.com/video"
+        />
+      </label>
+
+      <label class="field" for="urlTitle">
+        <span class="label">Title <span class="label-optional">(optional)</span></span>
+        <input id="urlTitle" type="text" autocomplete="off" placeholder="Auto-detected from the page" />
+      </label>
+
+      <label class="field" for="formatSelect">
+        <span class="label">Format</span>
+        <select id="formatSelect">
+          <option value="best">Best available</option>
+          <option value="1080p">1080p</option>
+          <option value="720p">720p</option>
+          <option value="480p">480p</option>
+          <option value="audio">Audio only</option>
+        </select>
+      </label>
+
+      <button id="urlCaptureBtn" class="btn btn-primary btn-block" type="button" data-busy-label="Sending…">
+        Send URL to Vault
+      </button>
+    </section>
+
+    <section id="tabShot" class="tab-panel" role="tabpanel" aria-labelledby="tabBtnShot" hidden>
+      <button id="captureShotBtn" class="btn btn-ghost btn-block" type="button" data-busy-label="Capturing…">
+        Capture Visible Page
+      </button>
+      <p class="hint">
+        Grabs the visible webpage, print preview, or photo as a PNG. Works best on regular
+        http(s) pages.
+      </p>
+
+      <div id="shotPreviewWrap" class="preview-wrap" hidden>
+        <img id="shotPreview" class="preview-img" alt="Screenshot preview" />
+      </div>
+
+      <label class="field" for="shotTitle">
+        <span class="label">Title</span>
+        <input id="shotTitle" type="text" autocomplete="off" placeholder="Screenshot title" />
+      </label>
+
+      <button id="shotUploadBtn" class="btn btn-primary btn-block" type="button" data-busy-label="Uploading…" disabled>
+        Send Photo to Vault
+      </button>
+    </section>
+
+    <section id="tabFile" class="tab-panel" role="tabpanel" aria-labelledby="tabBtnFile" hidden>
+      <label class="field file-field" for="fileInput">
+        <span class="label">File</span>
+        <span class="file-drop">
+          <span class="file-drop-title">Choose a file</span>
+          <span class="hint">PDFs, print-to-PDF exports, photos, videos, documents — any file type.</span>
+          <input id="fileInput" type="file" accept="*/*" />
+        </span>
+      </label>
+      <p id="fileMeta" class="hint file-meta" hidden></p>
+
+      <label class="field" for="fileTitle">
+        <span class="label">Title</span>
+        <input id="fileTitle" type="text" autocomplete="off" placeholder="File title" />
+      </label>
+
+      <button id="fileUploadBtn" class="btn btn-primary btn-block" type="button" data-busy-label="Uploading…" disabled>
+        Upload to Vault
+      </button>
+    </section>
+
+    <section class="panel destination-panel" aria-label="Destination">
+      <div class="panel-head">
+        <h2>Destination</h2>
+        <span class="subtle">Applies to all capture modes</span>
+      </div>
+
+      <label class="field" for="folderInput">
+        <span class="label">Folder</span>
+        <input
+          id="folderInput"
+          type="text"
+          list="extFolderList"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="Choose or type a folder"
+        />
+        <datalist id="extFolderList"></datalist>
+      </label>
+      <div id="folderChips" class="chips" aria-label="Recent folders"></div>
+
+      <label class="field" for="tagsInput">
+        <span class="label">Tags <span class="label-optional">(comma separated)</span></span>
+        <input id="tagsInput" type="text" list="extTagList" autocomplete="off" placeholder="tag1, tag2" />
+        <datalist id="extTagList"></datalist>
+      </label>
+      <div id="tagChips" class="chips" aria-label="Popular tags"></div>
+
+      <label id="telegramRow" class="check" for="telegramForward" hidden>
+        <input id="telegramForward" type="checkbox" checked />
+        <span>Forward to Telegram</span>
+      </label>
+    </section>
+
+    <section class="panel recent-panel" aria-label="Recent captures">
+      <div class="panel-head">
+        <h2>Recent Captures</h2>
+        <button id="refreshRecentBtn" class="link-btn" type="button">Refresh</button>
+      </div>
+      <ul id="recentList" class="recent-list"></ul>
+      <p id="recentEmpty" class="subtle recent-empty">No captures yet.</p>
+    </section>
+
+    <footer class="footer">
+      <span>Media Vault Companion</span>
+      <span id="footerVersion" class="subtle">v1.0.0</span>
+    </footer>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

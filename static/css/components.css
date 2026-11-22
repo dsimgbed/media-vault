@@ -2300,3 +2300,218 @@ a.job-media-link:hover {
   color: var(--muted);
   margin-left: 6px;
 }
+
+/* Capture Tools (Bookmarklet / Extension / Android / iOS) */
+.capture-tools-stack {
+  display: grid;
+  gap: 12px;
+}
+
+.capture-tools-card {
+  gap: 12px;
+}
+
+.capture-tools-card code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  color: #93c5fd;
+  word-break: break-word;
+}
+
+.capture-security-row {
+  align-items: flex-start;
+}
+
+.capture-security-copy {
+  display: grid;
+  gap: 2px;
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+.capture-opt-grid {
+  display: grid;
+  gap: 8px;
+}
+
+.capture-field {
+  display: grid;
+  gap: 4px;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.capture-field input {
+  width: 100%;
+  max-width: 320px;
+}
+
+.capture-opt-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.82rem;
+  color: var(--text);
+}
+
+.bookmarklet-drag-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 16px;
+  border-radius: 999px;
+  background: linear-gradient(180deg, #3b82f6 0%, #2563eb 100%);
+  border: 1px solid rgba(147, 197, 253, 0.55);
+  color: #fff;
+  font-size: 0.86rem;
+  font-weight: 700;
+  text-decoration: none;
+  cursor: grab;
+  user-select: none;
+  box-shadow: 0 4px 14px rgba(37, 99, 235, 0.35);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.bookmarklet-drag-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 18px rgba(37, 99, 235, 0.45);
+}
+
+.bookmarklet-drag-btn:active {
+  cursor: grabbing;
+  transform: translateY(0);
+}
+
+.capture-code-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.capture-code-block {
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow-x: auto;
+  font-size: 0.74rem;
+  line-height: 1.5;
+  color: #93c5fd;
+}
+
+.capture-code-block code {
+  white-space: pre;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.capture-feature-list {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 4px;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.capture-feature-list li::marker {
+  color: var(--accent);
+}
+
+.capture-subhead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 0.86rem;
+}
+
+.capture-copy-list {
+  display: grid;
+  gap: 8px;
+}
+
+.capture-copy-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.capture-copy-label {
+  display: grid;
+  gap: 2px;
+  flex: 1 1 200px;
+  min-width: 0;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.capture-copy-label code {
+  color: #93c5fd;
+  word-break: break-all;
+}
+
+.capture-steps {
+  margin: 0;
+  padding-left: 20px;
+  display: grid;
+  gap: 6px;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.capture-steps strong {
+  color: var(--text);
+}
+
+.capture-steps code {
+  color: #93c5fd;
+}
+
+.capture-locked-hint {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 0.78rem;
+  color: var(--warn);
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.capture-warn {
+  border-color: rgba(245, 158, 11, 0.4);
+  background: rgba(245, 158, 11, 0.1);
+  color: var(--warn);
+}
+
+@media (max-width: 640px) {
+  .capture-code-block {
+    font-size: 0.7rem;
+  }
+
+  .capture-copy-row {
+    align-items: stretch;
+  }
+
+  .capture-copy-row button {
+    width: 100%;
+  }
+
+  .bookmarklet-drag-btn {
+    width: 100%;
+    justify-content: center;
+  }
+}

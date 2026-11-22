@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
 
@@ -16,6 +17,7 @@ from app.context import STATIC_DIR, AppContext
 from app.db import Database
 from app.ingest import IngestService, update_ytdlp
 from app.integrity import IntegrityService
+from app.routers import capture as capture_router
 from app.routers import ingest as ingest_router
 from app.routers import jobs as jobs_router
 from app.routers import maintenance as maintenance_router
@@ -97,6 +99,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             db.close()
 
     app = FastAPI(title="Media Ingest & Gallery", lifespan=lifespan)
+
+    capture_origins = cfg.get_capture_cors_origins()
+    if capture_origins or cfg.capture_cors_allow_extensions:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=capture_origins,
+            allow_origin_regex=(
+                r"^(chrome-extension://[a-p]{32}|moz-extension://[0-9a-fA-F-]{36})$"
+                if cfg.capture_cors_allow_extensions
+                else None
+            ),
+            allow_credentials=False,
+            allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+            allow_headers=["Authorization", "Content-Type", "Accept"],
+            max_age=600,
+        )
+
     app.state.ctx = ctx
     app.state.settings = cfg
     app.state.db = db
@@ -119,6 +138,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     if STATIC_DIR.exists():
         app.mount("/static", RevalidatingStaticFiles(directory=str(STATIC_DIR)), name="static")
 
+    app.include_router(capture_router.router)
     app.include_router(pwa_router.router)
 
     return app

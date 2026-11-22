@@ -150,6 +150,12 @@ export function initSystem() {
   $("tgStatus")?.addEventListener("click", () => {
     openSystemSheet("health");
   });
+  $("captureToolsBtn")?.addEventListener("click", () => {
+    openSystemSheet("capture");
+  });
+  $("sheetCaptureBtn")?.addEventListener("click", () => {
+    openSystemSheet("capture");
+  });
   $("closeSystemSheetBtn")?.addEventListener("click", () => $("systemSheet")?.close());
   $("systemSheet")?.addEventListener("click", (e) => {
     if (e.target === $("systemSheet")) $("systemSheet").close();

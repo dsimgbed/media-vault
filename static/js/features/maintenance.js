@@ -3,9 +3,16 @@ import { emit, on } from "/static/js/bus.js";
 import { apiFetch, withToken } from "/static/js/api.js";
 import { $, escapeHtml, fmtSize } from "/static/js/utils.js";
 import { confirmDialog, toast } from "/static/js/ui/dialogs.js";
+import {
+  loadCaptureTab,
+  handleCaptureClick,
+  handleCaptureInput,
+  handleCaptureChange,
+} from "/static/js/features/integrations.js";
 
 const TABS = [
   { id: "settings", label: "Settings" },
+  { id: "capture", label: "Capture" },
   { id: "health", label: "Health" },
   { id: "backups", label: "Backups" },
   { id: "integrity", label: "Integrity" },
@@ -667,6 +674,9 @@ async function loadIntegrityTab({ silent = false } = {}) {
 function loadTab(tab) {
   const view = $("systemMaintenanceView");
   if (!view) return;
+  // Capture stays usable while locked: it only needs to render bookmarklet
+  // and shortcut instructions (extension download gates itself internally).
+  if (tab === "capture") return loadCaptureTab(view);
   if (isLocked()) {
     stopRepairPoll();
     renderLockedState(view);
@@ -888,6 +898,10 @@ function wireEvents() {
 
   const view = $("systemMaintenanceView");
   view?.addEventListener("input", (e) => {
+    if (activeTab === "capture") {
+      handleCaptureInput(e);
+      return;
+    }
     const t = e.target;
     if (t.id === "sysBackupNote") backupDraft.note = t.value;
     else if (t.id === "sysMaxTgDownloads") integrityDraft.maxTelegramDownloads = Number(t.value) || 0;
@@ -895,6 +909,10 @@ function wireEvents() {
   });
 
   view?.addEventListener("change", (e) => {
+    if (activeTab === "capture") {
+      handleCaptureChange(e);
+      return;
+    }
     const t = e.target;
     if (t.id === "sysBackupTgCheck") backupDraft.uploadToTelegram = t.checked;
     else if (t.id === "sysVerifyTgCheck") integrityDraft.verifyTelegram = t.checked;
@@ -906,6 +924,10 @@ function wireEvents() {
   });
 
   view?.addEventListener("click", (e) => {
+    if (activeTab === "capture") {
+      handleCaptureClick(e);
+      return;
+    }
     const gotoBtn = e.target.closest("[data-sys-goto]");
     if (gotoBtn) {
       const target = gotoBtn.dataset.sysGoto;
@@ -964,7 +986,11 @@ function wireEvents() {
     backupsCache = null;
     integrityCache = null;
     if (isSheetOpen() && activeTab !== "settings") {
-      loadTab(activeTab);
+      if (activeTab === "capture") {
+        loadCaptureTab($("systemMaintenanceView"));
+      } else {
+        loadTab(activeTab);
+      }
     }
   });
 
@@ -976,7 +1002,11 @@ function wireEvents() {
     stopRepairPoll();
     if (isSheetOpen() && activeTab !== "settings") {
       const maintView = $("systemMaintenanceView");
-      if (maintView) renderLockedState(maintView);
+      if (activeTab === "capture") {
+        loadCaptureTab(maintView);
+      } else if (maintView) {
+        renderLockedState(maintView);
+      }
     }
   });
 

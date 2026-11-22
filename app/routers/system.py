@@ -199,14 +199,23 @@ async def save_ytdlp_cookies(
     raw = payload.cookies_text.replace("\r\n", "\n").strip()
     if not raw:
         raise HTTPException(status_code=400, detail="Cookies text cannot be empty.")
-    has_cookie_line = any(
-        line and not line.startswith("#") and "\t" in line
-        for line in raw.splitlines()
-    )
+    def _is_valid_cookie_row(line: str) -> bool:
+        if not line:
+            return False
+        if line.startswith("#HttpOnly_"):
+            row = line[len("#HttpOnly_"):]
+        elif line.startswith("#"):
+            return False
+        else:
+            row = line
+        cols = row.split("\t")
+        return len(cols) == 7 and bool(cols[0].strip()) and bool(cols[5].strip())
+
+    has_cookie_line = any(_is_valid_cookie_row(line) for line in raw.splitlines())
     if not has_cookie_line:
         raise HTTPException(
             status_code=400,
-            detail="Expected Netscape cookies.txt format (tab-separated cookie rows).",
+            detail="Expected Netscape cookies.txt format (7-column tab-separated cookie rows).",
         )
     cookies_file = ctx.settings.ytdlp_cookies_file
     cookies_file.parent.mkdir(parents=True, exist_ok=True)

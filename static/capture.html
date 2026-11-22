@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0d1117" />
+  <title>Media Vault — Quick Capture</title>
+  <link rel="icon" type="image/svg+xml" href="/static/icons/icon.svg" />
+  <link rel="stylesheet" href="/static/css/base.css" />
+  <link rel="stylesheet" href="/static/css/capture.css" />
+</head>
+<body>
+  <main class="capture-shell">
+    <header class="capture-header">
+      <div class="capture-brand">
+        <span class="capture-title">Media Vault</span>
+        <span class="capture-subtitle">Quick Capture</span>
+      </div>
+      <a id="openVaultLink" class="btn-open-vault" href="/?mode=uploader" target="_blank" rel="noopener noreferrer">Open in Vault</a>
+    </header>
+
+    <section id="lockCard" class="card lock-card" hidden>
+      <h2>Vault Locked</h2>
+      <p class="muted-text">Enter your auth token to continue.</p>
+      <div class="lock-form">
+        <input id="lockPassword" type="password" placeholder="Auth token..." autocomplete="current-password" />
+        <button id="unlockBtn" type="button">Unlock</button>
+      </div>
+      <p id="lockError" class="error-text" hidden></p>
+    </section>
+
+    <div id="statusMessage" class="status-message" hidden></div>
+
+    <div id="appCard" hidden>
+      <nav class="tab-bar" role="tablist" aria-label="Capture mode">
+        <button id="tabLink" class="tab-pill is-active" type="button" role="tab" aria-selected="true" aria-controls="panelLink">Link / Page</button>
+        <button id="tabFile" class="tab-pill" type="button" role="tab" aria-selected="false" aria-controls="panelFile">File / PDF / Photo</button>
+      </nav>
+
+      <section id="panelLink" class="panel" role="tabpanel">
+        <label class="field" for="urlInput">
+          <span class="label">URL</span>
+          <input id="urlInput" type="url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://example.com/video" />
+        </label>
+
+        <div id="duplicateBadge" class="badge badge-ok" hidden>New URL</div>
+
+        <label class="check-row" for="forceReingest">
+          <input id="forceReingest" type="checkbox" />
+          <span>Force re-ingest</span>
+        </label>
+
+        <label class="field" for="titleInput">
+          <span class="label">Title <span class="label-optional">(optional)</span></span>
+          <input id="titleInput" type="text" autocomplete="off" placeholder="Auto-detected from the page" />
+        </label>
+
+        <label class="field" for="formatSelect">
+          <span class="label">Format</span>
+          <select id="formatSelect">
+            <option value="best">Best MP4</option>
+            <option value="1080p">1080p MP4</option>
+            <option value="720p">720p MP4</option>
+            <option value="480p">480p MP4</option>
+            <option value="audio">Audio only (MP3)</option>
+          </select>
+        </label>
+      </section>
+
+      <section id="panelFile" class="panel" role="tabpanel" hidden>
+        <div id="dropZone" class="drop-zone" tabindex="0">
+          <span class="drop-title">Drop or click to choose a file</span>
+          <span class="hint">PDFs, photos, videos, documents — any file type.</span>
+          <input id="fileInput" type="file" />
+        </div>
+        <p id="fileMeta" class="hint file-meta" hidden></p>
+        <label class="field" for="fileTitle">
+          <span class="label">Title <span class="label-optional">(optional)</span></span>
+          <input id="fileTitle" type="text" autocomplete="off" placeholder="File title" />
+        </label>
+      </section>
+
+      <section class="destination">
+        <label class="field" for="folderInput">
+          <span class="label">Folder</span>
+          <input id="folderInput" type="text" list="folderList" autocomplete="off" spellcheck="false" placeholder="Choose or type a folder" />
+          <datalist id="folderList"></datalist>
+        </label>
+        <div id="folderChips" class="chips" aria-label="Top folders"></div>
+
+        <label class="field" for="tagsInput">
+          <span class="label">Tags</span>
+          <input id="tagsInput" type="text" list="tagList" autocomplete="off" spellcheck="false" placeholder="#soap, #hd..." />
+          <datalist id="tagList"></datalist>
+        </label>
+        <div id="tagChips" class="chips" aria-label="Popular tags"></div>
+
+        <label id="tgForwardRow" class="check-row" for="tgForwardCheck" hidden>
+          <input id="tgForwardCheck" type="checkbox" checked />
+          <span>Forward to Telegram</span>
+        </label>
+
+        <label class="check-row" for="rememberFolderCheck">
+          <input id="rememberFolderCheck" type="checkbox" checked />
+          <span>Remember folder</span>
+        </label>
+
+        <label class="check-row" for="autocloseCheck">
+          <input id="autocloseCheck" type="checkbox" />
+          <span>Auto-close after archiving</span>
+        </label>
+      </section>
+
+      <div id="uploadProgress" class="upload-progress" hidden>
+        <div id="uploadProgressBar" class="upload-progress-bar"></div>
+        <span id="uploadProgressText" class="upload-progress-text">0%</span>
+      </div>
+
+      <div class="action-row">
+        <button id="submitLinkBtn" type="button">Archive Link</button>
+        <button id="submitFileBtn" type="button" hidden>Upload File</button>
+      </div>
+
+      <section id="resultCard" class="card result-card" hidden>
+        <p id="resultSummary" class="result-summary"></p>
+        <div class="result-actions">
+          <a id="openInVaultResult" class="btn-open-vault" href="/?mode=uploader" target="_blank" rel="noopener noreferrer">Open in Vault</a>
+          <button id="closeWindowBtn" type="button" class="secondary">Close Window</button>
+        </div>
+        <div class="countdown-row">
+          <span id="countdown" class="muted-text"></span>
+          <button id="cancelCloseBtn" type="button" class="secondary btn-sm" hidden>Cancel Close</button>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script type="module" src="/static/js/capture.js"></script>
+</body>
+</html>

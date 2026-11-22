@@ -31,6 +31,7 @@ A self-hosted server that gives you **both**:
   - **Zero-Buffer Bulk ZIP64 Streaming (`GET/POST /api/media/bulk/download`)**: Pure-stdlib APPNOTE 6.3.x `ZIP_STORED` async streaming (`app/streaming_zip.py`) with automatic ZIP64 support and immediate chunked TTFB (no `SpooledTemporaryFile` buffering or client-disconnect leaks).
   - **Persisted Two-Tier ZIP Directory Cache**: Bounded L1 RAM + zlib-compressed SQLite (`zip_entries_cache`, `ZIP_CACHE_DB_MAX_ROWS=500`, `ZIP_CACHE_DB_MAX_MB=16`) with fingerprint verification and transactional invalidation so ZIP explorer survives restarts without bloating backups.
   - **Two-Tier Hot-Block Cache, Coalescing & Sequential Prefetch**: Canonical fixed-grid blocking with RAM L1 + optional opt-in L2 sharded `.blk` disk cache (`TELEGRAM_DISK_CACHE_MB`), single-flight deduplication, bounded read-ahead prefetch (`TELEGRAM_PREFETCH_BLOCKS`), multipart next-part warming, stream-aware worker routing, and `POST /api/system/cache/purge` + Health UI controls.
+- **One-Tap Capture Ecosystem**: Quick-capture popup & bookmarklet (`GET /capture`), a zero-build Manifest V3 companion browser extension (`GET /api/system/extension.zip`), and Android/iOS share recipes via `POST /api/capture/quick`, with controlled CORS (`CAPTURE_CORS_ORIGINS`, `CAPTURE_CORS_ALLOW_EXTENSIONS`).
 
 ## Quick Start
 
@@ -101,4 +102,11 @@ Open `http://localhost:8080` (or your Tailscale IP) on your phone or laptop.
    .venv/bin/python scripts/restore_vault.py --backup ./data/backups/vault_backup_<timestamp>_<id>.db.gz --yes
    ```
 3. **Restart the server** once the restore reports `Status : RESTORED`.
+
+### 8. One-Tap Capture Ecosystem (Bookmarklet, Browser Extension, Android & iOS)
+
+1. **Quick-Capture Popup & Bookmarklet (`GET /capture`)**: Works across strict-CSP and HTTPS→HTTP LAN/Tailscale setups via a popup window (`window.open`), reusing same-origin `localStorage` auth token so `WEB_AUTH_TOKEN` is never leaked in bookmarklet URLs. Drag-and-drop Bookmarklet generator in **Capture Tools** (System Settings → Capture tab) with optional auto-submit (`auto=1`), auto-close (`autoclose=1`), folder remembrance, duplicate check, and File/PDF/Photo upload.
+2. **Companion Browser Extension (`clients/browser-extension/`, Manifest V3, Zero-Build)**: Downloadable directly from the Vault (`GET /api/system/extension.zip` or Capture Tools → Download Extension). Chrome/Edge/Brave & Firefox MV3 compatible; supports URL/page capture, visible-tab screenshot/photo capture, local PDF/file upload, right-click context menus with dynamic `Send to Folder...` submenu and remembered folder choice, plus **opt-in YouTube Cookie Sync** (`optional_permissions: ["cookies"]` strictly scoped to YouTube/Google domains, posting Netscape `cookies.txt` to `POST /api/ytdlp/cookies`).
+3. **Android & iOS Capture (`POST /api/capture/quick`)**: Android PWA Share Sheet (`/share-target`) + Android HTTP Shortcuts / Tasker recipe. Apple/iOS Shortcuts recipe calling `POST /api/capture/quick` (JSON or form-encoded) returning concise `summary`, `gallery_url`, `job_id`, and `duplicate` status for instant notifications.
+4. **Controlled CORS Configuration**: Document `CAPTURE_CORS_ORIGINS` and `CAPTURE_CORS_ALLOW_EXTENSIONS` (off by default, wildcards rejected, `allow_credentials=False`).
 

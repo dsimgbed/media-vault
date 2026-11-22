@@ -24,6 +24,18 @@ class PlaylistRequest(BaseModel):
     max_items: int = 50
 
 
+class QuickCaptureRequest(BaseModel):
+    url: str = ""
+    text: str | None = None
+    folder: str | None = None
+    tags: list[str] | str | None = None
+    title: str | None = Field(default=None, max_length=300)
+    format_spec: str | None = None
+    forward_to_telegram: bool = True
+    force: bool = False
+    source: str = "quick"
+
+
 class CheckDuplicateRequest(BaseModel):
     url: str | None = None
     urls: list[str] | None = Field(default=None, max_length=500)

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger(__name__)
+
+_CAPTURE_CORS_SCHEMES = {"http", "https", "chrome-extension", "moz-extension"}
 
 
 class DriveConfig(BaseModel):
@@ -31,6 +37,11 @@ class Settings(BaseSettings):
     port: int = 8080
     public_base_url: str = "http://localhost:8080"
     web_auth_token: str = ""
+    # One-tap capture (bookmarklet / browser extension) CORS allowlist.
+    # Comma-separated origins, e.g. "https://vault.example.com,chrome-extension://abc..."
+    capture_cors_origins: str = ""
+    # Allow any well-formed Chrome/Firefox extension origin (use only if needed).
+    capture_cors_allow_extensions: bool = False
     max_upload_mb: int = 20480
     telegram_part_size_mb: int = 1900
 
@@ -162,6 +173,48 @@ class Settings(BaseSettings):
             if part.isdigit():
                 ids.add(int(part))
         return ids
+
+    def get_capture_cors_origins(self) -> list[str]:
+        """Return a validated, deduplicated CORS origin allowlist.
+
+        Wildcards are never permitted: "*" (or any origin containing "*") is
+        skipped with a warning. Origins must be a bare scheme://authority with
+        no path, query, or fragment.
+        """
+        origins: list[str] = []
+        seen: set[str] = set()
+        for raw in (self.capture_cors_origins or "").split(","):
+            origin = raw.strip()
+            if not origin:
+                continue
+            if "*" in origin:
+                logger.warning(
+                    "Ignoring wildcard capture CORS origin %r; explicit origins required",
+                    origin,
+                )
+                continue
+            origin = origin.rstrip("/")
+            if not origin:
+                continue
+            try:
+                parts = urlsplit(origin)
+            except ValueError:
+                logger.warning("Ignoring malformed capture CORS origin %r", raw)
+                continue
+            if (
+                parts.scheme not in _CAPTURE_CORS_SCHEMES
+                or not parts.netloc
+                or parts.path not in ("", "/")
+                or parts.query
+                or parts.fragment
+            ):
+                logger.warning("Ignoring invalid capture CORS origin %r", raw)
+                continue
+            if origin in seen:
+                continue
+            seen.add(origin)
+            origins.append(origin)
+        return origins
 
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
