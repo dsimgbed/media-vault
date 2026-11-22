@@ -457,11 +457,141 @@ def test_node_storage_module():
 const m = await import({json.dumps(file_url)});
 const n = m.normalizeServerUrl;
 if (n("http://100.64.0.1:8080/") !== "http://100.64.0.1:8080") {{ console.error("accept fail: " + n("http://100.64.0.1:8080/")); process.exit(1); }}
+// strips trailing UI page suffixes at root
+for (const [input, expected] of [
+  ["http://example.com/capture", "http://example.com"],
+  ["http://example.com/capture/", "http://example.com"],
+  ["http://example.com/CAPTURE", "http://example.com"],
+  ["http://example.com/index.html", "http://example.com"],
+  ["http://example.com/share-target", "http://example.com"],
+]) {{
+  const got = n(input);
+  if (got !== expected) {{ console.error("strip fail: " + input + " got " + got + " expected " + expected); process.exit(1); }}
+}}
+// strips after reverse-proxy subpath
+if (n("https://example.com/vault/capture") !== "https://example.com/vault") {{ console.error("subpath strip fail: " + n("https://example.com/vault/capture")); process.exit(1); }}
+// preserves genuine reverse-proxy subpaths
+if (n("https://example.com/vault/") !== "https://example.com/vault") {{ console.error("subpath preserve fail: " + n("https://example.com/vault/")); process.exit(1); }}
+// rejects invalid schemes/credentials
 for (const bad of ["javascript:alert(1)", "ftp://host", "http://user:pass@host"]) {{
   if (n(bad) !== "") {{ console.error("should reject: " + bad + " got " + n(bad)); process.exit(1); }}
 }}
 console.log("ok");
 """
     res = _run_node(script)
+    assert res.returncode == 0, res.stderr
+    assert "ok" in res.stdout
+
+
+@skip_no_node
+def test_node_api_quick_capture_fallback(tmp_path: Path):
+    (tmp_path / "package.json").write_text(json.dumps({"type": "module"}), encoding="utf-8")
+    shutil.copyfile(EXTENSION_DIR / "lib" / "api.js", tmp_path / "api.js")
+    shutil.copyfile(EXTENSION_DIR / "lib" / "storage.js", tmp_path / "storage.js")
+    api_url = (tmp_path / "api.js").resolve().as_uri()
+    script = f"""
+const m = await import({json.dumps(api_url)});
+const quickCapture = m.quickCapture;
+
+function makeResponse(status, bodyObj) {{
+  const text = bodyObj === undefined ? "" : JSON.stringify(bodyObj);
+  return {{ status, ok: status >= 200 && status < 300, async text() {{ return text; }} }};
+}}
+
+function setup(mock) {{ globalThis.fetch = mock; }}
+
+const settings = {{ serverUrl: "http://example.com", authToken: "" }};
+const longTitle = "x".repeat(400);
+
+// Case a: modern server returns 202
+let calls = [];
+setup(async (url, opts) => {{
+  calls.push({{ url: String(url), method: opts?.method, body: opts?.body }});
+  if (String(url).includes("/api/capture/quick")) return makeResponse(202, {{ ok: true, status: "queued", job_id: "job-modern", folder: "General" }});
+  return makeResponse(404, {{}});
+}});
+let result = await quickCapture(settings, {{ url: "https://example.com/v", title: longTitle, folder: "General" }});
+if (!result || result.status !== "queued" || result.job_id !== "job-modern") {{ console.error("case a result fail: " + JSON.stringify(result)); process.exit(1); }}
+if (calls.filter(c => String(c.url).includes("/api/ingest/")).length !== 0) {{ console.error("case a should not call ingest"); process.exit(1); }}
+const qcCall = calls.find(c => String(c.url).includes("/api/capture/quick"));
+const qcBody = JSON.parse(qcCall.body);
+if (!qcBody.title || qcBody.title.length !== 300) {{ console.error("case a title not truncated: " + (qcBody.title?.length)); process.exit(1); }}
+
+// Case b: legacy 404, not duplicate
+calls = [];
+let dupCalled = false, ingestCalled = false;
+setup(async (url, opts) => {{
+  calls.push({{ url: String(url), method: opts?.method, body: opts?.body }});
+  if (String(url).includes("/api/capture/quick")) return makeResponse(404, {{ detail: "Not Found" }});
+  if (String(url).includes("/api/ingest/check-duplicate")) {{ dupCalled = true; return makeResponse(200, {{ duplicate: false }}); }}
+  if (String(url).includes("/api/ingest/url")) {{ ingestCalled = true; return makeResponse(202, {{ job_id: "job-legacy-1", status: "queued" }}); }}
+  return makeResponse(404, {{}});
+}});
+result = await quickCapture(settings, {{ url: "https://example.com/v", title: "My Title", folder: "General" }});
+if (!result || result.ok !== true || result.duplicate !== false || result.status !== "queued" || result.job_id !== "job-legacy-1" || result.fallback !== "ingest_url") {{ console.error("case b result fail: " + JSON.stringify(result)); process.exit(1); }}
+if (!String(result.summary || "").includes("General")) {{ console.error("case b summary missing folder: " + result.summary); process.exit(1); }}
+if (!dupCalled || !ingestCalled) {{ console.error("case b missing calls"); process.exit(1); }}
+
+// Case c: 405, duplicate found, force false
+calls = [];
+let ingestCalledC = false;
+setup(async (url, opts) => {{
+  calls.push({{ url: String(url), method: opts?.method, body: opts?.body }});
+  if (String(url).includes("/api/capture/quick")) return makeResponse(405, {{ detail: "Method Not Allowed" }});
+  if (String(url).includes("/api/ingest/check-duplicate")) return makeResponse(200, {{ duplicate: true, item: {{ id: 42, folder: "Archive", title: "Existing" }} }});
+  if (String(url).includes("/api/ingest/url")) {{ ingestCalledC = true; return makeResponse(202, {{ job_id: "x", status: "queued" }}); }}
+  return makeResponse(404, {{}});
+}});
+result = await quickCapture(settings, {{ url: "https://example.com/v", force: false, folder: "General" }});
+if (!result || result.ok !== true || result.status !== "duplicate" || result.duplicate !== true || result.job_id !== null || result.media_id !== 42 || result.folder !== "Archive" || result.fallback !== "ingest_url") {{ console.error("case c result fail: " + JSON.stringify(result)); process.exit(1); }}
+if (ingestCalledC) {{ console.error("case c should not call ingest"); process.exit(1); }}
+
+// Case d: 404, force true skips check-duplicate
+calls = [];
+let dupCalledD = false, ingestCalledD = false, ingestBodyD = null;
+setup(async (url, opts) => {{
+  calls.push({{ url: String(url), method: opts?.method, body: opts?.body }});
+  if (String(url).includes("/api/capture/quick")) return makeResponse(404, {{ detail: "Not Found" }});
+  if (String(url).includes("/api/ingest/check-duplicate")) {{ dupCalledD = true; return makeResponse(200, {{ duplicate: true, item: {{ id: 1, folder: "X", title: "Y" }} }}); }}
+  if (String(url).includes("/api/ingest/url")) {{ ingestCalledD = true; ingestBodyD = opts?.body; return makeResponse(202, {{ job_id: "j", status: "queued" }}); }}
+  return makeResponse(404, {{}});
+}});
+result = await quickCapture(settings, {{ url: "https://example.com/v", force: true, folder: "General" }});
+if (!result || result.fallback !== "ingest_url") {{ console.error("case d result fail: " + JSON.stringify(result)); process.exit(1); }}
+if (dupCalledD) {{ console.error("case d should skip check-duplicate"); process.exit(1); }}
+if (!ingestCalledD) {{ console.error("case d should call ingest"); process.exit(1); }}
+const ingestParsedD = JSON.parse(ingestBodyD);
+if (ingestParsedD.force !== true) {{ console.error("case d force not true: " + JSON.stringify(ingestParsedD)); process.exit(1); }}
+
+// Case e: 401 and 400 rethrow without fallback
+for (const st of [401, 400]) {{
+  calls = [];
+  let ingestCalledE = false, dupCalledE = false;
+  setup(async (url, opts) => {{
+    calls.push({{ url: String(url), method: opts?.method, body: opts?.body }});
+    if (String(url).includes("/api/capture/quick")) return makeResponse(st, {{ detail: st === 401 ? "Unauthorized" : "Bad Request" }});
+    if (String(url).includes("/api/ingest/")) {{ ingestCalledE = true; dupCalledE = true; return makeResponse(200, {{}}); }}
+    return makeResponse(404, {{}});
+  }});
+  let thrown = null;
+  try {{
+    await quickCapture(settings, {{ url: "https://example.com/v" }});
+  }} catch (err) {{
+    thrown = err;
+  }}
+  if (!thrown || thrown.status !== st) {{ console.error("case e status fail for " + st + ": " + (thrown && thrown.status)); process.exit(1); }}
+  const expectedMsg = st === 401 ? "Unauthorized" : "Bad Request";
+  if (thrown.message !== expectedMsg) {{ console.error("case e message fail: " + thrown.message); process.exit(1); }}
+  if (ingestCalledE || dupCalledE) {{ console.error("case e should not fallback"); process.exit(1); }}
+}}
+
+console.log("ok");
+"""
+    res = subprocess.run(
+        [NODE, "--input-type=module", "--eval", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
     assert res.returncode == 0, res.stderr
     assert "ok" in res.stdout

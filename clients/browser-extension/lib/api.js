@@ -202,7 +202,7 @@ export async function checkDuplicate(settings, url) {
   });
 }
 
-export async function quickCapture(settings, { url, folder, tags, title, format_spec, forward_to_telegram, force, source } = {}) {
+export async function ingestUrl(settings, { url, folder, tags, title, format_spec, forward_to_telegram, force } = {}) {
   const body = {
     url,
     folder,
@@ -211,9 +211,67 @@ export async function quickCapture(settings, { url, folder, tags, title, format_
     format_spec,
     forward_to_telegram,
     force,
+  };
+  return vaultRequest(settings, "/api/ingest/url", { method: "POST", body });
+}
+
+export async function quickCapture(settings, { url, folder, tags, title, format_spec, forward_to_telegram, force, source } = {}) {
+  const cleanTitle = typeof title === "string" ? title.trim().slice(0, 300) : title;
+  const body = {
+    url,
+    folder,
+    tags,
+    title: cleanTitle,
+    format_spec,
+    forward_to_telegram,
+    force,
     source: source == null ? "extension" : source,
   };
-  return vaultRequest(settings, "/api/capture/quick", { method: "POST", body });
+
+  try {
+    return await vaultRequest(settings, "/api/capture/quick", { method: "POST", body });
+  } catch (err) {
+    if (!(err?.status === 404 || err?.status === 405)) throw err;
+
+    if (!force) {
+      let dup = null;
+      try {
+        dup = await checkDuplicate(settings, url);
+      } catch (_) {
+        dup = null;
+      }
+      if (dup?.duplicate && dup?.item) {
+        const item = dup.item;
+        return {
+          ok: true,
+          status: "duplicate",
+          duplicate: true,
+          job_id: null,
+          url,
+          folder: item.folder || folder || "General",
+          format_spec: format_spec || "best",
+          summary: `Already in Vault (${item.folder || folder || "General"}): ${item.title || url}`,
+          media_id: item.id ?? null,
+          fallback: "ingest_url",
+        };
+      }
+    }
+
+    const res = await ingestUrl(settings, { url, folder, tags, title: cleanTitle, format_spec, forward_to_telegram, force });
+    return {
+      ok: true,
+      status: res?.status || "queued",
+      duplicate: false,
+      job_id: res?.job_id ?? (Array.isArray(res?.job_ids) ? res.job_ids[0] : null) ?? null,
+      job_ids: res?.job_ids,
+      url,
+      folder: folder || "General",
+      format_spec: format_spec || "best",
+      summary: `Queued for ${folder || "General"}: ${cleanTitle || url}`,
+      media_id: null,
+      fallback: "ingest_url",
+    };
+  }
 }
 
 export async function uploadBlob(settings, { blob, filename, title, folder, tags, forward_to_telegram, force } = {}) {

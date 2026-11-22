@@ -75,7 +75,7 @@ async function loadModules() {
 }
 
 const MAX_RECENT = 5;
-const TERMINAL_STATUSES = new Set(["done", "failed", "cancelled"]);
+const TERMINAL_STATUSES = new Set(["done", "failed", "cancelled", "duplicate"]);
 const ACTIVE_STATUSES = new Set(["queued", "pending", "downloading", "processing", "uploading", "running"]);
 const VALID_FORMATS = new Set(["best", "1080p", "720p", "480p", "audio"]);
 
@@ -438,21 +438,44 @@ async function handleUrlCapture() {
     });
 
     const jobId = jobIdFrom(result);
-    await recordRecent({
-      id: jobId || `local-${Date.now()}`,
-      kind: "url",
-      title: title || url,
-      url,
-      folder: destination.folder,
-      status: "queued",
-      createdAt: Date.now(),
-    });
-    await syncFolderMemory({ quiet: true });
-    hideDuplicate();
-    showStatus(
-      jobId ? `Queued in ${destination.folder}. Job ${shortId(jobId)}.` : `Sent to ${destination.folder}.`,
-      "ok",
-    );
+    const isDuplicate = Boolean(result?.duplicate || result?.status === "duplicate");
+
+    if (isDuplicate) {
+      await recordRecent({
+        id: jobId || `local-${Date.now()}`,
+        kind: "url",
+        title: title || url,
+        url,
+        folder: result?.folder || destination.folder,
+        status: "duplicate",
+        createdAt: Date.now(),
+      });
+      if (!duplicateInfo) {
+        duplicateInfo = {
+          item: { id: result?.media_id ?? null, folder: result?.folder || destination.folder, title: title || url },
+          folder: result?.folder || destination.folder,
+        };
+      }
+      $("dupDetail").textContent = (result?.folder || destination.folder) ? `(${result?.folder || destination.folder})` : "";
+      $("dupBanner").hidden = false;
+      showStatus(result?.summary || "Already in Vault.", "warn");
+    } else {
+      await recordRecent({
+        id: jobId || `local-${Date.now()}`,
+        kind: "url",
+        title: title || url,
+        url,
+        folder: destination.folder,
+        status: result?.status || "queued",
+        createdAt: Date.now(),
+      });
+      await syncFolderMemory({ quiet: true });
+      hideDuplicate();
+      showStatus(
+        result?.summary || (jobId ? `Queued in ${destination.folder}. Job ${shortId(jobId)}.` : `Sent to ${destination.folder}.`),
+        "ok",
+      );
+    }
   });
 }
 
@@ -1216,6 +1239,7 @@ function statusLabel(status) {
   if (value === "done") return "Done";
   if (value === "failed") return "Failed";
   if (value === "cancelled") return "Cancelled";
+  if (value === "duplicate") return "Duplicate";
   return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
@@ -1225,6 +1249,7 @@ function statusClass(status) {
     return value === "queued" || value === "pending" ? "queued" : "active";
   }
   if (value === "done" || value === "failed" || value === "cancelled") return value;
+  if (value === "duplicate") return "warn";
   return "unknown";
 }
 

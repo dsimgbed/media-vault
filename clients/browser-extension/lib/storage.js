@@ -73,7 +73,15 @@ export function normalizeServerUrl(raw) {
   if (parsed.username || parsed.password) return "";
   if (!parsed.hostname) return "";
 
-  const pathname = (parsed.pathname || "").replace(/\/+$/, "");
+  let pathname = (parsed.pathname || "").replace(/\/+$/, "");
+  const lower = pathname.toLowerCase();
+  for (const suffix of ["/capture", "/index.html", "/share-target"]) {
+    if (lower.endsWith(suffix)) {
+      pathname = pathname.slice(0, pathname.length - suffix.length);
+      break;
+    }
+  }
+  pathname = pathname.replace(/\/+$/, "");
   return `${parsed.origin}${pathname}`;
 }
 
