@@ -44,6 +44,7 @@ function defaultDraft() {
     interval_minutes: 60,
     max_items_per_check: 10,
     seed_only: true,
+    archive_existing: false,
     initial_backfill_limit: 0,
     title_include_regex: "",
     title_exclude_regex: "",
@@ -217,6 +218,10 @@ function draftForSub(sub) {
     interval_minutes: clampInt(sub.interval_minutes, 5, 10080, 60),
     max_items_per_check: clampInt(sub.max_items_per_check, 1, 100, 10),
     seed_only: sub.seed_only === undefined ? d.seed_only : Boolean(sub.seed_only),
+    archive_existing:
+      sub.archive_existing === undefined
+        ? d.archive_existing
+        : Boolean(sub.archive_existing),
     initial_backfill_limit: clampInt(sub.initial_backfill_limit, 0, 50, 0),
     title_include_regex: String(sub.title_include_regex ?? ""),
     title_exclude_regex: String(sub.title_exclude_regex ?? ""),
@@ -338,13 +343,17 @@ function renderForm() {
                 <span class="small-muted">Applied only on the first check. ${isEdit ? "This subscription has not been seeded yet." : ""}</span>
               </div>
               <label class="checkbox-label sub-check">
-                <input id="subSeedOnly" type="checkbox"${d.seed_only ? " checked" : ""} />
+                <input id="subArchiveExisting" type="checkbox"${d.archive_existing ? " checked" : ""} />
+                Download all existing videos on first run (full channel/playlist archive)
+              </label>
+              <label class="checkbox-label sub-check">
+                <input id="subSeedOnly" type="checkbox"${d.seed_only && !d.archive_existing ? " checked" : ""}${d.archive_existing ? " disabled" : ""} />
                 Seed existing items as seen on first run (no backlog flood)
               </label>
               <label class="sys-inline-field">
                 <span>Initial backfill limit</span>
                 <input id="subBackfillLimit" type="number" min="0" max="50"
-                  value="${E(n(d.initial_backfill_limit))}" />
+                  value="${E(n(d.initial_backfill_limit))}"${d.archive_existing ? " disabled" : ""} />
               </label>
             </div>
           `
@@ -419,6 +428,7 @@ function renderCard(sub) {
     : "";
 
   const checking = isBusy(id, "check");
+  const archiving = isBusy(id, "archive-existing");
   const previewing = isBusy(id, "dry-run");
   const toggling = isBusy(id, "toggle");
   const backfilling = isBusy(id, "backfill");
@@ -442,7 +452,8 @@ function renderCard(sub) {
         </div>
         <div class="sys-actions-row sub-card-actions">
           ${subButton(id, "toggle", toggling ? "Saving…" : isPaused(sub) ? "Enable" : "Pause", { disabled: toggling })}
-          ${subButton(id, "check", checking ? "Checking…" : "Check Now", { disabled: checking })}
+          ${subButton(id, "check", checking ? "Checking…" : "Check Now", { disabled: checking || archiving })}
+          ${subButton(id, "archive-existing", archiving ? "Archiving…" : "Archive Existing", { disabled: archiving || checking })}
           ${showCardBackfill ? subButton(id, "backfill", backfilling ? "Queuing…" : "Download Seen", { disabled: backfilling }) : ""}
           ${subButton(id, "dry-run", previewing ? "Previewing…" : "Preview / Dry Run", { disabled: previewing })}
           ${subButton(id, "entries", drawers.has(id) ? "Hide Entries" : "Entries")}
@@ -581,6 +592,7 @@ function renderDrawer(id, drawer, sub) {
   const status = String(d.status || "all");
   const entries = Array.isArray(d.entries) ? d.entries : [];
   const backfilling = isBusy(id, "backfill");
+  const archiving = isBusy(id, "archive-existing");
   const maxPerCheck = Math.max(1, n(sub?.max_items_per_check) || 10);
   const filters = ENTRY_FILTERS.map(
     (f) =>
@@ -602,7 +614,10 @@ function renderDrawer(id, drawer, sub) {
           <strong>Entry history</strong>
           <span class="small-muted">${E(n(d.total))} recorded</span>
         </div>
-        ${subButton(id, "backfill", backfilling ? "Queuing…" : `Download Seen (up to ${maxPerCheck})`, { disabled: backfilling })}
+        <div class="sys-actions-row">
+          ${subButton(id, "archive-existing", archiving ? "Archiving…" : "Archive Existing", { disabled: archiving })}
+          ${subButton(id, "backfill", backfilling ? "Queuing…" : `Download Seen (up to ${maxPerCheck})`, { disabled: backfilling })}
+        </div>
       </div>
       <div class="sub-entry-filters">${filters}</div>
       ${body}
@@ -653,6 +668,7 @@ function readFormValues(form) {
     format_spec: String(val("subFormat") || ""),
     interval_minutes: val("subInterval"),
     max_items_per_check: val("subMaxItems"),
+    archive_existing: checked("subArchiveExisting"),
     seed_only: checked("subSeedOnly"),
     initial_backfill_limit: val("subBackfillLimit"),
     title_include_regex: String(val("subIncludeRegex") || "").trim(),
@@ -680,7 +696,9 @@ function buildPayload(values) {
     title_exclude_regex: values.title_exclude_regex,
   };
   if (!formMode || formMode.kind === "create" || !isSeeded(findSub(formMode.id))) {
-    body.seed_only = Boolean(values.seed_only);
+    const archiveExisting = Boolean(values.archive_existing);
+    body.archive_existing = archiveExisting;
+    body.seed_only = archiveExisting ? false : Boolean(values.seed_only);
     body.initial_backfill_limit = clampInt(values.initial_backfill_limit, 0, 50, 0);
   }
   return body;
@@ -802,7 +820,7 @@ async function runCheck(id, view, dryRun) {
       const seen = n(result?.skipped_seen_count);
       if (queued === 0 && seeded === 0 && seen > 0) {
         toast(
-          `No new uploads (${seen} already marked seen). Click "Download Seen" or open Entries → Download to fetch older items.`,
+          `No new uploads (${seen} already marked seen). Click "Archive Existing" to download all videos on this channel or "Download Seen" for seen items.`,
           { type: "info" }
         );
       } else {
@@ -823,6 +841,56 @@ async function runCheck(id, view, dryRun) {
       loadSubscriptionsTab(view, { silent: true }).catch(() => {});
     }
     toast(`Check failed: ${err.message}`, { type: "error" });
+  } finally {
+    busyActions.delete(key);
+    if (view && subsCache) renderSubscriptionsView(view, subsCache);
+  }
+}
+
+async function archiveExistingSub(id, view) {
+  const key = subKey(id, "archive-existing");
+  if (busyActions.has(key) || busyActions.has(subKey(id, "check"))) return;
+  const sub = findSub(id);
+  const name = String(sub?.name || sub?.source_url || "this subscription");
+  const ok = await confirmDialog({
+    title: "Archive All Existing Videos",
+    message: `Scan the full channel/playlist catalog for "${name}" and queue all unarchived videos for download? Already-archived or queued items will be skipped.`,
+    confirmLabel: "Archive Existing",
+  });
+  if (!ok) return;
+
+  busyActions.add(key);
+  if (view && subsCache) renderSubscriptionsView(view, subsCache);
+  try {
+    const result = await apiFetch(
+      `/api/subscriptions/${encodeURIComponent(id)}/check?full_catalog=true&queue_existing=true`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ full_catalog: true, queue_existing: true }),
+      }
+    );
+    const discovered = n(result?.discovered_count);
+    const queued = n(result?.queued_count);
+    const dupes = n(result?.skipped_duplicate_count);
+    if (queued > 0) {
+      toast(
+        `Queued ${queued} video(s) from full scan (${discovered} discovered${dupes ? `, ${dupes} already in vault` : ""}).`,
+        { type: "success" }
+      );
+    } else {
+      toast(
+        `Full scan complete (${discovered} discovered): no new videos left to queue.`,
+        { type: "info" }
+      );
+    }
+    await loadSubscriptionsTab(view, { silent: true });
+    if (drawers.has(id)) {
+      await loadEntries(id, view, { append: false });
+    }
+  } catch (err) {
+    loadSubscriptionsTab(view, { silent: true }).catch(() => {});
+    toast(`Archive failed: ${err.message}`, { type: "error" });
   } finally {
     busyActions.delete(key);
     if (view && subsCache) renderSubscriptionsView(view, subsCache);
@@ -994,6 +1062,7 @@ function syncFormDraft(e) {
     subFormat: "format_spec",
     subInterval: "interval_minutes",
     subMaxItems: "max_items_per_check",
+    subArchiveExisting: "archive_existing",
     subSeedOnly: "seed_only",
     subBackfillLimit: "initial_backfill_limit",
     subIncludeRegex: "title_include_regex",
@@ -1004,6 +1073,18 @@ function syncFormDraft(e) {
   const key = fields[t.id];
   if (!key) return;
   subDraft[key] = t.type === "checkbox" ? Boolean(t.checked) : t.value;
+  if (t.id === "subArchiveExisting") {
+    const form = t.closest("form");
+    const seedEl = form?.querySelector("#subSeedOnly");
+    const backfillEl = form?.querySelector("#subBackfillLimit");
+    const on = Boolean(t.checked);
+    if (on) {
+      subDraft.seed_only = false;
+      if (seedEl) seedEl.checked = false;
+    }
+    if (seedEl) seedEl.disabled = on;
+    if (backfillEl) backfillEl.disabled = on;
+  }
 }
 
 export function handleSubscriptionsInput(e) {
@@ -1115,6 +1196,9 @@ export function handleSubscriptionsClick(e) {
   } else if (action === "check") {
     e.preventDefault();
     runCheck(id, view, false);
+  } else if (action === "archive-existing") {
+    e.preventDefault();
+    archiveExistingSub(id, view);
   } else if (action === "backfill") {
     e.preventDefault();
     backfillSub(id, view);

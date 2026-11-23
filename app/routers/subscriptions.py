@@ -90,16 +90,26 @@ async def delete_subscription(sub_id: str, ctx: AppContext = Depends(get_ctx)):
 async def check_subscription(
     sub_id: str,
     dry_run: bool = Query(default=False),
+    full_catalog: bool = Query(default=False),
+    queue_existing: bool = Query(default=False),
     payload: SubscriptionCheckRequest | None = Body(default=None),
     ctx: AppContext = Depends(get_ctx),
 ):
     subs = _require_subscriptions(ctx)
     effective_dry_run = bool(dry_run or (payload.dry_run if payload else False))
+    effective_full_catalog = bool(
+        full_catalog or (payload.full_catalog if payload else False)
+    )
+    effective_queue_existing = bool(
+        queue_existing or (payload.queue_existing if payload else False)
+    )
     try:
         return await subs.check_subscription(
             sub_id,
             dry_run=effective_dry_run,
             trigger="manual",
+            full_catalog=effective_full_catalog,
+            queue_existing=effective_queue_existing,
         )
     except SubscriptionNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
@@ -155,6 +165,7 @@ async def backfill_subscription(
             sub_id,
             limit=payload.limit if payload else None,
             statuses=payload.statuses if payload else None,
+            queue_all=bool(payload.all) if payload else False,
         )
     except SubscriptionNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))

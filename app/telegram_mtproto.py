@@ -1874,11 +1874,13 @@ class TelegramPool:
                     f"(`{state_lbl}`, every {s.get('interval_minutes')}m, "
                     f"{int(s.get('items_ingested_count') or 0)} archived)"
                 )
-            lines.append("\nRun `/subs check <id>` to check one now.")
+            lines.append(
+                "\nRun `/subs check <id>` to check now or `/subs archive <id>` to download all existing items."
+            )
             return "\n".join(lines)
 
         cmd = parts[0].lower()
-        if cmd == "check" and len(parts) >= 2:
+        if cmd in ("check", "archive") and len(parts) >= 2:
             target = parts[1].strip()
             subs = svc.list_subscriptions()
             match = next(
@@ -1887,18 +1889,27 @@ class TelegramPool:
             )
             if not match:
                 return f"Subscription `{target}` not found."
+            is_archive = cmd == "archive"
             try:
-                res = await svc.check_subscription(match["id"], dry_run=False, trigger="telegram")
+                res = await svc.check_subscription(
+                    match["id"],
+                    dry_run=False,
+                    trigger="telegram",
+                    full_catalog=is_archive,
+                    queue_existing=is_archive,
+                )
+                label = "Archived" if is_archive else "Checked"
                 return (
-                    f"Checked **{match.get('name') or match['id']}**: "
+                    f"{label} **{match.get('name') or match['id']}**: "
                     f"{int(res.get('discovered_count', 0))} discovered, "
                     f"{int(res.get('queued_count', 0))} queued, "
                     f"{int(res.get('seeded_count', 0))} seeded."
                 )
             except Exception as exc:
-                return f"Check failed for `{match['id']}`: {exc}"
+                action_lbl = "Archive" if is_archive else "Check"
+                return f"{action_lbl} failed for `{match['id']}`: {exc}"
 
-        return "Usage: `/subs` or `/subs check <id>`"
+        return "Usage: `/subs`, `/subs check <id>`, or `/subs archive <id>`"
 
     def _register_handlers(self, cfg: TelegramApiConfig, client: TelegramClient) -> None:
         @client.on(events.NewMessage(pattern=r"^/(start|help)$"))

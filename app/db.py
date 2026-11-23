@@ -388,6 +388,7 @@ class Database:
                     enabled INTEGER NOT NULL DEFAULT 1,
                     seed_only INTEGER NOT NULL DEFAULT 1,
                     initial_backfill_limit INTEGER NOT NULL DEFAULT 0,
+                    archive_existing INTEGER NOT NULL DEFAULT 0,
                     seeded_at TEXT,
                     title_include_regex TEXT,
                     title_exclude_regex TEXT,
@@ -435,6 +436,7 @@ class Database:
                 ("enabled", "INTEGER NOT NULL DEFAULT 1"),
                 ("seed_only", "INTEGER NOT NULL DEFAULT 1"),
                 ("initial_backfill_limit", "INTEGER NOT NULL DEFAULT 0"),
+                ("archive_existing", "INTEGER NOT NULL DEFAULT 0"),
                 ("seeded_at", "TEXT"),
                 ("title_include_regex", "TEXT"),
                 ("title_exclude_regex", "TEXT"),
@@ -2451,7 +2453,7 @@ class Database:
     def _hydrate_subscription(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         item = dict(row)
         item["tags"] = normalize_tags(item.get("tags") or "")
-        for key in ("forward_to_telegram", "enabled", "seed_only"):
+        for key in ("forward_to_telegram", "enabled", "seed_only", "archive_existing"):
             item[key] = bool(item.get(key))
         for key in (
             "interval_minutes",
@@ -2478,6 +2480,7 @@ class Database:
         enabled: bool = True,
         seed_only: bool = True,
         initial_backfill_limit: int = 0,
+        archive_existing: bool = False,
         title_include_regex: str | None = None,
         title_exclude_regex: str | None = None,
         next_check_at: str | None = None,
@@ -2498,9 +2501,9 @@ class Database:
                 INSERT INTO subscriptions (
                     id, name, source_url, normalized_source_url, source_kind, folder, tags,
                     format_spec, forward_to_telegram, interval_minutes, max_items_per_check,
-                    enabled, seed_only, initial_backfill_limit, next_check_at,
+                    enabled, seed_only, initial_backfill_limit, archive_existing, next_check_at,
                     title_include_regex, title_exclude_regex, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     sub_id,
@@ -2517,6 +2520,7 @@ class Database:
                     1 if enabled else 0,
                     1 if seed_only else 0,
                     int(initial_backfill_limit),
+                    1 if archive_existing else 0,
                     resolved_next_check_at,
                     title_include_regex,
                     title_exclude_regex,
@@ -2580,6 +2584,7 @@ class Database:
             "enabled",
             "seed_only",
             "initial_backfill_limit",
+            "archive_existing",
             "seeded_at",
             "title_include_regex",
             "title_exclude_regex",
@@ -2601,7 +2606,7 @@ class Database:
                 ).strip()
             if key == "tags":
                 updates["tags"] = ",".join(normalize_tags(value))
-            elif key in ("forward_to_telegram", "enabled", "seed_only"):
+            elif key in ("forward_to_telegram", "enabled", "seed_only", "archive_existing"):
                 updates[key] = 1 if value else 0
             else:
                 updates[key] = value
@@ -2856,7 +2861,7 @@ class Database:
         if not clean_statuses:
             clean_statuses = ["seen"]
         placeholders = ",".join("?" for _ in clean_statuses)
-        safe_limit = max(1, min(50, int(limit)))
+        safe_limit = max(1, min(5000, int(limit)))
         with self._connect() as conn:
             rows = conn.execute(
                 f"""

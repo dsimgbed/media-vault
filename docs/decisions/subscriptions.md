@@ -32,9 +32,9 @@ Design constraints that shaped the ADR:
 - `subscriptions` table: id, name, source_url, normalized_source_url, source_kind
   (`auto` | `rss` | `ytdlp`), folder, tags, format_spec, forward_to_telegram,
   interval_minutes, max_items_per_check, enabled, seed_only, initial_backfill_limit,
-  seeded_at, title_include_regex, title_exclude_regex, last_checked_at, next_check_at,
-  last_status, last_error, consecutive_failures, items_ingested_count, created_at,
-  updated_at.
+  archive_existing, seeded_at, title_include_regex, title_exclude_regex, last_checked_at,
+  next_check_at, last_status, last_error, consecutive_failures, items_ingested_count,
+  created_at, updated_at.
 - `subscription_entries` ledger: PK `(subscription_id, entry_key)`, with url,
   normalized_url, status (`seen` | `queued` | `ingested` | `skipped` | `failed`), media_id,
   job_id, error, published_at, first_seen_at, last_attempt_at; FK to `subscriptions(id)`
@@ -46,29 +46,41 @@ Design constraints that shaped the ADR:
 
 ### 2.2 Hybrid discovery pipeline
 
-`SubscriptionService._discover_entries`:
+`SubscriptionService._discover_entries(sub, full_catalog=False)`:
 
 1. `source_kind == "rss"` → fetch via `fetch_feed_bytes` + `parse_feed_xml` (backend `rss`).
 2. `source_kind == "ytdlp"` → `expand_ytdlp_playlist` with `max_items` (backend `ytdlp`).
 3. `source_kind == "auto"`:
-   - YouTube watch URL → `resolve_youtube_rss_url` maps channel (`/channel/UC…`,
-     `/user/…`, `/playlist?list=…`) to a YouTube Atom feed URL; fast-path RSS fetch with
-     fallback to yt-dlp on `SubscriptionFetchError`.
+   - YouTube watch URL (when `full_catalog=False`) → `resolve_youtube_rss_url` maps channel
+     (`/channel/UC…`, `/user/…`, `/playlist?list=…`) to a YouTube Atom feed URL; fast-path
+     RSS fetch with fallback to yt-dlp on `SubscriptionFetchError`. When `full_catalog=True`,
+     YouTube Atom RSS (capped at 15 items) is bypassed so `expand_ytdlp_playlist` scans the
+     full channel/playlist (including nested channel tabs) up to
+     `SUBSCRIPTIONS_FULL_CATALOG_MAX_ITEMS`.
    - Feed-looking URL (`feeds/`, `.rss`, `.xml`, `.atom`) → RSS fast path with yt-dlp fallback.
    - Otherwise → yt-dlp playlist expansion.
 
 Entry keys: YouTube video ids become `https://www.youtube.com/watch?v=<id>` (normalized);
 other entries key off `guid:` or normalized URL.
 
-### 2.3 First-run flood protection
+### 2.3 First-run flood protection & full-catalog archiving
 
-- Defaults: `seed_only = true`, `initial_backfill_limit = 0`, `max_items_per_check = 10`.
+- Defaults: `seed_only = true`, `initial_backfill_limit = 0`, `archive_existing = false`,
+  `max_items_per_check = 10`.
 - First check (`seeded_at` unset):
+  - `archive_existing = true` → forces `full_catalog=True` and `queue_existing=True` so the
+    entire discovered catalog (up to `SUBSCRIPTIONS_FULL_CATALOG_MAX_ITEMS`) is queued;
+    `archive_existing` is cleared once the initial run finishes so future polls stay incremental.
   - `seed_only` + no backfill limit → queue budget 0, all entries marked `seen`
     (`action = "seeded"`, no downloads).
   - `initial_backfill_limit > 0` → queue budget `min(backfill_limit, max_items)`, remaining
     entries marked seen.
 - Later checks: queue up to `max_items_per_check`, defer the rest.
+- Retroactive full archive: `POST /api/subscriptions/{id}/check?full_catalog=true&queue_existing=true`
+  (also exposed via the UI **"Archive Existing"** button and Telegram `/subs archive <id>`)
+  discovers up to `SUBSCRIPTIONS_FULL_CATALOG_MAX_ITEMS` items, skips `ingested`/`queued`/`skipped`/`failed`
+  entries and vault duplicates, and queues both previously `seen` rows and newly discovered backlog.
+- `POST /api/subscriptions/{id}/backfill` supports `all: true` (up to 5,000 seen entries).
 - `POST /api/subscriptions/{id}/check?dry_run=true` returns `would_queue` / `would_seed`
   without touching state.
 

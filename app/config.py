@@ -110,6 +110,7 @@ class Settings(BaseSettings):
     subscriptions_max_feed_bytes: int = 5 * 1024 * 1024
     subscriptions_failure_pause_threshold: int = 5
     subscriptions_allow_private_hosts: bool = False
+    subscriptions_full_catalog_max_items: int = 1000
 
     # Personal Cloud Torrent Leecher (aria2c) & gallery-dl Gallery Ingest settings
     torrent_enabled: bool = True

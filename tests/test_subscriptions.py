@@ -1511,11 +1511,15 @@ def test_telegram_subs_command_empty_populated_check_and_unknown(tmp_path: Path)
     assert "Checked **Feed One**" in checked
     assert "0 discovered, 0 queued, 0 seeded." in checked
 
+    archived = asyncio.run(pool.handle_subs_command(f"archive {first['id'][:6]}"))
+    assert "Archived **Feed One**" in archived
+    assert "0 discovered, 0 queued, 0 seeded." in archived
+
     unknown = asyncio.run(pool.handle_subs_command("check zzzzzz"))
     assert "not found" in unknown
 
     usage = asyncio.run(pool.handle_subs_command("bogus"))
-    assert usage == "Usage: `/subs` or `/subs check <id>`"
+    assert usage == "Usage: `/subs`, `/subs check <id>`, or `/subs archive <id>`"
 
 
 # ---------------------------------------------------------------------------
@@ -1544,6 +1548,9 @@ def test_frontend_subscription_and_maintenance_assets_pass_syntax_and_guardrails
         assert checked.returncode == 0, f"{rel}: {checked.stderr}"
         for forbidden in ("window.alert(", "window.confirm(", "window.prompt("):
             assert forbidden not in source, f"{forbidden} found in {rel}"
+        if rel == "js/features/subscriptions.js":
+            assert 'id="subArchiveExisting"' in source
+            assert 'data-sub-action="archive-existing"' in source or '"archive-existing"' in source
 
     index_source = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
     assert len(index_source.splitlines()) < 350
@@ -1812,5 +1819,275 @@ def test_queue_existing_entry_and_backfill_api(tmp_path: Path):
             headers=headers,
         )
         assert r_missing.status_code == 404
+
+
+def test_archive_existing_on_initial_run_queues_full_catalog_and_resets_flag(tmp_path: Path):
+    app, _settings = _make_api_app(tmp_path, enabled=False)
+    headers = {"Authorization": f"Bearer {AUTH_TOKEN}"}
+    subs = app.state.subscriptions
+    db = app.state.db
+
+    submitted: list[str] = []
+    app.state.ingest.submit_job = lambda job_id, coro: (submitted.append(job_id), coro.close())[0]
+
+    entries_60 = [
+        _entry(f"v{i:02d}", f"https://www.youtube.com/watch?v=vid{i:02d}", f"Video {i}")
+        for i in range(1, 61)
+    ]
+    discover_flags: list[bool] = []
+
+    async def fake_discover(sub, *, full_catalog: bool = False):
+        discover_flags.append(full_catalog)
+        return {
+            "backend": "ytdlp",
+            "resolved_url": sub.get("source_url"),
+            "feed_title": "Full Channel",
+            "entries": list(entries_60),
+        }
+
+    subs._discover_entries = fake_discover
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/subscriptions",
+            json={
+                "source_url": "https://www.youtube.com/@SomeCreator",
+                "name": "Creator Archive",
+                "max_items_per_check": 10,
+                "seed_only": True,
+                "archive_existing": True,
+            },
+            headers=headers,
+        )
+        assert created.status_code == 201, created.text
+        sub_obj = created.json()
+        sub_id = sub_obj["id"]
+        assert sub_obj["archive_existing"] is True
+        assert sub_obj["seed_only"] is False
+
+        # Dry-run should preview all 60 without mutating DB or clearing archive_existing
+        dry = client.post(f"/api/subscriptions/{sub_id}/check?dry_run=true", headers=headers)
+        assert dry.status_code == 200, dry.text
+        assert dry.json()["queued_count"] == 60
+        assert discover_flags == [True]
+        assert db.get_subscription(sub_id)["archive_existing"] is True
+
+        # Real initial run queues all 60 and clears archive_existing for subsequent polls
+        real = client.post(f"/api/subscriptions/{sub_id}/check", headers=headers)
+        assert real.status_code == 200, real.text
+        body = real.json()
+        assert discover_flags == [True, True]
+        assert body["discovered_count"] == 60
+        assert body["queued_count"] == 60
+        assert body["seeded_count"] == 0
+        assert len(submitted) == 60
+
+        stored = db.get_subscription(sub_id)
+        assert stored["seeded_at"] is not None
+        assert stored["archive_existing"] is False
+
+        # Next regular check stays incremental (full_catalog=False)
+        entries_60.insert(
+            0, _entry("v61", "https://www.youtube.com/watch?v=vid61", "Video 61")
+        )
+        nxt = client.post(f"/api/subscriptions/{sub_id}/check", headers=headers)
+        assert nxt.status_code == 200
+        assert discover_flags[-1] is False
+        assert nxt.json()["queued_count"] == 1
+        assert len(submitted) == 61
+
+
+def test_retroactive_full_catalog_archive_queues_seen_and_newly_discovered_entries(tmp_path: Path):
+    app, _settings = _make_api_app(tmp_path, enabled=False)
+    headers = {"Authorization": f"Bearer {AUTH_TOKEN}"}
+    subs = app.state.subscriptions
+    db = app.state.db
+
+    submitted: list[str] = []
+    app.state.ingest.submit_job = lambda job_id, coro: (submitted.append(job_id), coro.close())[0]
+
+    with TestClient(app) as client:
+        sub_id = client.post(
+            "/api/subscriptions",
+            json={
+                "source_url": "https://www.youtube.com/@Crimson_Aura-k4b",
+                "name": "Crimson",
+                "seed_only": True,
+                "max_items_per_check": 10,
+            },
+            headers=headers,
+        ).json()["id"]
+
+        # Simulate initial capped discovery of 25 entries
+        first_25 = [
+            _entry(f"k{i:02d}", f"https://www.youtube.com/watch?v=k{i:02d}", f"Clip {i}")
+            for i in range(1, 26)
+        ]
+        all_45 = [
+            _entry(f"k{i:02d}", f"https://www.youtube.com/watch?v=k{i:02d}", f"Clip {i}")
+            for i in range(1, 46)
+        ]
+        discover_flags: list[bool] = []
+
+        async def fake_discover(sub, *, full_catalog: bool = False):
+            discover_flags.append(full_catalog)
+            return {
+                "backend": "ytdlp",
+                "resolved_url": sub.get("source_url"),
+                "feed_title": "Crimson",
+                "entries": list(all_45 if full_catalog else first_25),
+            }
+
+        subs._discover_entries = fake_discover
+
+        # First incremental check seeds only top 25
+        seed_res = client.post(f"/api/subscriptions/{sub_id}/check", headers=headers).json()
+        assert seed_res["discovered_count"] == 25
+        assert seed_res["seeded_count"] == 25
+
+        # Mark k01..k15 ingested, k21 failed, and k20 already in media_items vault
+        for i in range(1, 16):
+            db.update_subscription_entry_status(sub_id, f"k{i:02d}", status="ingested", media_id=f"m{i}")
+        db.update_subscription_entry_status(sub_id, "k21", status="failed", error="404")
+        _insert_media(db, "m20", "https://www.youtube.com/watch?v=k20", title="Clip 20")
+
+        # Retroactive full-catalog archive:
+        # 15 ingested + 1 failed = 16 skipped_seen
+        # 1 vault duplicate (k20) = 1 skipped_duplicate
+        # remaining seen (k16..k19, k22..k25 = 8) + new (k26..k45 = 20) = 28 queued!
+        res = client.post(
+            f"/api/subscriptions/{sub_id}/check?full_catalog=true&queue_existing=true",
+            headers=headers,
+        )
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert discover_flags == [False, True]
+        assert body["discovered_count"] == 45
+        assert body["skipped_seen_count"] == 16
+        assert body["skipped_duplicate_count"] == 1
+        assert body["queued_count"] == 28
+        assert len(submitted) == 28
+        assert db.list_subscription_entries(sub_id)[1] == 45
+
+
+def test_full_catalog_discovery_bypasses_youtube_rss_and_uses_configured_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    service, _db, _ingest = _make_service(
+        tmp_path, subscriptions_full_catalog_max_items=350
+    )
+    _public_dns(monkeypatch)
+    expand_limits: list[int] = []
+    rss_calls: list[str] = []
+
+    async def fake_fetch(url, **kwargs):
+        rss_calls.append(url)
+        return (ATOM_YOUTUBE_FEED, url, "application/atom+xml")
+
+    async def fake_expand(url, *, cookies_file=None, proxy="", max_items=100):
+        expand_limits.append(max_items)
+        return {
+            "playlist_title": "Channel",
+            "webpage_url": url,
+            "entries": [{"url": "https://www.youtube.com/watch?v=abc", "title": "ABC"}],
+        }
+
+    monkeypatch.setattr(subs_mod, "fetch_feed_bytes", fake_fetch)
+    monkeypatch.setattr(subs_mod, "expand_ytdlp_playlist", fake_expand)
+
+    sub = {
+        "id": "sub-yt",
+        "source_url": "https://www.youtube.com/channel/UC1234567890",
+        "source_kind": "auto",
+        "max_items_per_check": 10,
+        "initial_backfill_limit": 0,
+    }
+
+    normal = asyncio.run(service._discover_entries(sub, full_catalog=False))
+    assert normal["backend"] == "rss"
+    assert len(rss_calls) == 1
+    assert expand_limits == []
+
+    full = asyncio.run(service._discover_entries(sub, full_catalog=True))
+    assert full["backend"] == "ytdlp"
+    assert len(rss_calls) == 1  # bypassed YouTube RSS 15-item feed
+    assert expand_limits == [350]
+
+
+def test_expand_ytdlp_playlist_flattens_nested_channel_tabs(monkeypatch: pytest.MonkeyPatch):
+    import app.ingest as ingest_mod
+
+    payload = {
+        "_type": "playlist",
+        "title": "Creator",
+        "webpage_url": "https://www.youtube.com/@Creator",
+        "entries": [
+            {
+                "_type": "playlist",
+                "title": "Creator - Videos",
+                "ie_key": "YoutubeTab",
+                "entries": [
+                    {"id": "vid1", "title": "V1", "ie_key": "Youtube"},
+                    {"id": "vid2", "title": "V2", "url": "https://www.youtube.com/watch?v=vid2"},
+                ],
+            },
+            {
+                "_type": "playlist",
+                "title": "Creator - Shorts",
+                "ie_key": "YoutubeTab",
+                "entries": [
+                    {"id": "sh1", "title": "S1", "ie_key": "Youtube"},
+                ],
+            },
+        ],
+    }
+
+    async def fake_run_subprocess(*args):
+        return (0, json.dumps(payload), "")
+
+    monkeypatch.setattr(ingest_mod, "_run_subprocess", fake_run_subprocess)
+    res = asyncio.run(ingest_mod.expand_ytdlp_playlist("https://www.youtube.com/@Creator", max_items=500))
+    assert [e["url"] for e in res["entries"]] == [
+        "https://www.youtube.com/watch?v=vid1",
+        "https://www.youtube.com/watch?v=vid2",
+        "https://www.youtube.com/watch?v=sh1",
+    ]
+
+
+def test_backfill_all_queues_more_than_fifty_seen_entries(tmp_path: Path):
+    app, _settings = _make_api_app(tmp_path, enabled=False)
+    headers = {"Authorization": f"Bearer {AUTH_TOKEN}"}
+    subs = app.state.subscriptions
+
+    submitted: list[str] = []
+    app.state.ingest.submit_job = lambda job_id, coro: (submitted.append(job_id), coro.close())[0]
+
+    with TestClient(app) as client:
+        sub_id = client.post(
+            "/api/subscriptions",
+            json={
+                "source_url": "https://example.com/feed.xml",
+                "name": "Big Seeded",
+                "seed_only": True,
+                "max_items_per_check": 5,
+            },
+            headers=headers,
+        ).json()["id"]
+
+        _install_discovery(
+            subs,
+            [_entry(f"e{i:03d}", f"https://example.com/v{i}.mp4", f"V{i}") for i in range(1, 76)],
+        )
+        assert client.post(f"/api/subscriptions/{sub_id}/check", headers=headers).json()["seeded_count"] == 75
+
+        bf = client.post(
+            f"/api/subscriptions/{sub_id}/backfill",
+            json={"all": True},
+            headers=headers,
+        )
+        assert bf.status_code == 200, bf.text
+        assert bf.json()["queued_count"] == 75
+        assert len(submitted) == 75
+
 
 

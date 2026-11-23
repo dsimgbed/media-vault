@@ -116,9 +116,9 @@ Open `http://localhost:8080` (or your Tailscale IP) on your phone or laptop.
 
 ### 9. Watch Subscriptions (Auto-Archiver)
 
-1. **System Sheet → Subscriptions**: Create, edit, pause/resume, dry-run (`?dry_run=true`), live-check, or inspect the per-entry ledger (`seen`, `queued`, `ingested`, `skipped`, `failed`) for any YouTube channel/playlist or RSS/Atom/RDF feed.
-2. **First-Run Flood Protection**: New subscriptions default to `seed_only=true` (`initial_backfill_limit=0`) so existing catalogs are seeded without triggering a download storm; optional `initial_backfill_limit` lets you queue only the newest N items on creation.
-3. **Telegram Commands**: Run `/subs` to view watched feeds and `/subs check <id>` to trigger an immediate check from Telegram.
+1. **System Sheet → Subscriptions**: Create, edit, pause/resume, dry-run (`?dry_run=true`), live-check, **Archive Existing** (`?full_catalog=true&queue_existing=true`), or inspect the per-entry ledger (`seen`, `queued`, `ingested`, `skipped`, `failed`) for any YouTube channel/playlist or RSS/Atom/RDF feed.
+2. **First-Run Flood Protection & Full Archiving**: New subscriptions default to `seed_only=true` (`initial_backfill_limit=0`) so existing catalogs are seeded without triggering a download storm; optional `initial_backfill_limit` queues only the newest N items, or enable **Download all existing videos on first run** (`archive_existing=true`) to scan and archive the full channel/playlist (up to `SUBSCRIPTIONS_FULL_CATALOG_MAX_ITEMS`, default `1000`).
+3. **Telegram Commands**: Run `/subs` to view watched feeds, `/subs check <id>` to trigger an incremental check, or `/subs archive <id>` to scan and queue all existing items from Telegram.
 4. **Security & SSRF**: Outbound feed fetches, redirect hops, and subscription-triggered downloads block private/loopback/link-local/metadata IPs unless `SUBSCRIPTIONS_ALLOW_PRIVATE_HOSTS=true`; XML parsing forbids DTD/ENTITY/NOTATION declarations; title regexes are AST-screened against ReDoS. See [`docs/decisions/subscriptions.md`](docs/decisions/subscriptions.md) for architecture details.
 
 ### 10. External Players & Read-Only WebDAV (/webdav/)

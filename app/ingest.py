@@ -701,11 +701,25 @@ async def expand_ytdlp_playlist(
 
     raw_entries = info.get("entries")
     if info.get("_type") in ("playlist", "multi_video") or isinstance(raw_entries, list):
+        def _flatten_entries(items: list[Any]) -> list[dict[str, Any]]:
+            flat: list[dict[str, Any]] = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                nested = item.get("entries")
+                if isinstance(nested, list) and (
+                    item.get("_type") in ("playlist", "multi_video") or not item.get("id")
+                    or str(item.get("ie_key") or "").lower().endswith("tab")
+                    or not item.get("url")
+                ):
+                    flat.extend(_flatten_entries(nested))
+                    continue
+                flat.append(item)
+            return flat
+
         entries: list[dict[str, Any]] = []
         parent_web = str(info.get("webpage_url") or url).lower()
-        for entry in (raw_entries or []):
-            if not isinstance(entry, dict):
-                continue
+        for entry in _flatten_entries(list(raw_entries or [])):
             cand_url = str(entry.get("url") or "").strip()
             cand_web = str(entry.get("webpage_url") or "").strip()
             if cand_url.startswith(("http://", "https://")):

@@ -848,6 +848,17 @@ class SubscriptionService:
     def _default_folder(self) -> str:
         return str(getattr(self.settings, "default_folder", "General") or "General")
 
+    def _full_catalog_max_items(self) -> int:
+        return min(
+            5000,
+            _setting_int(
+                self.settings,
+                "subscriptions_full_catalog_max_items",
+                1000,
+                minimum=1,
+            ),
+        )
+
     # -- CRUD wrappers ------------------------------------------------------
 
     def create_subscription(
@@ -866,6 +877,7 @@ class SubscriptionService:
         enabled: bool | None = None,
         seed_only: bool | None = None,
         initial_backfill_limit: int | None = None,
+        archive_existing: bool | None = None,
         title_include_regex: str | None = None,
         title_exclude_regex: str | None = None,
         next_check_at: str | None = None,
@@ -892,6 +904,7 @@ class SubscriptionService:
             "enabled": enabled,
             "seed_only": seed_only,
             "initial_backfill_limit": initial_backfill_limit,
+            "archive_existing": archive_existing,
             "title_include_regex": title_include_regex,
             "title_exclude_regex": title_exclude_regex,
             "next_check_at": next_check_at,
@@ -933,6 +946,10 @@ class SubscriptionService:
             minimum=0,
             maximum=50,
         )
+        clean_archive_existing = bool(fields.get("archive_existing", False))
+        clean_seed_only = (
+            False if clean_archive_existing else bool(fields.get("seed_only", True))
+        )
         is_enabled = bool(fields.get("enabled", True))
         clean_next_check = fields.get("next_check_at")
 
@@ -947,8 +964,9 @@ class SubscriptionService:
             interval_minutes=clean_interval,
             max_items_per_check=clean_max_items,
             enabled=is_enabled,
-            seed_only=bool(fields.get("seed_only", True)),
+            seed_only=clean_seed_only,
             initial_backfill_limit=clean_backfill,
+            archive_existing=clean_archive_existing,
             title_include_regex=clean_include,
             title_exclude_regex=clean_exclude,
             next_check_at=clean_next_check if is_enabled else None,
@@ -984,6 +1002,7 @@ class SubscriptionService:
             "folder",
             "enabled",
             "seed_only",
+            "archive_existing",
             "forward_to_telegram",
             "interval_minutes",
             "max_items_per_check",
@@ -1052,6 +1071,10 @@ class SubscriptionService:
             updates["forward_to_telegram"] = bool(updates.get("forward_to_telegram"))
         if "seed_only" in updates:
             updates["seed_only"] = bool(updates.get("seed_only"))
+        if "archive_existing" in updates:
+            updates["archive_existing"] = bool(updates.get("archive_existing"))
+            if updates["archive_existing"]:
+                updates["seed_only"] = False
 
         if "enabled" in updates:
             is_enabled = bool(updates.get("enabled"))
@@ -1174,9 +1197,15 @@ class SubscriptionService:
         *,
         limit: int | None = None,
         statuses: list[str] | None = None,
+        queue_all: bool = False,
     ) -> dict[str, Any]:
         sub = self.get_subscription(subscription_id)
-        safe_limit = min(50, max(1, int(limit or sub.get("max_items_per_check") or 10)))
+        if queue_all and limit is None:
+            safe_limit = 5000
+        else:
+            safe_limit = min(
+                5000, max(1, int(limit or sub.get("max_items_per_check") or 10))
+            )
         candidates = self.db.list_subscription_entries_for_backfill(
             subscription_id, statuses=statuses or ["seen"], limit=safe_limit
         )
@@ -1268,7 +1297,13 @@ class SubscriptionService:
     # -- check / poll -------------------------------------------------------
 
     async def check_subscription(
-        self, subscription_id: str, *, dry_run: bool = False, trigger: str = "manual"
+        self,
+        subscription_id: str,
+        *,
+        dry_run: bool = False,
+        trigger: str = "manual",
+        full_catalog: bool = False,
+        queue_existing: bool = False,
     ) -> dict[str, Any]:
         if self.db.get_subscription(subscription_id) is None:
             raise SubscriptionNotFoundError(
@@ -1289,7 +1324,11 @@ class SubscriptionService:
                 self._active_polls += 1
                 try:
                     return await self._run_check(
-                        sub, dry_run=dry_run, trigger=trigger
+                        sub,
+                        dry_run=dry_run,
+                        trigger=trigger,
+                        full_catalog=full_catalog,
+                        queue_existing=queue_existing,
                     )
                 finally:
                     self._active_polls = max(0, self._active_polls - 1)
@@ -1312,14 +1351,30 @@ class SubscriptionService:
         return not _is_ip_disallowed(host)
 
     async def _run_check(
-        self, sub: dict[str, Any], *, dry_run: bool, trigger: str
+        self,
+        sub: dict[str, Any],
+        *,
+        dry_run: bool,
+        trigger: str,
+        full_catalog: bool = False,
+        queue_existing: bool = False,
     ) -> dict[str, Any]:
         sub_id = str(sub.get("id") or "")
         now_dt = datetime.now(timezone.utc)
         now_iso = now_dt.isoformat()
 
+        is_initial = not bool(sub.get("seeded_at"))
+        archive_initial = bool(is_initial and sub.get("archive_existing"))
+        effective_full_catalog = bool(full_catalog or archive_initial)
+        effective_queue_existing = bool(queue_existing or archive_initial)
+
         try:
-            discovery = await self._discover_entries(sub)
+            if effective_full_catalog and self._supports_kwarg(
+                self._discover_entries, "full_catalog"
+            ):
+                discovery = await self._discover_entries(sub, full_catalog=True)
+            else:
+                discovery = await self._discover_entries(sub)
         except (SubscriptionFetchError, SubscriptionValidationError) as exc:
             redacted_msg = _redact_credentials(str(exc))
             if dry_run:
@@ -1360,11 +1415,13 @@ class SubscriptionService:
                 all_urls.append(str(entry["normalized_url"]))
         vault_map = self.db.find_media_by_source_urls(all_urls) or {}
 
-        is_initial = not bool(sub.get("seeded_at"))
         seed_only = bool(sub.get("seed_only", True))
         backfill_limit = int(sub.get("initial_backfill_limit") or 0)
         max_items = int(sub.get("max_items_per_check") or 10)
-        if is_initial and seed_only and backfill_limit <= 0:
+        if effective_queue_existing:
+            queue_budget = len(entries)
+            mark_remaining_as_seen = False
+        elif is_initial and seed_only and backfill_limit <= 0:
             queue_budget = 0
             mark_remaining_as_seen = True
         elif is_initial and backfill_limit > 0:
@@ -1406,8 +1463,23 @@ class SubscriptionService:
             existing_media = vault_map.get(url) or (
                 vault_map.get(normalized) if normalized else None
             )
+            existing_status = (
+                str(existing_entry.get("status") or "").lower()
+                if existing_entry is not None
+                else ""
+            )
+            requeue_seen = bool(
+                effective_queue_existing
+                and existing_entry is not None
+                and existing_status == "seen"
+            )
+            target_key = (
+                str(existing_entry.get("entry_key") or entry_key)
+                if requeue_seen and existing_entry is not None
+                else entry_key
+            )
 
-            if existing_entry is not None:
+            if existing_entry is not None and not requeue_seen:
                 action = "seen"
                 skipped_seen_count += 1
             elif existing_media is not None:
@@ -1416,7 +1488,7 @@ class SubscriptionService:
                 if not dry_run:
                     self.db.upsert_subscription_entry(
                         sub_id,
-                        entry_key,
+                        target_key,
                         title=title,
                         url=url,
                         normalized_url=normalized or None,
@@ -1431,7 +1503,7 @@ class SubscriptionService:
                 if not dry_run:
                     self.db.upsert_subscription_entry(
                         sub_id,
-                        entry_key,
+                        target_key,
                         title=title,
                         url=url,
                         normalized_url=normalized or None,
@@ -1452,7 +1524,7 @@ class SubscriptionService:
                 if not dry_run:
                     self.db.upsert_subscription_entry(
                         sub_id,
-                        entry_key,
+                        target_key,
                         title=title,
                         url=url,
                         normalized_url=normalized or None,
@@ -1467,7 +1539,7 @@ class SubscriptionService:
                 else:
                     job_id = self._queue_entry(
                         sub_id=sub_id,
-                        entry_key=entry_key,
+                        entry_key=target_key,
                         url=url,
                         normalized_url=normalized or None,
                         title=title,
@@ -1487,7 +1559,7 @@ class SubscriptionService:
                 if not dry_run:
                     self.db.upsert_subscription_entry(
                         sub_id,
-                        entry_key,
+                        target_key,
                         title=title,
                         url=url,
                         normalized_url=normalized or None,
@@ -1500,7 +1572,7 @@ class SubscriptionService:
 
             report_entries.append(
                 {
-                    "entry_key": entry_key,
+                    "entry_key": target_key,
                     "title": title,
                     "url": url,
                     "published_at": published_at,
@@ -1533,6 +1605,10 @@ class SubscriptionService:
                 }
                 if is_initial:
                     updates["seeded_at"] = now_iso
+                if (is_initial or effective_queue_existing) and bool(
+                    latest_sub.get("archive_existing")
+                ):
+                    updates["archive_existing"] = False
                 fresh = self.db.update_subscription(sub_id, **updates)
                 if fresh is not None:
                     updated_sub = fresh
@@ -1914,13 +1990,19 @@ class SubscriptionService:
             unique.append(entry)
         return unique
 
-    async def _discover_entries(self, sub: dict[str, Any]) -> dict[str, Any]:
+    async def _discover_entries(
+        self, sub: dict[str, Any], *, full_catalog: bool = False
+    ) -> dict[str, Any]:
         sub_id = str(sub.get("id") or "")
         url = str(sub.get("source_url") or "").strip()
         kind = str(sub.get("source_kind") or "auto").strip().lower()
         max_items = int(sub.get("max_items_per_check") or 10)
         backfill_limit = int(sub.get("initial_backfill_limit") or 0)
-        fetch_limit = min(100, max(1, max(max_items, backfill_limit, 25)))
+        fetch_limit = (
+            self._full_catalog_max_items()
+            if full_catalog
+            else min(200, max(1, max(max_items, backfill_limit, 50)))
+        )
         proxy = await self._effective_proxy()
 
         if kind == "rss":
@@ -1938,7 +2020,7 @@ class SubscriptionService:
             )
 
         youtube_rss = resolve_youtube_rss_url(url)
-        if youtube_rss:
+        if youtube_rss and not full_catalog:
             try:
                 parsed, final_url = await self._fetch_rss(youtube_rss, proxy=proxy)
                 entries = list(parsed.get("entries") or [])

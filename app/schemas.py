@@ -152,6 +152,7 @@ class SubscriptionCreateRequest(BaseModel):
     enabled: bool = True
     seed_only: bool = True
     initial_backfill_limit: int = Field(default=0, ge=0, le=50)
+    archive_existing: bool = False
     title_include_regex: str | None = Field(default=None, max_length=256)
     title_exclude_regex: str | None = Field(default=None, max_length=256)
 
@@ -169,12 +170,15 @@ class SubscriptionUpdateRequest(BaseModel):
     enabled: bool | None = None
     seed_only: bool | None = None
     initial_backfill_limit: int | None = Field(default=None, ge=0, le=50)
+    archive_existing: bool | None = None
     title_include_regex: str | None = Field(default=None, max_length=256)
     title_exclude_regex: str | None = Field(default=None, max_length=256)
 
 
 class SubscriptionCheckRequest(BaseModel):
     dry_run: bool = False
+    full_catalog: bool = False
+    queue_existing: bool = False
 
 
 class SubscriptionQueueEntryRequest(BaseModel):
@@ -182,7 +186,8 @@ class SubscriptionQueueEntryRequest(BaseModel):
 
 
 class SubscriptionBackfillRequest(BaseModel):
-    limit: int | None = Field(default=None, ge=1, le=50)
+    limit: int | None = Field(default=None, ge=1, le=5000)
+    all: bool = False
     statuses: list[Literal["seen", "skipped", "failed"]] = Field(
         default_factory=lambda: ["seen"]
     )
