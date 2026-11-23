@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import shutil
+import subprocess
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -393,6 +395,7 @@ def test_rich_metadata_video_preview_fallback_and_telegram_zerocopy(tmp_path: Pa
             assert prev_resp.headers["cache-control"] == "public, max-age=31536000, immutable"
             with Image.open(io.BytesIO(prev_resp.content)) as im:
                 assert im.format == "WEBP"
+                assert getattr(im, "n_frames", 1) == 10
 
             # Deleting video unlinks both thumb and animated preview
             del_resp = client.delete(f"/api/media/{vid_id}")
@@ -400,12 +403,60 @@ def test_rich_metadata_video_preview_fallback_and_telegram_zerocopy(tmp_path: Pa
             assert not prev_path.exists()
             assert client.get(f"/api/media/{vid_id}/preview").status_code == 404
 
+    # 2b) Multi-segment video (red -> green -> blue over 12s) produces 10 screenshots spanning full duration
+    from app.thumbnails import PREVIEW_FRAME_COUNT, _compute_preview_timestamps
+
+    assert _compute_preview_timestamps(100.0) == [5.0, 15.0, 25.0, 35.0, 45.0, 55.0, 65.0, 75.0, 85.0, 95.0]
+    assert _compute_preview_timestamps(None) == []
+    assert _compute_preview_timestamps(0.0) == []
+
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if ffmpeg_bin:
+        multi_mp4 = tmp_path / "multi_segment.mp4"
+        proc = subprocess.run(
+            [
+                ffmpeg_bin,
+                "-y",
+                "-f", "lavfi", "-i", "color=c=red:size=320x180:duration=4:rate=10",
+                "-f", "lavfi", "-i", "color=c=green:size=320x180:duration=4:rate=10",
+                "-f", "lavfi", "-i", "color=c=blue:size=320x180:duration=4:rate=10",
+                "-filter_complex", "[0:v][1:v][2:v]concat=n=3:v=1:a=0[bg];testsrc2=size=64x36:duration=12:rate=10[pip];[bg][pip]overlay=10:10[v]",
+                "-map", "[v]",
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                str(multi_mp4),
+            ],
+            capture_output=True,
+            check=False,
+        )
+        if proc.returncode == 0 and multi_mp4.is_file():
+            multi_prev = asyncio.run(
+                generate_video_preview(multi_mp4, settings.thumbs_dir, "multi_seg", duration_sec=12.0)
+            )
+            assert multi_prev == "multi_seg_preview.webp"
+            multi_path = settings.thumbs_dir / multi_prev
+            assert multi_path.is_file()
+            with Image.open(multi_path) as im:
+                assert im.format == "WEBP"
+                assert getattr(im, "n_frames", 1) == PREVIEW_FRAME_COUNT
+                # Sample center pixel at frame 0 (red ~0.6s), frame 4 (green ~5.4s), frame 9 (blue ~11.4s)
+                im.seek(0)
+                r0, g0, b0 = im.convert("RGB").getpixel((160, 90))
+                im.seek(4)
+                r4, g4, b4 = im.convert("RGB").getpixel((160, 90))
+                im.seek(9)
+                r9, g9, b9 = im.convert("RGB").getpixel((160, 90))
+                assert r0 > 180 and g0 < 60 and b0 < 60
+                assert g4 > 100 and r4 < 60 and b4 < 60
+                assert b9 > 180 and r9 < 60 and g9 < 60
+            multi_path.unlink(missing_ok=True)
+
     # 3) Synthetic invalid file degrades gracefully in extract_media_metadata
     bad_mp4 = tmp_path / "broken.mp4"
     bad_mp4.write_bytes(b"not-a-real-video")
     assert asyncio.run(extract_media_metadata(bad_mp4, "video")) == {}
 
-    # 4) generate_video_preview falls back to Pillow animated WebP when ffmpeg libwebp fails
+    # 4) generate_video_preview samples timestamps via ffmpeg seeks and falls back when duration is unknown
     class FakeProc:
         def __init__(self, rc: int) -> None:
             self.returncode = rc
@@ -413,27 +464,56 @@ def test_rich_metadata_video_preview_fallback_and_telegram_zerocopy(tmp_path: Pa
         async def communicate(self):
             return b"", b""
 
-    async def fake_exec(*args, **kwargs):
+    seek_timestamps: list[str] = []
+
+    async def fake_exec_seeks(*args, **kwargs):
+        args_list = [str(a) for a in args]
+        out_arg = args_list[-1]
+        if "-ss" in args_list:
+            ss_idx = args_list.index("-ss")
+            seek_timestamps.append(args_list[ss_idx + 1])
+            idx = len(seek_timestamps)
+            Image.new("RGB", (160, 90), color=(20 * idx, 100, 200)).save(out_arg, format="PNG")
+            return FakeProc(0)
+        return FakeProc(1)
+
+    monkeypatch.setattr("app.thumbnails.shutil.which", lambda _: "/usr/bin/ffmpeg")
+    monkeypatch.setattr("app.thumbnails.asyncio.create_subprocess_exec", fake_exec_seeks)
+
+    dummy_mp4 = tmp_path / "dummy.mp4"
+    dummy_mp4.write_bytes(b"fake")
+    preview_name = asyncio.run(
+        generate_video_preview(dummy_mp4, settings.thumbs_dir, "seek_preview", duration_sec=20.0)
+    )
+    assert preview_name == "seek_preview_preview.webp"
+    assert len(seek_timestamps) == 10
+    assert sorted(float(t) for t in seek_timestamps) == [1.0, 3.0, 5.0, 7.0, 9.0, 11.0, 13.0, 15.0, 17.0, 19.0]
+    seek_prev_path = settings.thumbs_dir / preview_name
+    assert seek_prev_path.is_file()
+    with Image.open(seek_prev_path) as im:
+        assert im.format == "WEBP"
+        assert getattr(im, "n_frames", 1) == 10
+
+    # Fallback single-pass PNG extraction when duration cannot be probed
+    async def fake_meta(_src, _mtype):
+        return {}
+
+    async def fake_exec_fallback(*args, **kwargs):
         out_arg = str(args[-1])
-        if out_arg.endswith(".webp"):
-            return FakeProc(1)
-        # Produce 3 PNG frames matching the pattern
         parent = Path(out_arg).parent
         for idx in (1, 2, 3):
             frame_file = parent / f"fb_preview_pframe_{idx:02d}.png"
             Image.new("RGB", (160, 90), color=(40 * idx, 100, 200)).save(frame_file, format="PNG")
         return FakeProc(0)
 
-    monkeypatch.setattr("app.thumbnails.shutil.which", lambda _: "/usr/bin/ffmpeg")
-    monkeypatch.setattr("app.thumbnails.asyncio.create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("app.thumbnails.extract_media_metadata", fake_meta)
+    monkeypatch.setattr("app.thumbnails.asyncio.create_subprocess_exec", fake_exec_fallback)
 
-    dummy_mp4 = tmp_path / "dummy.mp4"
-    dummy_mp4.write_bytes(b"fake")
-    preview_name = asyncio.run(
-        generate_video_preview(dummy_mp4, settings.thumbs_dir, "fb_preview", duration_sec=4.0)
+    fb_preview_name = asyncio.run(
+        generate_video_preview(dummy_mp4, settings.thumbs_dir, "fb_preview", duration_sec=None)
     )
-    assert preview_name == "fb_preview_preview.webp"
-    fb_prev_path = settings.thumbs_dir / preview_name
+    assert fb_preview_name == "fb_preview_preview.webp"
+    fb_prev_path = settings.thumbs_dir / fb_preview_name
     assert fb_prev_path.is_file()
     with Image.open(fb_prev_path) as im:
         assert im.format == "WEBP"

@@ -158,7 +158,33 @@ def _make_image_thumb(src: Path, dst: Path) -> bool:
         return False
 
 
-def _save_animated_webp_from_pngs(frame_paths: list[Path], dst: Path) -> bool:
+PREVIEW_FRAME_COUNT = 10
+PREVIEW_FRAME_DURATION_MS = 600
+PREVIEW_MAX_WIDTH = 320
+PREVIEW_WEBP_QUALITY = 50
+
+
+def _compute_preview_timestamps(
+    duration_sec: float | None,
+    count: int = PREVIEW_FRAME_COUNT,
+) -> list[float]:
+    if count <= 0 or duration_sec is None or duration_sec <= 0:
+        return []
+    safe_end = max(0.01, duration_sec - min(0.05, duration_sec * 0.02))
+    return [
+        round(min(max(0.0, ((i + 0.5) / count) * duration_sec), safe_end), 3)
+        for i in range(count)
+    ]
+
+
+def _save_animated_webp_from_pngs(
+    frame_paths: list[Path],
+    dst: Path,
+    *,
+    duration_ms: int = PREVIEW_FRAME_DURATION_MS,
+    quality: int = PREVIEW_WEBP_QUALITY,
+    max_dim: int = PREVIEW_MAX_WIDTH,
+) -> bool:
     frames: list[Image.Image] = []
     try:
         for p in frame_paths:
@@ -166,23 +192,32 @@ def _save_animated_webp_from_pngs(frame_paths: list[Path], dst: Path) -> bool:
                 continue
             with Image.open(p) as im:
                 im = ImageOps.exif_transpose(im)
-                if im.mode not in ("RGB", "RGBA"):
+                if im.mode != "RGB":
                     im = im.convert("RGB")
-                im.thumbnail((320, 320))
+                im.thumbnail((max_dim, max_dim))
                 frames.append(im.copy())
         if not frames:
             return False
         dst.parent.mkdir(parents=True, exist_ok=True)
-        frames[0].save(
-            dst,
-            format="WEBP",
-            save_all=True,
-            append_images=frames[1:],
-            loop=0,
-            duration=180,
-            quality=60,
-        )
-        return dst.is_file() and dst.stat().st_size > 0
+        tmp_dst = dst.with_name(f".{dst.name}.tmp")
+        try:
+            frames[0].save(
+                tmp_dst,
+                format="WEBP",
+                save_all=True,
+                append_images=frames[1:],
+                loop=0,
+                duration=duration_ms,
+                quality=quality,
+                method=4,
+                minimize_size=True,
+            )
+            if tmp_dst.is_file() and tmp_dst.stat().st_size > 0:
+                tmp_dst.replace(dst)
+                return dst.is_file() and dst.stat().st_size > 0
+        finally:
+            tmp_dst.unlink(missing_ok=True)
+        return False
     except Exception:
         return False
     finally:
@@ -251,11 +286,46 @@ async def _make_video_thumb(src: Path, dst: Path) -> bool:
     return False
 
 
+async def _extract_preview_frame_png(
+    ffmpeg: str,
+    src: Path,
+    timestamp_sec: float,
+    dst_png: Path,
+) -> Path | None:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffmpeg,
+            "-y",
+            "-ss",
+            f"{max(0.0, float(timestamp_sec)):.3f}",
+            "-i",
+            str(src),
+            "-frames:v",
+            "1",
+            "-vf",
+            f"scale='min({PREVIEW_MAX_WIDTH},iw)':-2:flags=fast_bilinear",
+            "-an",
+            "-sn",
+            "-dn",
+            str(dst_png),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.communicate()
+        if proc.returncode == 0 and dst_png.is_file() and dst_png.stat().st_size > 0:
+            return dst_png
+    except Exception:
+        pass
+    dst_png.unlink(missing_ok=True)
+    return None
+
+
 async def generate_video_preview(
     src: Path,
     thumbs_dir: Path,
     media_id: str,
     duration_sec: float | None = None,
+    frame_count: int = PREVIEW_FRAME_COUNT,
 ) -> str | None:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg or not src.is_file():
@@ -264,62 +334,64 @@ async def generate_video_preview(
     preview_name = f"{media_id}_preview.webp"
     dst = thumbs_dir / preview_name
     thumbs_dir.mkdir(parents=True, exist_ok=True)
-    seek = "00:00:01" if (duration_sec is not None and duration_sec > 4.0) else "00:00:00"
 
-    for codec in ("libwebp_anim", "libwebp"):
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                ffmpeg,
-                "-y",
-                "-ss",
-                seek,
-                "-t",
-                "3",
-                "-i",
-                str(src),
-                "-vf",
-                "fps=6,scale='min(320,iw)':-2:flags=fast_bilinear",
-                "-c:v",
-                codec,
-                "-loop",
-                "0",
-                "-an",
-                "-quality",
-                "60",
-                str(dst),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await proc.communicate()
-            if proc.returncode == 0 and dst.is_file() and dst.stat().st_size > 0:
-                return preview_name
-        except Exception:
-            pass
-        dst.unlink(missing_ok=True)
+    effective_duration = _parse_float(duration_sec)
+    if effective_duration is None:
+        meta = await extract_media_metadata(src, "video")
+        effective_duration = _parse_float(meta.get("duration_sec"))
 
-    # Fallback: extract PNG frames and assemble animated WebP with Pillow
-    frame_pattern = thumbs_dir / f"{media_id}_pframe_%02d.png"
+    timestamps = _compute_preview_timestamps(effective_duration, count=frame_count)
+    frame_paths: list[Path] = []
+
     try:
-        proc_png = await asyncio.create_subprocess_exec(
-            ffmpeg,
-            "-y",
-            "-ss",
-            seek,
-            "-t",
-            "3",
-            "-i",
-            str(src),
-            "-vf",
-            "fps=4,scale='min(320,iw)':-2:flags=fast_bilinear",
-            "-frames:v",
-            "12",
-            str(frame_pattern),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await proc_png.communicate()
-        frame_paths = sorted(thumbs_dir.glob(f"{media_id}_pframe_*.png"))
-        if proc_png.returncode == 0 and frame_paths:
+        if timestamps:
+            sem = asyncio.Semaphore(4)
+
+            async def _grab(idx: int, ts: float) -> Path | None:
+                async with sem:
+                    out_png = thumbs_dir / f"{media_id}_pframe_{idx:02d}.png"
+                    return await _extract_preview_frame_png(ffmpeg, src, ts, out_png)
+
+            results = await asyncio.gather(
+                *(_grab(idx, ts) for idx, ts in enumerate(timestamps))
+            )
+            frame_paths = [p for p in results if p is not None]
+
+        if not frame_paths:
+            # Fallback when container duration is unavailable or keyframe seeking fails
+            for vf_expr in (
+                f"fps=1,scale='min({PREVIEW_MAX_WIDTH},iw)':-2:flags=fast_bilinear",
+                f"fps=5,scale='min({PREVIEW_MAX_WIDTH},iw)':-2:flags=fast_bilinear",
+            ):
+                for leftover in thumbs_dir.glob(f"{media_id}_pframe_*.png"):
+                    leftover.unlink(missing_ok=True)
+                frame_pattern = thumbs_dir / f"{media_id}_pframe_%02d.png"
+                try:
+                    proc_png = await asyncio.create_subprocess_exec(
+                        ffmpeg,
+                        "-y",
+                        "-i",
+                        str(src),
+                        "-vf",
+                        vf_expr,
+                        "-frames:v",
+                        str(max(1, int(frame_count))),
+                        "-an",
+                        "-sn",
+                        "-dn",
+                        str(frame_pattern),
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await proc_png.communicate()
+                    candidates = sorted(thumbs_dir.glob(f"{media_id}_pframe_*.png"))
+                    if proc_png.returncode == 0 and candidates:
+                        frame_paths = candidates
+                        break
+                except Exception:
+                    pass
+
+        if frame_paths:
             ok = await asyncio.to_thread(_save_animated_webp_from_pngs, frame_paths, dst)
             if ok and dst.is_file() and dst.stat().st_size > 0:
                 return preview_name
