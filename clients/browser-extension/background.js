@@ -4,15 +4,161 @@
 
 const extApi = globalThis.browser || globalThis.chrome;
 
-import { getSettings, saveSettings, rememberFolderChoice, addRecentJob } from "./lib/storage.js";
+import {
+  getSettings,
+  saveSettings,
+  rememberFolderChoice,
+  addRecentJob,
+  getCookieSyncState,
+  saveCookieSyncState,
+} from "./lib/storage.js";
 import {
   hasServerPermission,
   quickCapture,
   uploadBlob,
+  checkHealth,
+  uploadCookies,
 } from "./lib/api.js";
+import {
+  hasCookiePermission,
+  collectYouTubeCookies,
+  formatNetscapeCookies,
+  isYouTubeUrl,
+  isRelevantAuthCookieChange,
+  computeCookieTextDigest,
+} from "./lib/cookies.js";
+
+const COOKIE_SYNC_ALARM = "mv-cookie-sync";
+const COOKIE_SYNC_PERIOD_MINUTES = 10;
+const COOKIE_CHANGE_DEBOUNCE_MS = 4000;
+const COOKIE_CHANGE_MIN_INTERVAL_MS = 45_000;
+const SERVER_HEALTH_RECHECK_MS = 30 * 60_000;
+
+let syncInFlight = null;
+let cookieChangeTimer = null;
+let lastCookieChangeSyncAt = 0;
 
 function getExtApi() {
   return extApi;
+}
+
+async function ensureCookieSyncAlarm() {
+  const alarms = getExtApi()?.alarms;
+  if (!alarms || typeof alarms.create !== "function") return;
+  try {
+    let existing = null;
+    if (typeof alarms.get === "function") {
+      existing = await new Promise((resolve) => {
+        try {
+          const maybe = alarms.get(COOKIE_SYNC_ALARM);
+          if (maybe && typeof maybe.then === "function") {
+            maybe.then((a) => resolve(a || null)).catch(() => resolve(null));
+            return;
+          }
+          alarms.get(COOKIE_SYNC_ALARM, (a) => resolve(a || null));
+        } catch (_) {
+          resolve(null);
+        }
+      });
+    }
+    if (!existing || existing.periodInMinutes !== COOKIE_SYNC_PERIOD_MINUTES) {
+      alarms.create(COOKIE_SYNC_ALARM, { periodInMinutes: COOKIE_SYNC_PERIOD_MINUTES });
+    }
+  } catch (_) {
+    // Ignore alarm setup failures on restricted environments.
+  }
+}
+
+async function syncCookiesToVault({
+  force = false,
+  reason = "auto",
+  verifyServer = false,
+} = {}) {
+  if (syncInFlight) return syncInFlight;
+  const run = (async () => {
+    const settings = await getSettings();
+    if (!settings?.serverUrl) return { ok: false, skipped: "no_server" };
+    if (!force && settings.autoSyncCookies === false) {
+      return { ok: false, skipped: "disabled" };
+    }
+    const [serverOk, cookieOk] = await Promise.all([
+      hasServerPermission(settings.serverUrl),
+      hasCookiePermission(),
+    ]);
+    if (!serverOk || !cookieOk) {
+      return { ok: false, skipped: "no_permission" };
+    }
+
+    const collected = await collectYouTubeCookies();
+    const cookies = Array.isArray(collected) ? collected : [];
+    const formatted = formatNetscapeCookies(cookies);
+    const text = typeof formatted === "string" ? formatted : formatted?.text;
+    const count = typeof formatted === "object" && formatted ? Number(formatted.count || 0) : 0;
+    const domains = typeof formatted === "object" && Array.isArray(formatted?.domains) ? formatted.domains : [];
+    if (!text || count <= 0) {
+      return { ok: false, skipped: "empty" };
+    }
+
+    const digest = await computeCookieTextDigest(text);
+    const prev = await getCookieSyncState();
+
+    if (!force && prev.lastHash && prev.lastHash === digest) {
+      const staleCheck = verifyServer || Date.now() - prev.lastSyncedAt > SERVER_HEALTH_RECHECK_MS;
+      if (!staleCheck) {
+        return { ok: true, skipped: "unchanged", count, domains };
+      }
+      try {
+        const health = await checkHealth(settings);
+        if (health?.ytdlp_cookies_configured !== false) {
+          return { ok: true, skipped: "unchanged", count, domains };
+        }
+      } catch (_) {
+        return { ok: false, skipped: "server_unreachable" };
+      }
+    }
+
+    const response = await uploadCookies(settings, text, {
+      auto_retry_failed: true,
+      retry_unchanged: Boolean(force),
+    });
+    await saveCookieSyncState({
+      lastHash: digest,
+      lastSyncedAt: Date.now(),
+      lastCount: count,
+      lastDomains: domains,
+      lastReason: reason,
+    });
+    return { ok: true, uploaded: true, count, domains, response };
+  })();
+
+  syncInFlight = run;
+  try {
+    return await run;
+  } finally {
+    if (syncInFlight === run) syncInFlight = null;
+  }
+}
+
+function scheduleCookieChangeSync(changeInfo) {
+  if (!isRelevantAuthCookieChange(changeInfo)) return;
+  const criticalName = String(changeInfo?.cookie?.name || "");
+  const isCritical =
+    criticalName === "LOGIN_INFO" ||
+    criticalName === "SAPISID" ||
+    criticalName === "__Secure-1PSIDTS" ||
+    criticalName === "__Secure-3PSIDTS";
+
+  const elapsed = Date.now() - lastCookieChangeSyncAt;
+  const delay = isCritical
+    ? COOKIE_CHANGE_DEBOUNCE_MS
+    : Math.max(COOKIE_CHANGE_DEBOUNCE_MS, COOKIE_CHANGE_MIN_INTERVAL_MS - elapsed);
+
+  if (cookieChangeTimer) clearTimeout(cookieChangeTimer);
+  cookieChangeTimer = setTimeout(() => {
+    cookieChangeTimer = null;
+    lastCookieChangeSyncAt = Date.now();
+    syncCookiesToVault({ reason: "cookie_change" }).catch(() => {});
+  }, delay);
 }
 
 function notify(title, message) {
@@ -239,6 +385,16 @@ async function handleMenuClick(info, tab) {
   }
 
   try {
+    if (isYouTubeUrl(url) && settings?.autoSyncCookies !== false) {
+      try {
+        await Promise.race([
+          syncCookiesToVault({ force: false, reason: "youtube_capture" }),
+          new Promise((resolve) => setTimeout(resolve, 2500)),
+        ]);
+      } catch (_) {
+        // Best-effort sync; do not block URL capture.
+      }
+    }
     const captureTitle =
       info?.linkText?.trim() ||
       (menuItemId === "mv-send-page" || (!info?.srcUrl && !info?.linkUrl) ? tab?.title?.trim() : "") ||
@@ -278,12 +434,37 @@ async function handleMenuClick(info, tab) {
 try {
   extApi?.runtime?.onInstalled?.addListener(() => {
     rebuildContextMenus();
+    ensureCookieSyncAlarm();
+    syncCookiesToVault({ reason: "install", verifyServer: true }).catch(() => {});
   });
 } catch (_) {}
 
 try {
   extApi?.runtime?.onStartup?.addListener(() => {
     rebuildContextMenus();
+    ensureCookieSyncAlarm();
+    syncCookiesToVault({ reason: "startup", verifyServer: true }).catch(() => {});
+  });
+} catch (_) {}
+
+try {
+  extApi?.alarms?.onAlarm?.addListener((alarm) => {
+    if (alarm?.name === COOKIE_SYNC_ALARM) {
+      syncCookiesToVault({ reason: "alarm", verifyServer: true }).catch(() => {});
+    }
+  });
+} catch (_) {}
+
+try {
+  extApi?.cookies?.onChanged?.addListener((changeInfo) => {
+    scheduleCookieChangeSync(changeInfo);
+  });
+} catch (_) {}
+
+try {
+  extApi?.permissions?.onAdded?.addListener(() => {
+    ensureCookieSyncAlarm();
+    syncCookiesToVault({ reason: "permission_added", verifyServer: true }).catch(() => {});
   });
 } catch (_) {}
 
@@ -297,22 +478,48 @@ try {
 
 try {
   extApi?.runtime?.onMessage?.addListener((msg, sender, sendResponse) => {
-    if (msg?.type !== "MV_REFRESH_MENUS") return undefined;
-    (async () => {
-      try {
-        if (msg?.folders) {
-          await saveSettings({ cachedFolders: msg.folders });
+    if (msg?.type === "MV_REFRESH_MENUS") {
+      (async () => {
+        try {
+          if (msg?.folders) {
+            await saveSettings({ cachedFolders: msg.folders });
+          }
+          await rebuildContextMenus();
+        } catch (err) {
+          // ignore
         }
-        await rebuildContextMenus();
-      } catch (err) {
-        // ignore
-      }
-      try {
-        sendResponse?.({ ok: true });
-      } catch (_) {
-        // ignore
-      }
-    })();
-    return true;
+        try {
+          sendResponse?.({ ok: true });
+        } catch (_) {
+          // ignore
+        }
+      })();
+      return true;
+    }
+
+    if (msg?.type === "MV_SYNC_COOKIES") {
+      (async () => {
+        try {
+          await ensureCookieSyncAlarm();
+          const res = await syncCookiesToVault({
+            force: Boolean(msg?.force),
+            reason: String(msg?.reason || "message"),
+            verifyServer: Boolean(msg?.verifyServer),
+          });
+          sendResponse?.(res);
+        } catch (err) {
+          try {
+            sendResponse?.({ ok: false, error: humanError(err) });
+          } catch (_) {
+            // ignore
+          }
+        }
+      })();
+      return true;
+    }
+
+    return undefined;
   });
 } catch (_) {}
+
+ensureCookieSyncAlarm().catch(() => {});

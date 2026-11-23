@@ -108,6 +108,8 @@ class FormatsRequest(BaseModel):
 
 class CookiesRequest(BaseModel):
     cookies_text: str
+    auto_retry_failed: bool = True
+    retry_unchanged: bool = True
 
 
 class BackupCreateRequest(BaseModel):

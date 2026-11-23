@@ -246,3 +246,87 @@ export async function collectYouTubeCookies() {
   }
   return all;
 }
+
+const YOUTUBE_URL_HOSTS = new Set([
+  "youtube.com",
+  "youtu.be",
+  "youtube-nocookie.com",
+  "music.youtube.com",
+]);
+
+export function isYouTubeUrl(rawUrl) {
+  if (typeof rawUrl !== "string" || !rawUrl.trim()) return false;
+  try {
+    const parsed = new URL(rawUrl.trim());
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+    const host = parsed.hostname.toLowerCase().replace(/\.+$/, "");
+    if (!host) return false;
+    for (const dom of YOUTUBE_URL_HOSTS) {
+      if (host === dom || host.endsWith(`.${dom}`)) return true;
+    }
+    return false;
+  } catch (_) {
+    return false;
+  }
+}
+
+export const YOUTUBE_AUTH_COOKIE_NAMES = new Set([
+  "LOGIN_INFO",
+  "SAPISID",
+  "APISID",
+  "SID",
+  "HSID",
+  "SSID",
+  "SIDCC",
+  "__Secure-1PAPISID",
+  "__Secure-3PAPISID",
+  "__Secure-1PSID",
+  "__Secure-3PSID",
+  "__Secure-1PSIDTS",
+  "__Secure-3PSIDTS",
+  "__Secure-1PSIDCC",
+  "__Secure-3PSIDCC",
+  "VISITOR_INFO1_LIVE",
+  "VISITOR_PRIVACY_METADATA",
+  "PREF",
+  "CONSISTENCY",
+  "GPS",
+  "YSC",
+]);
+
+export function isRelevantAuthCookieChange(changeInfo) {
+  const cookie = changeInfo?.cookie;
+  if (!cookie || typeof cookie !== "object") return false;
+  if (!isAllowedCookieDomain(cookie.domain)) return false;
+  // Ignore pure expiration overwrites that immediately precede the replacement cookie;
+  // we'll receive the replacement cookie change event too.
+  if (changeInfo.removed && changeInfo.cause === "overwrite") return false;
+  const name = String(cookie.name || "");
+  if (!name) return false;
+  if (YOUTUBE_AUTH_COOKIE_NAMES.has(name)) return true;
+  const domain = String(cookie.domain || "").toLowerCase().replace(/^\./, "");
+  return domain === "youtube.com" || domain.endsWith(".youtube.com");
+}
+
+export async function computeCookieTextDigest(cookiesText) {
+  const text = String(cookiesText || "");
+  try {
+    if (globalThis.crypto?.subtle && typeof TextEncoder === "function") {
+      const data = new TextEncoder().encode(text);
+      const buf = await globalThis.crypto.subtle.digest("SHA-256", data);
+      return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join("");
+    }
+  } catch (_) {
+    // Fall back to deterministic FNV-1a + length string.
+  }
+  let h1 = 0x811c9dc5;
+  let h2 = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text.charCodeAt(i);
+    h1 ^= ch;
+    h1 = Math.imul(h1, 0x01000193) >>> 0;
+    h2 ^= ch ^ (i & 0xff);
+    h2 = Math.imul(h2, 0x01000193) >>> 0;
+  }
+  return `fnv:${text.length}:${h1.toString(16).padStart(8, "0")}${h2.toString(16).padStart(8, "0")}`;
+}

@@ -13,11 +13,13 @@ export const DEFAULT_SETTINGS = {
   lastFormat: "best",
   lastTags: "",
   forwardToTelegram: true,
+  autoSyncCookies: true,
   cachedFolders: ["General"],
   recentJobs: [],
 };
 
 const SETTINGS_KEY = "mv_settings";
+const COOKIE_SYNC_STATE_KEY = "mv_cookie_sync_state";
 const MAX_CACHED_FOLDERS = 25;
 const MAX_RECENT_JOBS = 8;
 
@@ -144,6 +146,12 @@ function coerceSettings(raw, fallback = cloneDefaultSettings()) {
         ? source.forwardToTelegram
         : typeof fb.forwardToTelegram === "boolean"
           ? fb.forwardToTelegram
+          : true,
+    autoSyncCookies:
+      typeof source.autoSyncCookies === "boolean"
+        ? source.autoSyncCookies
+        : typeof fb.autoSyncCookies === "boolean"
+          ? fb.autoSyncCookies
           : true,
     cachedFolders:
       source.cachedFolders === undefined
@@ -349,4 +357,29 @@ export async function updateRecentJob(jobId, patch) {
   const next = { ...current, recentJobs };
   await persistSettings(next);
   return recentJobs;
+}
+
+export async function getCookieSyncState() {
+  if (!getStorageArea()) {
+    return { lastHash: "", lastSyncedAt: 0, lastCount: 0, lastDomains: [], lastReason: "" };
+  }
+  const items = await readStorage(COOKIE_SYNC_STATE_KEY);
+  const raw = toPlainObject(items?.[COOKIE_SYNC_STATE_KEY]);
+  return {
+    lastHash: typeof raw.lastHash === "string" ? raw.lastHash : "",
+    lastSyncedAt: Number.isFinite(Number(raw.lastSyncedAt)) ? Number(raw.lastSyncedAt) : 0,
+    lastCount: Number.isFinite(Number(raw.lastCount)) ? Number(raw.lastCount) : 0,
+    lastDomains: Array.isArray(raw.lastDomains) ? raw.lastDomains.map((d) => String(d)) : [],
+    lastReason: typeof raw.lastReason === "string" ? raw.lastReason : "",
+  };
+}
+
+export async function saveCookieSyncState(patch) {
+  const current = await getCookieSyncState();
+  const next = {
+    ...current,
+    ...toPlainObject(patch),
+  };
+  await writeStorage({ [COOKIE_SYNC_STATE_KEY]: next });
+  return next;
 }

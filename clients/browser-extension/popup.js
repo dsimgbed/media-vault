@@ -11,6 +11,8 @@ let saveSettings = async () => ({});
 let rememberFolderChoice = async () => ({});
 let addRecentJob = async () => ({});
 let updateRecentJob = async () => ({});
+let getCookieSyncState = async () => ({});
+let saveCookieSyncState = async () => ({});
 
 let buildOriginPattern = (serverUrl) => `${String(serverUrl || "").replace(/\/+$/, "")}/*`;
 let hasServerPermission = async () => false;
@@ -31,6 +33,8 @@ let hasCookiePermission = async () => false;
 let requestCookiePermission = async () => false;
 let revokeCookiePermission = async () => ({});
 let collectYouTubeCookies = async () => [];
+let isYouTubeUrl = () => false;
+let computeCookieTextDigest = async () => "";
 
 const ext = globalThis.browser ?? globalThis.chrome;
 const $ = (id) => document.getElementById(id);
@@ -45,6 +49,8 @@ async function loadModules() {
     rememberFolderChoice,
     addRecentJob,
     updateRecentJob,
+    getCookieSyncState,
+    saveCookieSyncState,
   } = storage);
 
   const api = await import("./lib/api.js");
@@ -71,6 +77,8 @@ async function loadModules() {
     requestCookiePermission,
     revokeCookiePermission,
     collectYouTubeCookies,
+    isYouTubeUrl,
+    computeCookieTextDigest,
   } = cookies);
 }
 
@@ -132,6 +140,7 @@ function hydrateForm() {
   $("serverUrlInput").value = settings.serverUrl || "";
   $("authTokenInput").value = settings.authToken || "";
   $("rememberFolderCheck").checked = settings.rememberFolder !== false;
+  $("autoSyncCookiesCheck").checked = settings.autoSyncCookies !== false;
   $("folderInput").value = settings.lastFolder || "";
   $("formatSelect").value = VALID_FORMATS.has(settings.lastFormat) ? settings.lastFormat : "best";
   updateOpenVault();
@@ -427,6 +436,9 @@ async function handleUrlCapture() {
   const force = Boolean(duplicateInfo) && $("forceReingest").checked;
 
   await withBusy($("urlCaptureBtn"), async () => {
+    if (isYouTubeUrl(url) && settings.autoSyncCookies !== false) {
+      await syncCookiesViaBackground({ reason: "youtube_capture", timeoutMs: 2500 });
+    }
     const result = await quickCapture(settings, {
       url,
       title: title || undefined,
@@ -682,6 +694,9 @@ async function handleSaveSettings(event) {
     } else {
       notifyMenus();
     }
+    if (settings.autoSyncCookies !== false) {
+      void syncCookiesViaBackground({ reason: "settings_saved", verifyServer: true });
+    }
     await updateCookieStatus();
 
     showStatus(
@@ -742,6 +757,28 @@ function notifyMenus() {
 /* YouTube cookie sync                                                */
 /* ------------------------------------------------------------------ */
 
+async function syncCookiesViaBackground({ force = false, reason = "popup", verifyServer = false, timeoutMs = 4000 } = {}) {
+  if (!ext?.runtime?.sendMessage) return null;
+  try {
+    const req = ext.runtime.sendMessage({
+      type: "MV_SYNC_COOKIES",
+      force,
+      reason,
+      verifyServer,
+    });
+    if (!req || typeof req.then !== "function") return null;
+    if (timeoutMs > 0) {
+      return await Promise.race([
+        req,
+        new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs)),
+      ]);
+    }
+    return await req;
+  } catch {
+    return null;
+  }
+}
+
 async function updateCookieStatus() {
   const granted = await cookiePermissionGranted();
 
@@ -763,6 +800,20 @@ async function updateCookieStatus() {
     $("cookieVaultStatus").textContent = health.ytdlp_cookies_configured
       ? "Cookies loaded"
       : "No cookies yet";
+  }
+
+  try {
+    const syncState = await getCookieSyncState();
+    if (granted && syncState?.lastSyncedAt) {
+      const when = timeAgo(syncState.lastSyncedAt);
+      const countText = syncState.lastCount ? `${syncState.lastCount} cookie${syncState.lastCount === 1 ? "" : "s"}` : "Cookies";
+      $("cookieDetail").textContent = `Last synced ${when || "recently"} (${countText}${syncState.lastDomains?.length ? ` • ${syncState.lastDomains.join(", ")}` : ""})`;
+      $("cookieDetail").hidden = false;
+    } else if (!granted) {
+      $("cookieDetail").hidden = true;
+    }
+  } catch {
+    /* ignore */
   }
 }
 
@@ -815,17 +866,30 @@ async function handleSyncCookies() {
       );
     }
 
-    const response = await uploadCookies(settings, cookiesText);
+    const response = await uploadCookies(settings, cookiesText, {
+      auto_retry_failed: true,
+      retry_unchanged: true,
+    });
+    const digest = await computeCookieTextDigest(cookiesText);
+    await saveCookieSyncState({
+      lastHash: digest,
+      lastSyncedAt: Date.now(),
+      lastCount: syncedCount,
+      lastDomains: domains,
+      lastReason: "manual",
+    });
     health = { ...(health || {}), ytdlp_cookies_configured: response?.ytdlp_cookies_configured !== false };
     await updateCookieStatus();
 
+    const retriedCount = Number(response?.retried_count || 0);
+    const retriedSuffix = retriedCount > 0 ? ` • retried ${retriedCount} failed job${retriedCount === 1 ? "" : "s"}` : "";
     $("cookieDetail").textContent = `Synced ${syncedCount} cookie${
       syncedCount === 1 ? "" : "s"
-    }${domains.length ? ` • ${domains.join(", ")}` : ""}`;
+    }${domains.length ? ` • ${domains.join(", ")}` : ""}${retriedSuffix}`;
     $("cookieDetail").hidden = false;
 
     showStatus(
-      `Synced ${syncedCount} YouTube cookie${syncedCount === 1 ? "" : "s"} to Media Vault.`,
+      `Synced ${syncedCount} YouTube cookie${syncedCount === 1 ? "" : "s"} to Media Vault${retriedCount > 0 ? ` and retried ${retriedCount} failed job${retriedCount === 1 ? "" : "s"}` : ""}.`,
       "ok",
     );
   });
@@ -835,6 +899,7 @@ async function handleRevokeCookies() {
   await withBusy($("revokeCookiesBtn"), async () => {
     const scopes = Array.isArray(YOUTUBE_COOKIE_ORIGINS) ? YOUTUBE_COOKIE_ORIGINS : [];
     await revokeCookiePermission(scopes);
+    await saveCookieSyncState({ lastHash: "", lastSyncedAt: 0, lastCount: 0, lastDomains: [], lastReason: "revoked" });
     $("cookieDetail").hidden = true;
     await updateCookieStatus();
     showStatus("Cookie access revoked.", "ok");
@@ -1020,6 +1085,14 @@ function wireEvents() {
 
   $("syncCookiesBtn").addEventListener("click", handleSyncCookies);
   $("revokeCookiesBtn").addEventListener("click", handleRevokeCookies);
+  $("autoSyncCookiesCheck").addEventListener("change", async () => {
+    const enabled = Boolean($("autoSyncCookiesCheck").checked);
+    settings.autoSyncCookies = enabled;
+    await saveSettings({ autoSyncCookies: enabled }).catch(() => {});
+    if (enabled) {
+      void syncCookiesViaBackground({ reason: "toggle_enabled", verifyServer: true });
+    }
+  });
 
   for (const tab of document.querySelectorAll(".tab")) {
     tab.addEventListener("click", () => switchTab(tab.dataset.tab));

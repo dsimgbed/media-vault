@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Media Vault Companion",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "One-tap media, webpage, PDF & screenshot capture with remembered folders and opt-in YouTube cookie sync for Media Vault.",
   "icons": {
     "16": "icons/icon-16.png",
@@ -24,6 +24,7 @@
   },
   "permissions": [
     "activeTab",
+    "alarms",
     "contextMenus",
     "storage",
     "notifications"

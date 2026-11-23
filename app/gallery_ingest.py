@@ -539,12 +539,19 @@ class GalleryIngestService:
                 cookies_file = getattr(self.settings, "ytdlp_cookies_file", None)
                 if isinstance(cookies_file, str):
                     cookies_file = Path(cookies_file)
+                iso_cookies: Path | None = None
+                if cookies_file and cookies_file.is_file() and cookies_file.stat().st_size > 0:
+                    iso_cookies = job_dir / "_cookies.txt"
+                    try:
+                        shutil.copyfile(cookies_file, iso_cookies)
+                    except OSError:
+                        iso_cookies = None
                 args = build_gallery_dl_cmd(
                     cmd,
                     clean_url,
                     download_dir,
                     max_items=bounded_max,
-                    cookies_file=cookies_file,
+                    cookies_file=iso_cookies,
                     proxy=effective_proxy,
                 )
 

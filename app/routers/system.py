@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
 from importlib.metadata import PackageNotFoundError, version as pkg_version
+import os
+import tempfile
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -10,7 +13,11 @@ from app.allocator import sanitize_folder
 from app.context import AppContext
 from app.db import normalize_source_url
 from app.gallery_ingest import get_gallery_dl_status
-from app.ingest import expand_ytdlp_playlist, list_ytdlp_formats
+from app.ingest import (
+    expand_ytdlp_playlist,
+    is_cookie_recoverable_ytdlp_job,
+    list_ytdlp_formats,
+)
 from app.torrent_ingest import find_aria2c, get_aria2c_version
 from app.routers.deps import get_ctx, require_auth
 from app.schemas import CookiesRequest, FormatsRequest, PlaylistRequest
@@ -241,8 +248,54 @@ async def save_ytdlp_cookies(
         )
     cookies_file = ctx.settings.ytdlp_cookies_file
     cookies_file.parent.mkdir(parents=True, exist_ok=True)
-    cookies_file.write_text(raw + "\n", encoding="utf-8")
-    return {"saved": True, "ytdlp_cookies_configured": True}
+    new_content = raw + "\n"
+    prev_content = ""
+    if cookies_file.is_file():
+        try:
+            prev_content = cookies_file.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            prev_content = ""
+    cookies_changed = new_content != prev_content
+
+    fd, tmp_name = tempfile.mkstemp(prefix=".cookies_", suffix=".tmp", dir=str(cookies_file.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(new_content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, cookies_file)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+    retried_ids: list[str] = []
+    if payload.auto_retry_failed and (cookies_changed or payload.retry_unchanged):
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=48)
+        candidates = ctx.db.list_jobs(limit=100, status="failed")
+        for job in candidates:
+            if len(retried_ids) >= 50:
+                break
+            if not is_cookie_recoverable_ytdlp_job(job):
+                continue
+            ts = ctx.ingest._parse_iso_utc(job.get("updated_at") or job.get("created_at"))
+            if ts is not None and ts < cutoff:
+                continue
+            try:
+                await ctx.ingest.retry_job(job["id"])
+                retried_ids.append(job["id"])
+            except (KeyError, ValueError):
+                continue
+
+    return {
+        "saved": True,
+        "ytdlp_cookies_configured": True,
+        "cookies_changed": cookies_changed,
+        "retried_count": len(retried_ids),
+        "retried_job_ids": retried_ids,
+    }
 
 
 @router.delete("/api/ytdlp/cookies", dependencies=[Depends(require_auth)])

@@ -99,9 +99,13 @@
           </div>
         </dl>
         <p class="hint">
-          Opt-in only: grants temporary access to YouTube / Google cookies so yt-dlp can fetch
-          sign-in-required videos. You can revoke access at any time.
+          Opt-in only: grants access to YouTube / Google cookies so yt-dlp can fetch
+          sign-in-required videos. When enabled below, changed cookies are auto-synced in the background.
         </p>
+        <label class="check" for="autoSyncCookiesCheck">
+          <input id="autoSyncCookiesCheck" type="checkbox" checked />
+          <span>Auto-sync YouTube cookies in background</span>
+        </label>
         <div class="row">
           <button id="syncCookiesBtn" class="btn btn-ghost btn-sm" type="button" data-busy-label="Syncing…">
             Sync YouTube Cookies to Vault

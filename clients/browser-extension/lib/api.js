@@ -300,9 +300,16 @@ export async function getJobStatus(settings, jobId) {
   return vaultRequest(settings, `/api/jobs/${encodeURIComponent(jobId)}`, { method: "GET" });
 }
 
-export async function uploadCookies(settings, cookiesText) {
+export async function uploadCookies(settings, cookiesText, options = {}) {
+  const body = { cookies_text: cookiesText };
+  if (typeof options?.auto_retry_failed === "boolean") {
+    body.auto_retry_failed = options.auto_retry_failed;
+  }
+  if (typeof options?.retry_unchanged === "boolean") {
+    body.retry_unchanged = options.retry_unchanged;
+  }
   return vaultRequest(settings, "/api/ytdlp/cookies", {
     method: "POST",
-    body: { cookies_text: cookiesText },
+    body,
   });
 }

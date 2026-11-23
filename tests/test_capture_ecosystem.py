@@ -433,6 +433,15 @@ const sidCount = rows.filter(r => r.split("\\t")[5] === "sid").length;
 if (sidCount !== 1) {{ console.error("dedup fail: " + sidCount); process.exit(1); }}
 // disallowed domain dropped
 if (text.includes("evilyoutube")) {{ console.error("disallowed not dropped"); process.exit(1); }}
+// isYouTubeUrl + isRelevantAuthCookieChange + computeCookieTextDigest
+if (!m.isYouTubeUrl("https://www.youtube.com/watch?v=dQw4w9WgXcQ")) {{ console.error("yt url fail"); process.exit(1); }}
+if (!m.isYouTubeUrl("https://youtu.be/dQw4w9WgXcQ")) {{ console.error("youtu.be fail"); process.exit(1); }}
+if (m.isYouTubeUrl("https://example.com/watch?v=1")) {{ console.error("non-yt url allowed"); process.exit(1); }}
+if (!m.isRelevantAuthCookieChange({{ removed: false, cause: "explicit", cookie: {{ domain: ".google.com", name: "__Secure-3PSIDTS" }} }})) {{ console.error("auth cookie change fail"); process.exit(1); }}
+if (m.isRelevantAuthCookieChange({{ removed: true, cause: "overwrite", cookie: {{ domain: ".youtube.com", name: "LOGIN_INFO" }} }})) {{ console.error("overwrite removal should be skipped"); process.exit(1); }}
+const d1 = await m.computeCookieTextDigest(out.text);
+const d2 = await m.computeCookieTextDigest(out.text + "x");
+if (!d1 || d1 === d2) {{ console.error("digest fail"); process.exit(1); }}
 console.log(JSON.stringify({{ text: out.text, count: out.count, domains: out.domains }}));
 """
     res = _run_node(script)
@@ -476,6 +485,19 @@ if (n("https://example.com/vault/") !== "https://example.com/vault") {{ console.
 for (const bad of ["javascript:alert(1)", "ftp://host", "http://user:pass@host"]) {{
   if (n(bad) !== "") {{ console.error("should reject: " + bad + " got " + n(bad)); process.exit(1); }}
 }}
+if (m.DEFAULT_SETTINGS.autoSyncCookies !== true) {{ console.error("autoSyncCookies default fail"); process.exit(1); }}
+const store = {{}};
+globalThis.chrome = {{
+  storage: {{
+    local: {{
+      async get(k) {{ return {{ [k]: store[k] }}; }},
+      async set(obj) {{ Object.assign(store, obj); }},
+    }},
+  }},
+}};
+await m.saveCookieSyncState({{ lastHash: "abc123", lastSyncedAt: 1000, lastCount: 12, lastDomains: ["youtube.com"] }});
+const st = await m.getCookieSyncState();
+if (st.lastHash !== "abc123" || st.lastCount !== 12) {{ console.error("sync state fail: " + JSON.stringify(st)); process.exit(1); }}
 console.log("ok");
 """
     res = _run_node(script)

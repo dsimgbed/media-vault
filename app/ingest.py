@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from contextlib import contextmanager
 import hashlib
 import inspect
 import json
 import logging
 import mimetypes
+import os
 import re
 import shutil
 import sys
@@ -16,7 +18,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterator
 from urllib.parse import unquote, urljoin, urlparse
 
 import httpx
@@ -86,6 +88,22 @@ def classify_media(path: Path) -> tuple[str, str]:
 
 
 _DDL_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_YOUTUBE_HOST_SUFFIXES = (
+    "youtube.com",
+    "youtu.be",
+    "youtube-nocookie.com",
+    "music.youtube.com",
+)
+
+
+def _is_youtube_url(url: str) -> bool:
+    try:
+        host = (urlparse(str(url or "").strip()).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    if not host:
+        return False
+    return any(host == dom or host.endswith(f".{dom}") for dom in _YOUTUBE_HOST_SUFFIXES)
 
 
 async def _assert_public_url(url: str) -> str:
@@ -102,6 +120,8 @@ async def is_direct_download(
     ext = Path(urlparse(url).path).suffix.lower()
     if ext in DDL_EXTENSIONS:
         return True
+    if _is_youtube_url(url):
+        return False
     clean_proxy = proxy.strip()
     proxy_url = clean_proxy if clean_proxy.startswith(("http://", "https://")) else None
     try:
@@ -360,6 +380,47 @@ _ytdlp_update_lock = asyncio.Lock()
 _YTDLP_PLUGINS_DIR = Path(__file__).resolve().parent / "ytdlp_plugins"
 
 
+_YOUTUBE_FALLBACK_EXTRACTOR_ARGS = (
+    # Cookie-compatible YouTube clients that do not require GVS PO tokens.
+    "youtube:player_client=tv,tv_downgraded,web_safari,mweb,web_embedded,web",
+    # Allow formats missing PO token + web_safari HLS as a second pass.
+    "youtube:player_client=web_safari,tv,tv_downgraded,web_embedded,web;formats=missing_pot",
+)
+_YOUTUBE_COOKIELESS_FALLBACK_EXTRACTOR_ARGS = (
+    "youtube:player_client=android_vr,tv,web_safari",
+)
+_INCOMPLETE_DOWNLOAD_SUFFIXES = (".part", ".ytdl", ".tmp", ".temp", ".aria2")
+
+
+@contextmanager
+def _isolated_cookies_copy(cookies_file: Path | None) -> Iterator[Path | None]:
+    """Expose a private per-invocation copy of cookies.txt.
+
+    yt-dlp (and gallery-dl) overwrite the ``--cookies`` file in place on exit,
+    stripping ``#HttpOnly_`` markers, racing across concurrent workers, and
+    persisting Set-Cookie deletions back to the shared master file.
+    """
+    if not cookies_file:
+        yield None
+        return
+    try:
+        if not cookies_file.is_file() or cookies_file.stat().st_size <= 0:
+            yield None
+            return
+    except OSError:
+        yield None
+        return
+
+    with tempfile.TemporaryDirectory(prefix="mv_cookies_") as tmp_dir:
+        copy_path = Path(tmp_dir) / "cookies.txt"
+        try:
+            shutil.copyfile(cookies_file, copy_path)
+        except OSError:
+            yield None
+            return
+        yield copy_path
+
+
 def _ytdlp_cmd() -> list[str]:
     venv_ytdlp = Path(sys.executable).parent / "yt-dlp"
     if venv_ytdlp.is_file():
@@ -375,6 +436,7 @@ def _ytdlp_base_args(
     proxy: str = "",
     *,
     no_playlist: bool = True,
+    extractor_args: str | None = None,
 ) -> list[str]:
     args: list[str] = [*_ytdlp_cmd(), "--no-playlist" if no_playlist else "--yes-playlist"]
     if _YTDLP_PLUGINS_DIR.is_dir():
@@ -382,8 +444,18 @@ def _ytdlp_base_args(
     venv_deno = Path(sys.executable).parent / "deno"
     if venv_deno.is_file():
         args.extend(["--js-runtimes", f"deno:{venv_deno}"])
+    else:
+        path_deno = shutil.which("deno")
+        if path_deno:
+            args.extend(["--js-runtimes", f"deno:{path_deno}"])
+        else:
+            path_node = shutil.which("node")
+            if path_node:
+                args.extend(["--js-runtimes", f"node:{path_node}"])
     if cookies_file and cookies_file.is_file() and cookies_file.stat().st_size > 0:
         args.extend(["--cookies", str(cookies_file)])
+    if extractor_args:
+        args.extend(["--extractor-args", extractor_args])
     if proxy.strip():
         args.extend(["--proxy", proxy.strip()])
     return args
@@ -411,25 +483,64 @@ def resolve_format_spec(format_spec: str | None) -> tuple[list[str], bool]:
     return ["-f", spec, "--merge-output-format", "mp4"], False
 
 
-async def list_ytdlp_formats(
-    url: str,
-    *,
-    cookies_file: Path | None = None,
-    proxy: str = "",
-) -> dict[str, Any]:
-    args = [
-        *_ytdlp_base_args(cookies_file=cookies_file, proxy=proxy),
-        "-J",
-        url,
-    ]
-    code, out, err = await _run_subprocess(*args)
-    if code != 0:
-        raise RuntimeError(_format_ytdlp_error(err or out))
-    try:
-        info = json.loads(out)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Could not parse yt-dlp metadata: {exc}")
+def _fallback_format_args(format_spec: str | None) -> list[str] | None:
+    spec = (format_spec or "best").strip()
+    if not spec or spec == "best":
+        return ["-f", "bv*+ba/b/bv*/ba", "--merge-output-format", "mp4"]
+    if spec == "1080p":
+        return ["-f", "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b/bv*", "--merge-output-format", "mp4"]
+    if spec == "720p":
+        return ["-f", "bv*[height<=720]+ba/b[height<=720]/bv*+ba/b/bv*", "--merge-output-format", "mp4"]
+    if spec == "480p":
+        return ["-f", "bv*[height<=480]+ba/b[height<=480]/bv*+ba/b/bv*", "--merge-output-format", "mp4"]
+    if spec == "audio":
+        return ["-f", "ba/b/bv*", "-x", "--audio-format", "mp3"]
+    return None
 
+
+def _is_ytdlp_bot_or_cookie_error(text: str) -> bool:
+    lower = (text or "").lower()
+    return (
+        "not a bot" in lower
+        or "cookies are no longer valid" in lower
+        or ("cookies" in lower and "youtube" in lower)
+        or "sign in to confirm" in lower
+    )
+
+
+def _is_ytdlp_format_unavailable_error(text: str) -> bool:
+    lower = (text or "").lower()
+    return (
+        "requested format is not available" in lower
+        or "only images are available" in lower
+        or "no video formats found" in lower
+        or "no such format" in lower
+    )
+
+
+def is_cookie_recoverable_ytdlp_job(job: dict[str, Any]) -> bool:
+    if job.get("status") != "failed":
+        return False
+    source_kind = str(job.get("source_kind") or "")
+    if source_kind not in ("url", ""):
+        return False
+    source_ref = str(job.get("source_ref") or "")
+    params_raw = job.get("params_json") or "{}"
+    try:
+        params = json.loads(params_raw) if isinstance(params_raw, str) else (params_raw or {})
+    except (TypeError, ValueError):
+        params = {}
+    target_url = str((params.get("url") if isinstance(params, dict) else "") or source_ref)
+    msg = str(job.get("message") or "")
+    lower = msg.lower()
+    if _is_ytdlp_bot_or_cookie_error(msg) or "youtube bot check" in lower:
+        return True
+    if _is_youtube_url(target_url) and _is_ytdlp_format_unavailable_error(msg):
+        return True
+    return False
+
+
+def _extract_ytdlp_format_options(info: dict[str, Any], url: str) -> dict[str, Any]:
     entries = info.get("entries")
     if isinstance(entries, list) and entries:
         info = entries[0] or info
@@ -490,6 +601,79 @@ async def list_ytdlp_formats(
     }
 
 
+async def list_ytdlp_formats(
+    url: str,
+    *,
+    cookies_file: Path | None = None,
+    proxy: str = "",
+) -> dict[str, Any]:
+    async def _probe(*, use_cookies: bool, extractor_args: str | None = None) -> tuple[int, str, str]:
+        with _isolated_cookies_copy(cookies_file if use_cookies else None) as iso_cookies:
+            args = [
+                *_ytdlp_base_args(
+                    cookies_file=iso_cookies,
+                    proxy=proxy,
+                    extractor_args=extractor_args,
+                ),
+                "-J",
+                url,
+            ]
+            return await _run_subprocess(*args)
+
+    code, out, err = await _probe(use_cookies=True)
+    last_parsed: dict[str, Any] | None = None
+    last_err = err or out
+
+    if code == 0:
+        try:
+            info = json.loads(out)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Could not parse yt-dlp metadata: {exc}")
+        last_parsed = _extract_ytdlp_format_options(info, url)
+        if last_parsed["formats"] or not _is_youtube_url(url):
+            return last_parsed
+
+    should_retry_youtube = _is_youtube_url(url) and (
+        (code == 0 and last_parsed is not None and not last_parsed["formats"])
+        or (code != 0 and _is_ytdlp_format_unavailable_error(last_err))
+    )
+
+    if should_retry_youtube:
+        has_cookies = bool(cookies_file and cookies_file.is_file() and cookies_file.stat().st_size > 0)
+        attempts: list[tuple[bool, str]] = [
+            (True, ext_arg) for ext_arg in _YOUTUBE_FALLBACK_EXTRACTOR_ARGS
+        ]
+        if has_cookies:
+            attempts.extend(
+                (False, ext_arg) for ext_arg in _YOUTUBE_COOKIELESS_FALLBACK_EXTRACTOR_ARGS
+            )
+
+        for use_cookies, ext_arg in attempts:
+            r_code, r_out, r_err = await _probe(
+                use_cookies=use_cookies, extractor_args=ext_arg
+            )
+            if r_code == 0:
+                try:
+                    r_info = json.loads(r_out)
+                except json.JSONDecodeError:
+                    continue
+                r_parsed = _extract_ytdlp_format_options(r_info, url)
+                if r_parsed["formats"]:
+                    return r_parsed
+                if last_parsed is None:
+                    last_parsed = r_parsed
+            else:
+                r_msg = r_err or r_out
+                if use_cookies and _is_ytdlp_bot_or_cookie_error(r_msg):
+                    raise RuntimeError(_format_ytdlp_error(r_msg))
+                if use_cookies or not _is_ytdlp_bot_or_cookie_error(r_msg):
+                    last_err = r_msg
+
+    if last_parsed is not None:
+        return last_parsed
+    raise RuntimeError(_format_ytdlp_error(last_err))
+
+
 async def expand_ytdlp_playlist(
     url: str,
     *,
@@ -498,15 +682,16 @@ async def expand_ytdlp_playlist(
     max_items: int = 100,
 ) -> dict[str, Any]:
     limit = max(1, int(max_items))
-    args = [
-        *_ytdlp_base_args(cookies_file=cookies_file, proxy=proxy, no_playlist=False),
-        "--flat-playlist",
-        "--playlist-end",
-        str(limit),
-        "-J",
-        url,
-    ]
-    code, out, err = await _run_subprocess(*args)
+    with _isolated_cookies_copy(cookies_file) as iso_cookies:
+        args = [
+            *_ytdlp_base_args(cookies_file=iso_cookies, proxy=proxy, no_playlist=False),
+            "--flat-playlist",
+            "--playlist-end",
+            str(limit),
+            "-J",
+            url,
+        ]
+        code, out, err = await _run_subprocess(*args)
     if code != 0:
         raise RuntimeError(_format_ytdlp_error(err or out))
     try:
@@ -614,8 +799,7 @@ async def update_ytdlp() -> dict[str, Any]:
 def _format_ytdlp_error(stderr: str) -> str:
     err_lines = [line.strip() for line in stderr.splitlines() if line.strip().startswith("ERROR:")]
     detail = err_lines[-1] if err_lines else stderr.strip()[-400:]
-    lower = detail.lower()
-    if "not a bot" in lower or ("cookies" in lower and "youtube" in lower):
+    if _is_ytdlp_bot_or_cookie_error(detail):
         return (
             "yt-dlp blocked by YouTube bot check on this server IP. "
             "Upload a Netscape cookies.txt via the Web UI (YouTube Cookies) "
@@ -636,23 +820,9 @@ async def _download_ytdlp(
     on_proc: ProcHook | None = None,
 ) -> list[Path]:
     fmt_args, is_audio = resolve_format_spec(format_spec)
-    args: list[str] = [
-        *_ytdlp_base_args(cookies_file=cookies_file, proxy=proxy),
-        "--newline",
-        "--progress",
-        "--concurrent-fragments",
-        str(max(1, int(concurrent_fragments))),
-        "--paths",
-        str(job_dir),
-        "-o",
-        "%(title).100s [%(id)s].%(ext)s",
-        *fmt_args,
-    ]
-    if not is_audio:
-        args.extend(["--postprocessor-args", "Merger+ffmpeg:-movflags +faststart"])
-    args.append(url)
-
+    fallback_fmt = _fallback_format_args(format_spec)
     last_report = 0.0
+    baseline_names = {p.name for p in job_dir.iterdir() if p.is_file()}
 
     async def handle_line(line: str) -> None:
         nonlocal last_report
@@ -675,11 +845,104 @@ async def _download_ytdlp(
         elif "[Merger]" in line or "[ExtractAudio]" in line:
             await on_progress(98.0, "Post-processing media...")
 
-    code, tail = await _invoke_streaming(*args, on_line=handle_line, on_proc=on_proc)
-    if code != 0:
-        raise RuntimeError(_format_ytdlp_error("\n".join(tail)))
+    def _cleanup_failed_attempt_files() -> None:
+        for p in job_dir.iterdir():
+            if p.is_file() and p.name not in baseline_names:
+                p.unlink(missing_ok=True)
 
-    files = [p for p in job_dir.iterdir() if p.is_file()]
+    async def _run_attempt(
+        *,
+        use_cookies: bool,
+        attempt_fmt_args: list[str],
+        extractor_args: str | None = None,
+    ) -> tuple[int, list[str]]:
+        with _isolated_cookies_copy(cookies_file if use_cookies else None) as iso_cookies:
+            args: list[str] = [
+                *_ytdlp_base_args(
+                    cookies_file=iso_cookies,
+                    proxy=proxy,
+                    extractor_args=extractor_args,
+                ),
+                "--newline",
+                "--progress",
+                "--concurrent-fragments",
+                str(max(1, int(concurrent_fragments))),
+                "--paths",
+                str(job_dir),
+                "-o",
+                "%(title).100s [%(id)s].%(ext)s",
+                *attempt_fmt_args,
+            ]
+            if not is_audio:
+                args.extend(["--postprocessor-args", "Merger+ffmpeg:-movflags +faststart"])
+            args.append(url)
+            return await _invoke_streaming(*args, on_line=handle_line, on_proc=on_proc)
+
+    code, tail = await _run_attempt(use_cookies=True, attempt_fmt_args=fmt_args)
+    raw_err = "\n".join(tail)
+
+    if code != 0 and _is_ytdlp_format_unavailable_error(raw_err):
+        _cleanup_failed_attempt_files()
+        attempt_fmt = fallback_fmt or fmt_args
+        last_authed_err = raw_err
+
+        if _is_youtube_url(url):
+            has_cookies = bool(
+                cookies_file and cookies_file.is_file() and cookies_file.stat().st_size > 0
+            )
+            fallback_plan: list[tuple[bool, list[str], str | None]] = [
+                (True, attempt_fmt, ext_arg)
+                for ext_arg in _YOUTUBE_FALLBACK_EXTRACTOR_ARGS
+            ]
+            if has_cookies:
+                fallback_plan.extend(
+                    (False, attempt_fmt, ext_arg)
+                    for ext_arg in _YOUTUBE_COOKIELESS_FALLBACK_EXTRACTOR_ARGS
+                )
+
+            for use_cookies, cand_fmt, ext_arg in fallback_plan:
+                logger.info(
+                    "Retrying YouTube download for %s with fallback (%s, cookies=%s)",
+                    url,
+                    ext_arg,
+                    use_cookies,
+                )
+                code, tail = await _run_attempt(
+                    use_cookies=use_cookies,
+                    attempt_fmt_args=cand_fmt,
+                    extractor_args=ext_arg,
+                )
+                if code == 0:
+                    break
+                cand_err = "\n".join(tail)
+                _cleanup_failed_attempt_files()
+                if use_cookies:
+                    last_authed_err = cand_err
+                    raw_err = cand_err
+                    if _is_ytdlp_bot_or_cookie_error(cand_err):
+                        break
+                else:
+                    # Preserve authenticated format error if cookieless attempt hit bot check.
+                    raw_err = last_authed_err if _is_ytdlp_bot_or_cookie_error(cand_err) else cand_err
+                if not (
+                    _is_ytdlp_format_unavailable_error(cand_err)
+                    or not use_cookies
+                ):
+                    break
+        elif attempt_fmt != fmt_args:
+            code, tail = await _run_attempt(use_cookies=True, attempt_fmt_args=attempt_fmt)
+            if code != 0:
+                _cleanup_failed_attempt_files()
+                raw_err = "\n".join(tail)
+
+    if code != 0:
+        raise RuntimeError(_format_ytdlp_error(raw_err))
+
+    files = [
+        p
+        for p in job_dir.iterdir()
+        if p.is_file() and not p.name.lower().endswith(_INCOMPLETE_DOWNLOAD_SUFFIXES)
+    ]
     if not files:
         raise RuntimeError("yt-dlp finished but produced no file.")
     return files
