@@ -7,8 +7,10 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from app.context import AppContext
 from app.routers.deps import get_ctx, require_auth
 from app.schemas import (
+    SubscriptionBackfillRequest,
     SubscriptionCheckRequest,
     SubscriptionCreateRequest,
+    SubscriptionQueueEntryRequest,
     SubscriptionUpdateRequest,
 )
 from app.subscriptions import (
@@ -122,5 +124,37 @@ async def list_subscription_entries(
     subs = _require_subscriptions(ctx)
     try:
         return subs.list_entries(sub_id, status=status, limit=limit, offset=offset)
+    except SubscriptionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.post("/api/subscriptions/{sub_id}/entries/queue", dependencies=[Depends(require_auth)])
+async def queue_subscription_entry(
+    sub_id: str,
+    payload: SubscriptionQueueEntryRequest,
+    ctx: AppContext = Depends(get_ctx),
+):
+    subs = _require_subscriptions(ctx)
+    try:
+        return subs.queue_existing_entry(sub_id, payload.entry_key)
+    except SubscriptionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except SubscriptionValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/api/subscriptions/{sub_id}/backfill", dependencies=[Depends(require_auth)])
+async def backfill_subscription(
+    sub_id: str,
+    payload: SubscriptionBackfillRequest | None = Body(default=None),
+    ctx: AppContext = Depends(get_ctx),
+):
+    subs = _require_subscriptions(ctx)
+    try:
+        return subs.backfill_entries(
+            sub_id,
+            limit=payload.limit if payload else None,
+            statuses=payload.statuses if payload else None,
+        )
     except SubscriptionNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))

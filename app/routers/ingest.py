@@ -14,6 +14,13 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from app.allocator import sanitize_folder
 from app.context import AppContext
 from app.ingest import _accepts_kwarg, expand_ytdlp_playlist, is_direct_download, resolve_format_spec
+from app.torrent_ingest import (
+    TorrentQuotaError,
+    assert_staging_disk_space,
+    extract_magnet_infohash,
+    find_aria2c,
+    validate_magnet_uri,
+)
 from app.media_ops import _sanitize_archive_relpath
 from app.routers.deps import get_ctx, require_auth
 from app.schemas import CheckDuplicateRequest, UrlIngestRequest
@@ -84,7 +91,7 @@ async def ingest_url(
     if not raw_urls:
         raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
     for u in raw_urls:
-        if not u.startswith(("http://", "https://")):
+        if not (u.startswith(("http://", "https://")) or u.lower().startswith("magnet:?")):
             raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
 
     try:
@@ -98,6 +105,58 @@ async def ingest_url(
         await ctx.ingest.get_effective_proxy() if payload.expand_playlist else ""
     )
     for u in raw_urls:
+        if u.lower().startswith("magnet:?"):
+            try:
+                validate_magnet_uri(u)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            if ctx.torrent is None or not cfg.torrent_enabled or find_aria2c() is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Torrent leeching unavailable: aria2c is not installed or torrent support is disabled.",
+                )
+            try:
+                assert_staging_disk_space(
+                    cfg.staging_dir, 0, cfg.torrent_max_total_bytes, cfg.torrent_min_free_buffer_bytes
+                )
+            except TorrentQuotaError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+
+    magnet_job_ids: list[str] = []
+    for u in raw_urls:
+        if u.lower().startswith("magnet:?"):
+            clean_magnet = validate_magnet_uri(u)
+            infohash = extract_magnet_infohash(clean_magnet)
+            name = infohash or "magnet"
+            job_params = {
+                "magnet": clean_magnet,
+                "infohash": infohash,
+                "name": name,
+                "selected_indices": None,
+                "folder": payload.folder,
+                "use_torrent_subfolder": True,
+                "tags": payload.tags,
+                "forward_to_telegram": payload.forward_to_telegram,
+                "force": payload.force,
+                "source_origin": "web",
+            }
+            job_id = ctx.db.create_job("web", "torrent", clean_magnet, params=job_params)
+            ctx.ingest.submit_job(
+                job_id,
+                ctx.torrent.process_torrent_job(
+                    job_id,
+                    magnet=clean_magnet,
+                    selected_indices=None,
+                    source_origin="web",
+                    folder=payload.folder,
+                    use_torrent_subfolder=True,
+                    tags=payload.tags,
+                    forward_to_telegram=payload.forward_to_telegram,
+                    force=payload.force,
+                ),
+            )
+            magnet_job_ids.append(job_id)
+            continue
         if payload.expand_playlist:
             is_ddl = (
                 await is_direct_download(u, proxy=effective_proxy)
@@ -133,7 +192,7 @@ async def ingest_url(
                     continue
         queue_items.append((u, payload.title if len(raw_urls) == 1 else None, base_folder))
 
-    job_ids: list[str] = []
+    job_ids: list[str] = list(magnet_job_ids)
     for target_url, target_title, target_folder in queue_items:
         job_params = {
             "url": target_url,

@@ -57,5 +57,11 @@ export function debounce(fn, delay = 250) {
 
 export function isZipItem(item) {
   const name = (item.filename || "").toLowerCase();
-  return name.endsWith(".zip") || item.mime_type === "application/zip";
+  const mime = (item.mime_type || "").toLowerCase();
+  return (
+    name.endsWith(".zip") ||
+    name.endsWith(".cbz") ||
+    mime === "application/zip" ||
+    mime === "application/vnd.comicbook+zip"
+  );
 }

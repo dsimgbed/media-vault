@@ -15,11 +15,14 @@ from app.backup import BackupService
 from app.config import Settings
 from app.context import STATIC_DIR, AppContext
 from app.db import Database
+from app.gallery_ingest import GalleryIngestService
 from app.ingest import IngestService, update_ytdlp
 from app.integrity import IntegrityService
+from app.torrent_ingest import TorrentIngestService
 from app.routers import capture as capture_router
 from app.routers import ingest as ingest_router
 from app.routers import jobs as jobs_router
+from app.routers import leech as leech_router
 from app.routers import maintenance as maintenance_router
 from app.routers import media as media_router
 from app.routers import pwa as pwa_router
@@ -62,6 +65,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     uploads = UploadSessionService(cfg, db, ingest)
     ingest.upload_service = uploads
     tg_pool = TelegramPool(cfg, db, allocator, ingest)
+    torrent = TorrentIngestService(cfg, db, ingest)
+    gallery = GalleryIngestService(cfg, db, ingest)
+    ingest.torrent_service = torrent
+    ingest.gallery_service = gallery
+    tg_pool.torrent_service = torrent
     backup = BackupService(cfg, db, tg_pool)
     integrity = IntegrityService(cfg, db, ingest, tg_pool)
     subscriptions = SubscriptionService(cfg, db, ingest)
@@ -83,6 +91,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         integrity=integrity,
         uploads=uploads,
         subscriptions=subscriptions,
+        torrent=torrent,
+        gallery=gallery,
     )
     ingest.recover_on_startup()
     db.recover_interrupted_maintenance_runs()
@@ -136,11 +146,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.integrity = integrity
     app.state.uploads = uploads
     app.state.subscriptions = subscriptions
+    app.state.torrent = torrent
+    app.state.gallery = gallery
 
     app.include_router(system_router.router)
     app.include_router(maintenance_router.router)
     app.include_router(jobs_router.router)
     app.include_router(ingest_router.router)
+    app.include_router(leech_router.router)
     app.include_router(uploads_router.router)
     app.include_router(subscriptions_router.router)
     app.include_router(media_router.router)

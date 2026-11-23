@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
+import re
 import shutil
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -330,16 +333,128 @@ async def generate_video_preview(
     return None
 
 
-async def generate_thumbnail(src: Path, media_type: str, thumbs_dir: Path, media_id: str) -> str | None:
+def _natural_key(text: str):
+    return [
+        (0, int(t)) if (t.isdigit() and len(t) <= 18) else (1, t.lower())
+        for t in re.split(r"(\d+)", text)
+    ]
+
+
+def _is_safe_cbz_entry_name(name: str) -> bool:
+    if not name or name.startswith("__MACOSX/") or name.startswith(("/", "\\")) or "\\" in name:
+        return False
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+        return False
+    segments = name.split("/")
+    for seg in segments:
+        if not seg or seg in (".", ".."):
+            return False
+        if len(seg) >= 2 and seg[1] == ":":
+            return False
+    return True
+
+
+def _make_cbz_thumb(src: Path, dst: Path) -> bool:
+    allowed = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+    max_pixels = 64_000_000
+    try:
+        with zipfile.ZipFile(src, "r") as zf:
+            candidates = []
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                name = info.filename
+                if not _is_safe_cbz_entry_name(name):
+                    continue
+                if Path(name).suffix.lower() not in allowed:
+                    continue
+                if info.file_size > 32 * 1024 * 1024:
+                    continue
+                candidates.append(info)
+            if not candidates:
+                return False
+            candidates.sort(key=lambda i: _natural_key(i.filename))
+            for info in candidates:
+                try:
+                    with zf.open(info) as member:
+                        raw = member.read(32 * 1024 * 1024 + 1)
+                except Exception:
+                    continue
+                if len(raw) > 32 * 1024 * 1024:
+                    continue
+                try:
+                    with Image.open(io.BytesIO(raw)) as img:
+                        w, h = img.size
+                        if w <= 0 or h <= 0 or (w * h) > max_pixels:
+                            continue
+                        img = ImageOps.exif_transpose(img)
+                        if img.mode not in ("RGB", "RGBA"):
+                            img = img.convert("RGB")
+                        img.thumbnail((480, 480))
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        img.save(dst, format="WEBP", quality=80, method=4)
+                    if dst.is_file() and dst.stat().st_size > 0:
+                        return True
+                except Exception:
+                    continue
+        return False
+    except Exception:
+        return False
+
+
+async def generate_thumbnail(*args: Any, **kwargs: Any) -> Any:
+    # Support both legacy signature generate_thumbnail(src, media_type, thumbs_dir, media_id)
+    # and new signature generate_thumbnail(src, dst, media_type).
+    src = kwargs.get("src", args[0] if len(args) > 0 else None)
+    src = Path(src) if not isinstance(src, Path) else src
+
+    new_style = False
+    if "dst" in kwargs:
+        new_style = True
+    elif len(args) >= 2 and isinstance(args[1], (str, Path)) and not str(args[1]).lower() in ("image", "video", "audio", "file"):
+        # second arg looks like a path, not a media_type
+        if Path(str(args[1])).suffix or True:
+            # heuristic: if second arg is Path or contains separator/dot path
+            if isinstance(args[1], Path) or ("/" in str(args[1]) or "\\" in str(args[1])):
+                new_style = True
+    # also if third positional provided as media_type string in new style
+    if len(args) >= 3 and isinstance(args[2], str) and args[2].lower() in ("image", "video", "audio", "file"):
+        # could be new style (src, dst, media_type)
+        if len(args) == 3:
+            new_style = True
+
+    if new_style:
+        dst = kwargs.get("dst", args[1] if len(args) > 1 else None)
+        dst = Path(dst) if not isinstance(dst, Path) else dst
+        media_type = kwargs.get("media_type", args[2] if len(args) > 2 else "file")
+        media_type = str(media_type)
+        if src.suffix.lower() == ".cbz":
+            ok = await asyncio.to_thread(_make_cbz_thumb, src, dst)
+            return bool(ok)
+        # fallback for image/video when dst provided
+        if media_type == "image":
+            ok = await asyncio.to_thread(_make_image_thumb, src, dst)
+            return bool(ok)
+        if media_type == "video":
+            ok = await _make_video_thumb(src, dst)
+            return bool(ok)
+        return False
+
+    # legacy
+    media_type = kwargs.get("media_type", args[1] if len(args) > 1 else "file")
+    thumbs_dir = kwargs.get("thumbs_dir", args[2] if len(args) > 2 else None)
+    media_id = kwargs.get("media_id", args[3] if len(args) > 3 else None)
+    media_type = str(media_type)
     thumb_name = f"{media_id}.webp"
-    dst = thumbs_dir / thumb_name
+    dst = Path(thumbs_dir) / thumb_name if thumbs_dir is not None else None
 
     if media_type == "image":
         ok = await asyncio.to_thread(_make_image_thumb, src, dst)
         return thumb_name if ok else None
-
     if media_type == "video":
         ok = await _make_video_thumb(src, dst)
         return thumb_name if ok else None
-
+    if src.suffix.lower() == ".cbz":
+        ok = await asyncio.to_thread(_make_cbz_thumb, src, dst)
+        return thumb_name if ok else None
     return None

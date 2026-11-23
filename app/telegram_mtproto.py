@@ -40,9 +40,21 @@ from app.db import Database, normalize_tags
 from app.ingest import IMAGE_EXTS, IngestService, classify_media
 from app.stream_cache import StreamFetchCoordinator, TelegramBlockCache, TwoTierBlockCache
 from app.thumbnails import generate_thumbnail
+from app.torrent_ingest import (
+    MAX_TORRENT_FILE_BYTES,
+    TorrentError,
+    TorrentQuotaError,
+    TorrentUnavailableError,
+    assert_staging_disk_space,
+    extract_magnet_infohash,
+    find_aria2c,
+    parse_torrent_bytes,
+    validate_magnet_uri,
+)
 
 logger = logging.getLogger(__name__)
 URL_REGEX = re.compile(r"https?://\S+")
+MAGNET_REGEX = re.compile(r"magnet:\?[^\s<>\"'`]+", re.IGNORECASE)
 FOLDER_HASH_RE = re.compile(r"(?:^|\s)#([A-Za-z0-9_/-]{1,64})")
 FOLDER_KV_RE = re.compile(r"(?:^|\s)(?:folder|dir):([A-Za-z0-9_./-]{1,64})", re.IGNORECASE)
 FORMAT_KV_RE = re.compile(r"(?:^|\s)(?:format|fmt|q):([A-Za-z0-9_+/\[\]<=.,:-]{1,48})", re.IGNORECASE)
@@ -67,6 +79,7 @@ TELEGRAM_PHOTO_MAX_BYTES = 10 * 1024 * 1024
 TELEGRAM_PHOTO_MAX_DIM_SUM = 10000
 TELEGRAM_PHOTO_MAX_SINGLE_DIM = 4096
 TELEGRAM_PHOTO_MAX_ASPECT_RATIO = 5.0
+TELEGRAM_ARCHIVE_REPLY_MAX_ITEMS = 15
 
 
 def _is_photo_fallback_error(exc: Exception) -> bool:
@@ -381,7 +394,13 @@ def parse_folder_from_text(text: str, fallback: str) -> str:
         return sanitize_folder(m.group(1), fallback)
     # If message has no URL and looks like a plain short folder name caption on media
     stripped = text.strip()
-    if stripped and not URL_REGEX.search(stripped) and len(stripped) <= 40 and "\n" not in stripped:
+    if (
+        stripped
+        and not URL_REGEX.search(stripped)
+        and not MAGNET_REGEX.search(stripped)
+        and len(stripped) <= 40
+        and "\n" not in stripped
+    ):
         return sanitize_folder(stripped, fallback)
     return fallback
 
@@ -399,6 +418,7 @@ class TelegramPool:
         self.allocator = allocator
         self.ingest = ingest
         self.subscriptions: Any = None
+        self.torrent_service: Any = None
         self.clients: list[tuple[TelegramApiConfig, TelegramClient]] = []
         self._tasks: list[asyncio.Task] = []
         self._topic_lock = asyncio.Lock()
@@ -1897,6 +1917,7 @@ class TelegramPool:
                 f"Connected via worker `{cfg.name}` (MTProto up to 2 GB, mode: `{self.settings.storage_mode}`).\n"
                 f"Active folder: `{cur_folder}`\n\n"
                 "• Send any URL or photo/video/file up to 2 GB (in DM or in the archive group).\n"
+                "• Send magnet links (`magnet:?xt=...`) or `.torrent` files to leech via aria2c into the vault.\n"
                 "• Specify a folder per message with `#FolderName` or `folder:FolderName` (or post inside a Topic).\n"
                 "• Optional quality: `format:1080p`, `format:720p`, `format:480p`, `format:audio`.\n"
                 "• Bypass duplicate check with `--force` or `force:true`.\n"
@@ -2065,12 +2086,13 @@ class TelegramPool:
                 pass
 
             urls = URL_REGEX.findall(text)
+            magnets = MAGNET_REGEX.findall(text)
             user_default = self.db.get_user_folder(event.sender_id, self.settings.default_folder)
 
             if in_archive_group:
-                # Inside the shared archive supergroup, ingest URLs (with #Folder / folder:Name / current Topic),
+                # Inside the shared archive supergroup, ingest URLs / magnet links (with #Folder / folder:Name / current Topic),
                 # but do not re-ingest raw media uploads already posted into the group.
-                if not urls:
+                if not urls and not magnets:
                     return
                 if not await self._claim_group_message(event.chat_id, event.id):
                     return
@@ -2082,6 +2104,8 @@ class TelegramPool:
                     await self._handle_telegram_url(
                         cfg, event, url, folder, format_spec=fmt_spec, tags=tags, force=force
                     )
+                for magnet in magnets:
+                    await self._handle_telegram_magnet(cfg, event, magnet, folder, tags=tags, force=force)
                 return
 
             folder = parse_folder_from_text(text, user_default)
@@ -2091,17 +2115,279 @@ class TelegramPool:
             if event.message.media and (
                 event.message.photo or event.message.video or event.message.document
             ):
+                if (
+                    bool(event.message.document)
+                    and _extract_filename(event.message).lower().endswith(".torrent")
+                    and self.torrent_service is not None
+                    and self.settings.torrent_enabled
+                ):
+                    await self._handle_telegram_torrent_file(
+                        cfg, event, folder, tags=tags, force=parse_force_from_text(text)
+                    )
+                    return
                 await self._handle_telegram_media(cfg, event, folder, tags=tags)
                 return
 
-            # 2. URLs in DM text
+            # 2. Magnets / URLs in DM text
+            force = parse_force_from_text(text)
+            for magnet in magnets:
+                await self._handle_telegram_magnet(cfg, event, magnet, folder, tags=tags, force=force)
             if urls:
                 fmt_spec = parse_format_from_text(text)
-                force = parse_force_from_text(text)
                 for url in urls:
                     await self._handle_telegram_url(
                         cfg, event, url, folder, format_spec=fmt_spec, tags=tags, force=force
                     )
+
+    def _format_telegram_archive_reply(
+        self, cfg: TelegramApiConfig, items: list[dict[str, Any]], folder: str
+    ) -> str:
+        safe_folder = str(folder or "").replace("`", "'")
+        if items and all(it.get("deduplicated") for it in items):
+            lines = [f"[{cfg.name}] Skipped (duplicate skipped — send with --force to re-ingest):"]
+        else:
+            lines = [f"[{cfg.name}] Saved to `{safe_folder}`:"]
+        shown = items[:TELEGRAM_ARCHIVE_REPLY_MAX_ITEMS]
+        for it in shown:
+            safe_name = str(it.get("filename") or "").replace("`", "'")
+            safe_drive = str(it.get("drive_name") or "").replace("`", "'")
+            topic_note = f" + Topic #{it['telegram_topic_id']}" if it.get("telegram_topic_id") else ""
+            dup_note = " (duplicate skipped — send with --force to re-ingest)" if it.get("deduplicated") else ""
+            lines.append(
+                f"• `{safe_name}` ({fmt_size(it['size_bytes'])}) → `{safe_drive}`{topic_note}{dup_note}\n"
+                f"  View: {self._gallery_link(it['id'])}"
+            )
+        if len(items) > len(shown):
+            lines.append(f"... and {len(items) - len(shown)} more file(s)")
+        return _truncate_utf16("\n".join(lines), 4000)
+
+    async def _handle_telegram_magnet(
+        self,
+        cfg: TelegramApiConfig,
+        event,
+        magnet: str,
+        folder: str,
+        *,
+        tags: list[str] | None = None,
+        force: bool = False,
+    ) -> None:
+        if self.torrent_service is None or not self.settings.torrent_enabled or find_aria2c() is None:
+            await event.reply(f"[{cfg.name}] Torrent leeching is disabled or aria2c is not installed.")
+            return
+        try:
+            clean_magnet = validate_magnet_uri(magnet)
+        except ValueError as exc:
+            await event.reply(f"[{cfg.name}] Invalid magnet link: {exc}")
+            return
+        infohash = extract_magnet_infohash(clean_magnet) or "magnet"
+        try:
+            assert_staging_disk_space(
+                self.settings.staging_dir,
+                0,
+                self.settings.torrent_max_total_bytes,
+                self.settings.torrent_min_free_buffer_bytes,
+            )
+        except TorrentQuotaError as exc:
+            await event.reply(f"[{cfg.name}] Torrent quota exceeded: {exc}")
+            return
+
+        display_ref = _truncate_utf16(clean_magnet, 600)
+        status_msg = await event.reply(f"[{cfg.name}] Queued magnet `{infohash[:12]}…` → `{folder}`...")
+        job_id = self.db.create_job(
+            "telegram",
+            "torrent",
+            clean_magnet,
+            params={
+                "magnet": clean_magnet,
+                "infohash": infohash,
+                "folder": folder,
+                "use_torrent_subfolder": True,
+                "tags": tags,
+                "forward_to_telegram": True,
+                "force": force,
+                "source_origin": "telegram",
+            },
+        )
+        last_edit = 0.0
+
+        async def progress_edit(pct: float, msg: str) -> None:
+            nonlocal last_edit
+            now = time.monotonic()
+            if now - last_edit >= 3.0:
+                last_edit = now
+                try:
+                    await status_msg.edit(f"[{cfg.name}] `{folder}` • {pct:.0f}%\n{msg}")
+                except Exception:
+                    pass
+
+        try:
+            task = self.ingest.submit_job(
+                job_id,
+                self.torrent_service.process_torrent_job(
+                    job_id,
+                    magnet=clean_magnet,
+                    source_origin="telegram",
+                    folder=folder,
+                    use_torrent_subfolder=True,
+                    tags=tags,
+                    forward_to_telegram=True,
+                    force=force,
+                    on_progress=progress_edit,
+                ),
+            )
+            items = await task
+            if items is None:
+                job = self.db.get_job(job_id)
+                if job and job.get("status") == "cancelled":
+                    await status_msg.edit(f"[{cfg.name}] Cancelled: {display_ref}")
+                    return
+                raise RuntimeError((job.get("message") if job else None) or "Ingest failed")
+
+            await status_msg.edit(self._format_telegram_archive_reply(cfg, items, folder))
+        except asyncio.CancelledError:
+            await status_msg.edit(f"[{cfg.name}] Cancelled: {display_ref}")
+        except FloodWaitError as fw:
+            self._record_flood_wait(cfg.name, fw.seconds)
+            self.db.update_job(job_id, status="failed", message=f"Telegram flood wait: {fw.seconds}s")
+            await status_msg.edit(f"[{cfg.name}] Rate limited by Telegram for {fw.seconds}s. Try another worker/bot.")
+        except Exception as exc:
+            err_msg = _truncate_utf16(str(exc), 1500)
+            await status_msg.edit(f"[{cfg.name}] Failed:\n`{err_msg}`")
+
+    async def _download_bounded_torrent_bytes(self, event) -> bytes | None:
+        """Download a .torrent attachment with a strict byte ceiling and timeout."""
+        client = getattr(event, "client", None)
+        doc = getattr(event.message, "document", None)
+        if client is not None and doc is not None and hasattr(client, "iter_download"):
+            buf = bytearray()
+
+            async def _stream() -> bytes | None:
+                async for chunk in client.iter_download(doc):
+                    buf.extend(chunk)
+                    if len(buf) > MAX_TORRENT_FILE_BYTES:
+                        return None
+                return bytes(buf)
+
+            return await asyncio.wait_for(_stream(), timeout=30.0)
+
+        raw = await asyncio.wait_for(event.message.download_media(file=bytes), timeout=30.0)
+        if not isinstance(raw, (bytes, bytearray)) or not raw or len(raw) > MAX_TORRENT_FILE_BYTES:
+            return None
+        return bytes(raw)
+
+    async def _handle_telegram_torrent_file(
+        self,
+        cfg: TelegramApiConfig,
+        event,
+        folder: str,
+        *,
+        tags: list[str] | None = None,
+        force: bool = False,
+    ) -> None:
+        if self.torrent_service is None or not self.settings.torrent_enabled or find_aria2c() is None:
+            await event.reply(f"[{cfg.name}] Torrent leeching is disabled or aria2c is not installed.")
+            return
+        total_size = event.message.file.size if event.message.file else 0
+        if total_size > MAX_TORRENT_FILE_BYTES:
+            await event.reply(f"[{cfg.name}] .torrent file exceeds maximum allowed metadata size (20 MB).")
+            return
+        try:
+            raw = await self._download_bounded_torrent_bytes(event)
+        except asyncio.TimeoutError:
+            await event.reply(f"[{cfg.name}] Timed out downloading .torrent metadata file.")
+            return
+        if not raw or len(raw) > MAX_TORRENT_FILE_BYTES:
+            await event.reply(f"[{cfg.name}] Failed to download .torrent metadata file (empty or exceeds 20 MB limit).")
+            return
+        try:
+            parsed = await asyncio.to_thread(parse_torrent_bytes, raw)
+        except (TorrentError, ValueError) as exc:
+            await event.reply(f"[{cfg.name}] Invalid .torrent file: {exc}")
+            return
+        selected_indices = [f["index"] for f in parsed["files"] if f.get("selected_default")]
+        if not selected_indices:
+            selected_indices = [f["index"] for f in parsed["files"]]
+        selected_set = set(selected_indices)
+        selected_bytes = sum(f["size_bytes"] for f in parsed["files"] if f["index"] in selected_set)
+        try:
+            assert_staging_disk_space(
+                self.settings.staging_dir,
+                selected_bytes,
+                self.settings.torrent_max_total_bytes,
+                self.settings.torrent_min_free_buffer_bytes,
+            )
+        except TorrentQuotaError as exc:
+            await event.reply(f"[{cfg.name}] Torrent quota exceeded: {exc}")
+            return
+
+        status_msg = await event.reply(
+            f"[{cfg.name}] Leeching `{parsed['name']}` ({len(selected_indices)}/{parsed['file_count']} file(s), {fmt_size(selected_bytes)}) → `{folder}`..."
+        )
+        job_ref = f"torrent:{parsed['infohash']}:{parsed['name']}"
+        job_id = self.db.create_job(
+            "telegram",
+            "torrent",
+            job_ref,
+            params={
+                "infohash": parsed["infohash"],
+                "name": parsed["name"],
+                "selected_indices": selected_indices,
+                "folder": folder,
+                "use_torrent_subfolder": True,
+                "tags": tags,
+                "forward_to_telegram": True,
+                "force": force,
+                "source_origin": "telegram",
+            },
+        )
+        last_edit = 0.0
+
+        async def progress_edit(pct: float, msg: str) -> None:
+            nonlocal last_edit
+            now = time.monotonic()
+            if now - last_edit >= 3.0:
+                last_edit = now
+                try:
+                    await status_msg.edit(f"[{cfg.name}] `{folder}` • {pct:.0f}%\n{msg}")
+                except Exception:
+                    pass
+
+        display_ref = _truncate_utf16(job_ref, 600)
+
+        try:
+            task = self.ingest.submit_job(
+                job_id,
+                self.torrent_service.process_torrent_job(
+                    job_id,
+                    torrent_bytes=bytes(raw),
+                    selected_indices=selected_indices,
+                    source_origin="telegram",
+                    folder=folder,
+                    use_torrent_subfolder=True,
+                    tags=tags,
+                    forward_to_telegram=True,
+                    force=force,
+                    on_progress=progress_edit,
+                ),
+            )
+            items = await task
+            if items is None:
+                job = self.db.get_job(job_id)
+                if job and job.get("status") == "cancelled":
+                    await status_msg.edit(f"[{cfg.name}] Cancelled: {display_ref}")
+                    return
+                raise RuntimeError((job.get("message") if job else None) or "Ingest failed")
+
+            await status_msg.edit(self._format_telegram_archive_reply(cfg, items, folder))
+        except asyncio.CancelledError:
+            await status_msg.edit(f"[{cfg.name}] Cancelled: {display_ref}")
+        except FloodWaitError as fw:
+            self._record_flood_wait(cfg.name, fw.seconds)
+            self.db.update_job(job_id, status="failed", message=f"Telegram flood wait: {fw.seconds}s")
+            await status_msg.edit(f"[{cfg.name}] Rate limited by Telegram for {fw.seconds}s. Try another worker/bot.")
+        except Exception as exc:
+            err_msg = _truncate_utf16(str(exc), 1500)
+            await status_msg.edit(f"[{cfg.name}] Failed:\n`{err_msg}`")
 
     async def _handle_telegram_url(
         self,

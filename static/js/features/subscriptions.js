@@ -421,13 +421,16 @@ function renderCard(sub) {
   const checking = isBusy(id, "check");
   const previewing = isBusy(id, "dry-run");
   const toggling = isBusy(id, "toggle");
+  const backfilling = isBusy(id, "backfill");
 
   const preview = previews.has(id)
     ? `<div class="sub-preview-slot">${renderPreview(id, previews.get(id))}</div>`
     : "";
   const drawer = drawers.has(id)
-    ? `<div class="sub-drawer-slot">${renderDrawer(id, drawers.get(id))}</div>`
+    ? `<div class="sub-drawer-slot">${renderDrawer(id, drawers.get(id), sub)}</div>`
     : "";
+
+  const showCardBackfill = isSeeded(sub) && archived === 0;
 
   return `
     <div class="sys-card sub-card" data-sub-id="${E(id)}">
@@ -440,6 +443,7 @@ function renderCard(sub) {
         <div class="sys-actions-row sub-card-actions">
           ${subButton(id, "toggle", toggling ? "Saving…" : isPaused(sub) ? "Enable" : "Pause", { disabled: toggling })}
           ${subButton(id, "check", checking ? "Checking…" : "Check Now", { disabled: checking })}
+          ${showCardBackfill ? subButton(id, "backfill", backfilling ? "Queuing…" : "Download Seen", { disabled: backfilling }) : ""}
           ${subButton(id, "dry-run", previewing ? "Previewing…" : "Preview / Dry Run", { disabled: previewing })}
           ${subButton(id, "entries", drawers.has(id) ? "Hide Entries" : "Entries")}
           ${subButton(id, "edit", "Edit")}
@@ -544,13 +548,18 @@ function entryStatusPill(status) {
   return `<span class="pill pill-compact">${E(s || "unknown")}</span>`;
 }
 
-function renderEntryRow(entry) {
+function renderEntryRow(entry, subId) {
   const title = String(entry?.title || entry?.entry_key || "(untitled)");
   const when = entry?.published_at || entry?.first_seen_at || entry?.last_attempt_at;
   const error = String(entry?.error || "");
   const mediaId = String(entry?.media_id || "");
+  const entryKey = String(entry?.entry_key || "");
+  const st = String(entry?.status ?? "").toLowerCase();
+  const canQueue = !mediaId && entryKey && ["seen", "skipped", "failed"].includes(st);
+  const queueing = canQueue && isBusy(subId, `q:${entryKey}`);
+  const queueLabel = queueing ? "Queuing…" : st === "failed" ? "Retry" : "Download";
   return `
-    <div class="sub-entry-row" data-entry-key="${E(entry?.entry_key || "")}">
+    <div class="sub-entry-row" data-entry-key="${E(entryKey)}">
       <div class="sub-entry-main">
         <div class="sub-entry-title">${renderTitleLink(title, entry?.url)}</div>
         <div class="sub-entry-meta">
@@ -559,15 +568,20 @@ function renderEntryRow(entry) {
         </div>
         ${error ? `<div class="sub-entry-error">${E(error)}</div>` : ""}
       </div>
-      ${mediaId ? `<div class="sub-entry-actions"><button type="button" class="secondary btn-xs" data-sub-media="${E(mediaId)}">View</button></div>` : ""}
+      <div class="sub-entry-actions">
+        ${mediaId ? `<button type="button" class="secondary btn-xs" data-sub-media="${E(mediaId)}">View</button>` : ""}
+        ${canQueue ? `<button type="button" class="secondary btn-xs" data-sub-action="queue-entry" data-sub-id="${E(subId)}" data-entry-key="${E(entryKey)}"${queueing ? " disabled" : ""}>${E(queueLabel)}</button>` : ""}
+      </div>
     </div>
   `;
 }
 
-function renderDrawer(id, drawer) {
+function renderDrawer(id, drawer, sub) {
   const d = drawer || {};
   const status = String(d.status || "all");
   const entries = Array.isArray(d.entries) ? d.entries : [];
+  const backfilling = isBusy(id, "backfill");
+  const maxPerCheck = Math.max(1, n(sub?.max_items_per_check) || 10);
   const filters = ENTRY_FILTERS.map(
     (f) =>
       `<button type="button" class="sub-filter-btn${status === f.id ? " is-active" : ""}" data-sub-entry-status="${E(f.id)}">${E(f.label)}</button>`
@@ -576,7 +590,7 @@ function renderDrawer(id, drawer) {
   const body = d.error
     ? `<div class="sub-entry-error">${E(d.error)}</div>`
     : entries.length
-      ? `<div class="sub-entry-list">${entries.map(renderEntryRow).join("")}</div>`
+      ? `<div class="sub-entry-list">${entries.map((entry) => renderEntryRow(entry, id)).join("")}</div>`
       : d.loading
         ? `<div class="sys-loading">Loading entries…</div>`
         : `<div class="sub-empty small-muted">No entries match this filter.</div>`;
@@ -584,8 +598,11 @@ function renderDrawer(id, drawer) {
   return `
     <div class="sub-drawer">
       <div class="sub-drawer-head">
-        <strong>Entry history</strong>
-        <span class="small-muted">${E(n(d.total))} recorded</span>
+        <div class="sys-actions-row">
+          <strong>Entry history</strong>
+          <span class="small-muted">${E(n(d.total))} recorded</span>
+        </div>
+        ${subButton(id, "backfill", backfilling ? "Queuing…" : `Download Seen (up to ${maxPerCheck})`, { disabled: backfilling })}
       </div>
       <div class="sub-entry-filters">${filters}</div>
       ${body}
@@ -780,11 +797,24 @@ async function runCheck(id, view, dryRun) {
         type: "info",
       });
     } else {
-      toast(
-        `Check complete: ${n(result?.queued_count)} queued, ${n(result?.seeded_count)} seeded.`,
-        { type: "success" }
-      );
+      const queued = n(result?.queued_count);
+      const seeded = n(result?.seeded_count);
+      const seen = n(result?.skipped_seen_count);
+      if (queued === 0 && seeded === 0 && seen > 0) {
+        toast(
+          `No new uploads (${seen} already marked seen). Click "Download Seen" or open Entries → Download to fetch older items.`,
+          { type: "info" }
+        );
+      } else {
+        toast(
+          `Check complete: ${queued} queued, ${seeded} seeded.`,
+          { type: "success" }
+        );
+      }
       await loadSubscriptionsTab(view, { silent: true });
+      if (drawers.has(id)) {
+        await loadEntries(id, view, { append: false });
+      }
     }
   } catch (err) {
     if (dryRun) {
@@ -793,6 +823,75 @@ async function runCheck(id, view, dryRun) {
       loadSubscriptionsTab(view, { silent: true }).catch(() => {});
     }
     toast(`Check failed: ${err.message}`, { type: "error" });
+  } finally {
+    busyActions.delete(key);
+    if (view && subsCache) renderSubscriptionsView(view, subsCache);
+  }
+}
+
+async function queueEntry(id, entryKey, view) {
+  const key = subKey(id, `q:${entryKey}`);
+  if (busyActions.has(key)) return;
+  busyActions.add(key);
+  if (view && subsCache) renderSubscriptionsView(view, subsCache);
+  try {
+    const result = await apiFetch(
+      `/api/subscriptions/${encodeURIComponent(id)}/entries/queue`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ entry_key: entryKey }),
+      }
+    );
+    if (result?.queued) {
+      toast("Queued item for download.", { type: "success" });
+    } else {
+      toast(`Item already ${result?.reason || "processed"}.`, { type: "info" });
+    }
+    if (drawers.has(id)) {
+      await loadEntries(id, view, { append: false });
+    }
+  } catch (err) {
+    toast(`Failed queuing item: ${err.message}`, { type: "error" });
+  } finally {
+    busyActions.delete(key);
+    if (view && subsCache) renderSubscriptionsView(view, subsCache);
+  }
+}
+
+async function backfillSub(id, view) {
+  const key = subKey(id, "backfill");
+  if (busyActions.has(key)) return;
+  busyActions.add(key);
+  if (view && subsCache) renderSubscriptionsView(view, subsCache);
+  try {
+    const result = await apiFetch(
+      `/api/subscriptions/${encodeURIComponent(id)}/backfill`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      }
+    );
+    const queued = n(result?.queued_count);
+    const dupes = n(result?.skipped_duplicate_count);
+    if (queued > 0) {
+      toast(
+        `Queued ${queued} seen item(s) for download${dupes ? ` (${dupes} already in vault)` : ""}.`,
+        { type: "success" }
+      );
+    } else {
+      toast(
+        dupes ? `All ${dupes} seen item(s) are already in the vault.` : "No seen items left to queue.",
+        { type: "info" }
+      );
+    }
+    await loadSubscriptionsTab(view, { silent: true });
+    if (drawers.has(id)) {
+      await loadEntries(id, view, { append: false });
+    }
+  } catch (err) {
+    toast(`Failed queuing seen items: ${err.message}`, { type: "error" });
   } finally {
     busyActions.delete(key);
     if (view && subsCache) renderSubscriptionsView(view, subsCache);
@@ -1016,6 +1115,13 @@ export function handleSubscriptionsClick(e) {
   } else if (action === "check") {
     e.preventDefault();
     runCheck(id, view, false);
+  } else if (action === "backfill") {
+    e.preventDefault();
+    backfillSub(id, view);
+  } else if (action === "queue-entry") {
+    e.preventDefault();
+    const entryKey = actionBtn.dataset.entryKey || "";
+    if (entryKey) queueEntry(id, entryKey, view);
   } else if (action === "dry-run") {
     e.preventDefault();
     runCheck(id, view, true);

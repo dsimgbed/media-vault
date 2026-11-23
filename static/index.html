@@ -91,11 +91,13 @@
             <input id="tgForwardCheck" type="checkbox" checked />
             Forward to Telegram Topic
           </label>
+          <label class="checkbox-label"><input id="galleryModeCheck" type="checkbox" /> Gallery mode (gallery-dl)</label>
+          <select id="galleryArchiveMode" class="gallery-mode-select" hidden><option value="items">Individual Files</option><option value="cbz">Pack as CBZ (Comic)</option><option value="zip">Pack as ZIP</option></select> <span id="galleryInstallHint" class="small-muted gallery-hint" hidden>Install gallery-dl: pip install gallery-dl</span>
         </div>
       </div>
 
       <form id="urlForm" class="url-row">
-        <textarea id="urlInput" rows="1" placeholder="Paste one or more URLs (one per line) — yt-dlp, playlists, or direct links..." required></textarea>
+        <textarea id="urlInput" rows="1" placeholder="Paste URLs, magnet:? links, or gallery URLs (one per line)..." required></textarea>
         <select id="formatSelect" class="format-select" title="Download quality / format">
           <option value="best">Format: Best MP4</option>
           <option value="1080p">1080p MP4</option>
@@ -105,16 +107,19 @@
         </select>
         <button type="button" id="inspectFormatsBtn" class="secondary" title="Inspect available yt-dlp formats for this URL">Formats</button>
         <button type="button" id="inspectPlaylistBtn" class="secondary" title="Preview and cherry-pick playlist items">Playlist</button>
+        <button type="button" id="inspectTorrentBtn" class="secondary" title="Inspect torrent metadata (magnet or .torrent)">Inspect Torrent</button>
         <button type="submit">Send</button>
       </form>
 
       <div class="drop-row">
         <div id="dropzone" class="dropzone">
-          <strong>Drop files or folders here</strong> (or click to choose — up to <span id="maxMbLabel">20480</span> MB)
+          <strong>Drop files, folders, or .torrent</strong> (or click to choose — up to <span id="maxMbLabel">20480</span> MB)
           <input id="fileInput" type="file" multiple hidden />
           <input id="folderUploadInput" type="file" webkitdirectory directory multiple hidden />
+          <input id="torrentFileInput" type="file" accept=".torrent,application/x-bittorrent" hidden />
         </div>
         <button type="button" id="selectFolderBtn" class="secondary select-folder-btn">Select Folder</button>
+        <button type="button" id="selectTorrentBtn" class="secondary select-folder-btn">Leech .torrent</button>
       </div>
       <div id="uploadProgress" class="upload-progress">
         <div class="upload-progress-head"><span id="uploadProgressText">Uploading...</span><button id="cancelFolderUploadBtn" type="button" class="danger btn-xs" hidden>Cancel</button></div>

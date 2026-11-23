@@ -9,7 +9,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from app.allocator import sanitize_folder
 from app.context import AppContext
 from app.db import normalize_source_url
+from app.gallery_ingest import get_gallery_dl_status
 from app.ingest import expand_ytdlp_playlist, list_ytdlp_formats
+from app.torrent_ingest import find_aria2c, get_aria2c_version
 from app.routers.deps import get_ctx, require_auth
 from app.schemas import CookiesRequest, FormatsRequest, PlaylistRequest
 
@@ -28,6 +30,7 @@ async def health(ctx: AppContext = Depends(get_ctx)):
         ytdlp_ver = "unknown"
     telemetry = ctx.tg_pool.get_telemetry()
     latest_backup = ctx.db.get_latest_backup_record()
+    gallery_st = ctx.gallery.get_status() if ctx.gallery else get_gallery_dl_status(cfg)
     webdav_summary = cfg.get_webdav_status_summary()
     return {
         "ok": True,
@@ -50,6 +53,12 @@ async def health(ctx: AppContext = Depends(get_ctx)):
         "ytdlp_cookies_configured": cookies_ok,
         "ytdlp_version": ytdlp_ver,
         "subscriptions_enabled": bool(cfg.subscriptions_enabled),
+        "torrent_enabled": bool(cfg.torrent_enabled),
+        "aria2c_installed": bool(ctx.torrent.get_status()["aria2c_installed"]) if ctx.torrent else (find_aria2c() is not None),
+        "aria2c_version": ctx.torrent.get_status()["aria2c_version"] if ctx.torrent else get_aria2c_version(),
+        "gallery_dl_enabled": bool(cfg.gallery_dl_enabled),
+        "gallery_dl_installed": bool(gallery_st["installed"]),
+        "gallery_dl_version": gallery_st["version"],
         "webdav_enabled": webdav_summary["enabled"],
         "webdav_auth_required": webdav_summary["auth_required"],
         "webdav_configured": webdav_summary["configured"],
@@ -80,6 +89,10 @@ async def system_status(ctx: AppContext = Depends(get_ctx)):
             if hasattr(ctx.zip_cache, "stats")
             else {"l1_entries": len(ctx.zip_cache)}
         ),
+        "leech": {
+            "torrent": ctx.torrent.get_status() if ctx.torrent else {},
+            "gallery_dl": ctx.gallery.get_status() if ctx.gallery else get_gallery_dl_status(cfg),
+        },
         "ingest": {
             "concurrency": cfg.ingest_concurrency,
             "active_jobs": ctx.ingest.has_active_jobs(),

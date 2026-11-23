@@ -1734,3 +1734,83 @@ def test_service_bounds_and_credential_redaction(tmp_path: Path):
     assert "topsecret" not in (stored["last_error"] or "")
     assert "http://***@proxy.example.com:8080" in (stored["last_error"] or "")
 
+
+def test_queue_existing_entry_and_backfill_api(tmp_path: Path):
+    app, _settings = _make_api_app(tmp_path, enabled=False)
+    headers = {"Authorization": f"Bearer {AUTH_TOKEN}"}
+    subs = app.state.subscriptions
+    db = app.state.db
+
+    submitted: list[str] = []
+    app.state.ingest.submit_job = lambda job_id, coro: (submitted.append(job_id), coro.close())[0]
+
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/subscriptions",
+            json={
+                "source_url": "https://example.com/feed.xml",
+                "name": "Seeded Feed",
+                "seed_only": True,
+                "initial_backfill_limit": 0,
+                "max_items_per_check": 2,
+            },
+            headers=headers,
+        ).json()
+        sub_id = created["id"]
+
+        # Seed 3 entries via first check
+        _install_discovery(
+            subs,
+            [
+                _entry("e1", "https://example.com/v1.mp4", "Video 1"),
+                _entry("e2", "https://example.com/v2.mp4", "Video 2"),
+                _entry("e3", "https://example.com/v3.mp4", "Video 3"),
+            ],
+        )
+        r_check = client.post(f"/api/subscriptions/{sub_id}/check", headers=headers)
+        assert r_check.status_code == 200
+        assert r_check.json()["seeded_count"] == 3
+        assert r_check.json()["queued_count"] == 0
+
+        # Queue one specific seen entry
+        r_one = client.post(
+            f"/api/subscriptions/{sub_id}/entries/queue",
+            json={"entry_key": "e1"},
+            headers=headers,
+        )
+        assert r_one.status_code == 200
+        assert r_one.json()["queued"] is True
+        assert len(submitted) == 1
+
+        # Re-queuing already queued entry returns queued=False cleanly
+        r_again = client.post(
+            f"/api/subscriptions/{sub_id}/entries/queue",
+            json={"entry_key": "e1"},
+            headers=headers,
+        )
+        assert r_again.status_code == 200
+        assert r_again.json()["queued"] is False
+        assert r_again.json()["reason"] == "queued"
+
+        # Backfill remaining seen entries (max_items_per_check=2 -> e2 and e3)
+        _insert_media(db, "m-dup", "https://example.com/v3.mp4", title="Video 3")
+        r_backfill = client.post(
+            f"/api/subscriptions/{sub_id}/backfill",
+            json={},
+            headers=headers,
+        )
+        assert r_backfill.status_code == 200
+        bf = r_backfill.json()
+        assert bf["queued_count"] == 1
+        assert bf["skipped_duplicate_count"] == 1
+        assert len(submitted) == 2
+
+        # Missing entry returns 404
+        r_missing = client.post(
+            f"/api/subscriptions/{sub_id}/entries/queue",
+            json={"entry_key": "does-not-exist"},
+            headers=headers,
+        )
+        assert r_missing.status_code == 404
+
+

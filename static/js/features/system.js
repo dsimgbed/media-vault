@@ -27,6 +27,12 @@ export async function loadHealth() {
   state.uploadChunkSizeMb = Number(data.upload_chunk_size_mb || 8);
   state.failedUploadRetentionSec = Number(data.failed_upload_retention_sec ?? 3600);
   state.telegramArchiveEnabled = Boolean(data.telegram_archive_enabled);
+  state.torrentEnabled = Boolean(data.torrent_enabled);
+  state.aria2cInstalled = Boolean(data.aria2c_installed);
+  state.aria2cVersion = data.aria2c_version || null;
+  state.galleryDlEnabled = Boolean(data.gallery_dl_enabled);
+  state.galleryDlInstalled = Boolean(data.gallery_dl_installed);
+  state.galleryDlVersion = data.gallery_dl_version || null;
 
   const folderInput = $("folderInput");
   if (folderInput && !folderInput.value) {
@@ -78,6 +84,8 @@ export async function loadHealth() {
     tgForwardLabel.style.display =
       state.storageMode === "both" && data.telegram_archive_enabled ? "flex" : "none";
   }
+
+  emit("health:loaded", data);
 }
 
 async function handleSaveToken(inputEl) {

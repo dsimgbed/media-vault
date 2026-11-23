@@ -270,10 +270,13 @@ async def _download_ddl(
             "--content-disposition-default-utf8=true",
             "--auto-file-renaming=true",
             "--summary-interval=1",
+            "--follow-metalink=false",
+            "--seed-time=0",
+            "--seed-ratio=0.0",
         ]
         if http_proxy:
             aria_args.extend(["--all-proxy", http_proxy])
-        aria_args.append(url)
+        aria_args.extend(["--", url])
         code, tail = await _invoke_streaming(
             *aria_args,
             on_line=handle_aria_line,
@@ -689,6 +692,8 @@ class IngestService:
         self.allocator = allocator
         self.mirror_hook: MirrorHook | None = None
         self.upload_service: Any = None
+        self.torrent_service: Any = None
+        self.gallery_service: Any = None
         self._configured_concurrency = max(1, int(settings.ingest_concurrency))
         self._semaphore = asyncio.Semaphore(self._configured_concurrency)
         self._background_tasks: set[asyncio.Task[Any]] = set()
@@ -876,6 +881,10 @@ class IngestService:
         if job.get("status") not in ("failed", "cancelled"):
             return False
         params = self._parse_job_params(job)
+        if job.get("source_kind") == "gallery":
+            return bool(params.get("url") or str(job.get("source_ref") or "").startswith(("http://", "https://"))) and self.gallery_service is not None
+        if job.get("source_kind") == "torrent":
+            return bool(params.get("magnet") or str(job.get("source_ref") or "").lower().startswith("magnet:?")) and self.torrent_service is not None
         is_url_job = (
             job.get("source_kind") == "url"
             or bool(params.get("url"))
@@ -1007,6 +1016,68 @@ class IngestService:
             raise ValueError("Only failed or cancelled jobs can be retried")
 
         params = self._parse_job_params(job)
+        if job["source_kind"] == "gallery":
+            if not self.gallery_service:
+                raise ValueError("gallery service unavailable")
+            claimed = self.db.claim_job_for_retry(
+                job_id, progress=0.0, message="Queued (retry)"
+            )
+            if not claimed:
+                raise ValueError("Job cannot be retried in its current state")
+            self._cancelled_jobs.discard(job_id)
+            effective_force = bool(force or params.get("force", False))
+            clean_url = str(params.get("url") or job["source_ref"])
+            bounded_max = params.get("max_items")
+            self.submit_job(
+                job_id,
+                self.gallery_service.ingest_gallery_job(
+                    job_id,
+                    clean_url,
+                    source_origin=str(params.get("source_origin") or job["source_origin"]),
+                    folder=params.get("folder"),
+                    tags=params.get("tags"),
+                    title=params.get("title"),
+                    archive_mode=params.get("archive_mode", "items"),
+                    max_items=bounded_max,
+                    forward_to_telegram=bool(params.get("forward_to_telegram", True)),
+                    force=effective_force,
+                ),
+            )
+            updated = self.db.get_job(job_id)
+            assert updated is not None
+            return self.hydrate_job(updated)
+
+        if job["source_kind"] == "torrent":
+            magnet = params.get("magnet")
+            if not magnet and str(job.get("source_ref") or "").lower().startswith("magnet:?"):
+                magnet = job["source_ref"]
+            if not magnet or self.torrent_service is None:
+                raise ValueError("Uploaded .torrent jobs without a magnet URI cannot be retried; please re-submit the .torrent file.")
+            claimed = self.db.claim_job_for_retry(
+                job_id, progress=0.0, message="Queued (retry)"
+            )
+            if not claimed:
+                raise ValueError("Job cannot be retried in its current state")
+            self._cancelled_jobs.discard(job_id)
+            effective_force = bool(force or params.get("force", False))
+            self.submit_job(
+                job_id,
+                self.torrent_service.process_torrent_job(
+                    job_id,
+                    magnet=magnet,
+                    selected_indices=params.get("selected_indices"),
+                    source_origin=str(params.get("source_origin") or job["source_origin"]),
+                    folder=params.get("folder"),
+                    use_torrent_subfolder=bool(params.get("use_torrent_subfolder", True)),
+                    tags=params.get("tags"),
+                    forward_to_telegram=bool(params.get("forward_to_telegram", True)),
+                    force=effective_force,
+                ),
+            )
+            updated = self.db.get_job(job_id)
+            assert updated is not None
+            return self.hydrate_job(updated)
+
         is_url_job = (
             job["source_kind"] == "url"
             or bool(params.get("url"))

@@ -12,6 +12,7 @@ import {
   getActiveUploadCount,
 } from "/static/js/features/upload-queue.js";
 import { openPlaylistPicker } from "/static/js/features/playlist-picker.js";
+import { openTorrentPicker } from "/static/js/features/torrent-picker.js";
 
 let folderUploadController = null;
 
@@ -51,6 +52,40 @@ function currentUploadOptions() {
     forwardToTelegram: shouldForwardToTelegram(),
     force: shouldForceIngest(),
   };
+}
+
+function isMagnetUri(s) {
+  return /^magnet:\?/i.test(String(s || "").trim());
+}
+
+function isTorrentFile(file) {
+  return Boolean(file && /\.torrent$/i.test(file.name || ""));
+}
+
+function syncGalleryControls() {
+  const galleryMode = Boolean($("galleryModeCheck")?.checked);
+  const archiveModeEl = $("galleryArchiveMode");
+  const maxItemsEl = $("galleryMaxItems");
+  const installHint = $("galleryInstallHint");
+  const formatSelect = $("formatSelect");
+  const inspectFormatsBtn = $("inspectFormatsBtn");
+  const inspectPlaylistBtn = $("inspectPlaylistBtn");
+
+  if (galleryMode) {
+    if (archiveModeEl) archiveModeEl.hidden = false;
+    if (maxItemsEl) maxItemsEl.hidden = false;
+    if (formatSelect) formatSelect.hidden = true;
+    if (inspectFormatsBtn) inspectFormatsBtn.hidden = true;
+    if (inspectPlaylistBtn) inspectPlaylistBtn.hidden = true;
+    if (installHint) installHint.hidden = !(state.galleryDlInstalled && state.galleryDlEnabled);
+  } else {
+    if (archiveModeEl) archiveModeEl.hidden = true;
+    if (maxItemsEl) maxItemsEl.hidden = true;
+    if (formatSelect) formatSelect.hidden = false;
+    if (inspectFormatsBtn) inspectFormatsBtn.hidden = false;
+    if (inspectPlaylistBtn) inspectPlaylistBtn.hidden = false;
+    if (installHint) installHint.hidden = true;
+  }
 }
 
 async function submitUrlIngest(url, formatSpec) {
@@ -164,6 +199,47 @@ async function collectEntryFiles(entry, prefix = "") {
   return [];
 }
 
+async function handleIncomingFiles(files) {
+  const list = Array.from(files || []).filter(Boolean);
+  const torrentFiles = list.filter((f) => isTorrentFile(f));
+  const regularFiles = list.filter((f) => !isTorrentFile(f));
+
+  if (torrentFiles.length === 1 && regularFiles.length === 0 && state.torrentEnabled) {
+    await openTorrentPicker(
+      { file: torrentFiles[0] },
+      {
+        defaultFolder: selectedFolder(),
+        defaultTags: selectedTags(),
+        forwardToTelegram: shouldForwardToTelegram(),
+        defaultForce: shouldForceIngest(),
+      }
+    );
+    return;
+  }
+
+  if (torrentFiles.length > 0 && state.torrentEnabled) {
+    const firstTorrent = torrentFiles[0];
+    if (torrentFiles.length > 1) {
+      toast(`Only inspecting the first of ${torrentFiles.length} .torrent file(s).`, { type: "info" });
+    }
+    await openTorrentPicker(
+      { file: firstTorrent },
+      {
+        defaultFolder: selectedFolder(),
+        defaultTags: selectedTags(),
+        forwardToTelegram: shouldForwardToTelegram(),
+        defaultForce: shouldForceIngest(),
+      }
+    );
+    if (regularFiles.length) {
+      enqueueFiles(regularFiles, currentUploadOptions());
+    }
+    return;
+  }
+
+  enqueueFiles(list, currentUploadOptions());
+}
+
 export function initUploader() {
   initUploadQueue();
 
@@ -184,6 +260,58 @@ export function initUploader() {
     e.preventDefault();
     const url = $("urlInput").value.trim();
     if (!url) return;
+
+    const lines = url.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    const singleUrl = lines.length === 1 ? lines[0] : "";
+    if (singleUrl && isMagnetUri(singleUrl)) {
+      await openTorrentPicker(
+        { magnet: singleUrl },
+        {
+          defaultFolder: selectedFolder(),
+          defaultTags: selectedTags(),
+          forwardToTelegram: shouldForwardToTelegram(),
+          defaultForce: shouldForceIngest(),
+        }
+      );
+      return;
+    }
+
+    if ($("galleryModeCheck")?.checked) {
+      if (!state.galleryDlEnabled) {
+        toast("gallery-dl ingestion is disabled on this server.", { type: "error" });
+        return;
+      }
+      if (!state.galleryDlInstalled) {
+        toast("gallery-dl is not installed on this server (run: pip install gallery-dl)", { type: "error" });
+        return;
+      }
+      const galleryUrls = lines.filter(Boolean);
+      try {
+        for (const line of galleryUrls) {
+          await apiFetch("/api/ingest/gallery", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              url: line,
+              folder: selectedFolder(),
+              tags: selectedTags(),
+              archive_mode: $("galleryArchiveMode")?.value || "items",
+              max_items: Number($("galleryMaxItems")?.value || 200),
+              forward_to_telegram: shouldForwardToTelegram(),
+              force: shouldForceIngest(),
+            }),
+          });
+        }
+        $("urlInput").value = "";
+        $("urlInput").rows = 1;
+        await loadJobs();
+        toast(`Queued ${galleryUrls.length} gallery job(s).`, { type: "success" });
+      } catch (err) {
+        toast(`Gallery ingest failed: ${err.message}`, { type: "error" });
+      }
+      return;
+    }
+
     try {
       await submitUrlIngest(url, $("formatSelect").value);
     } catch (err) {
@@ -205,6 +333,27 @@ export function initUploader() {
       defaultForce: shouldForceIngest(),
     });
   });
+
+  $("inspectTorrentBtn")?.addEventListener("click", async () => {
+    const magnet = $("urlInput").value.split(/\r?\n/).map((s) => s.trim()).find((s) => isMagnetUri(s)) || "";
+    if (!magnet) {
+      toast("Paste a magnet:? link or drop a .torrent file to inspect.", { type: "error" });
+      return;
+    }
+    await openTorrentPicker(
+      { magnet },
+      {
+        defaultFolder: selectedFolder(),
+        defaultTags: selectedTags(),
+        forwardToTelegram: shouldForwardToTelegram(),
+        defaultForce: shouldForceIngest(),
+      }
+    );
+  });
+
+  $("galleryModeCheck")?.addEventListener("change", syncGalleryControls);
+  on("health:loaded", syncGalleryControls);
+  syncGalleryControls();
 
   $("closeFormatsBtn")?.addEventListener("click", () => $("formatsModal").close());
   $("formatsModal")?.addEventListener("click", (e) => {
@@ -304,12 +453,29 @@ export function initUploader() {
   const dz = $("dropzone");
   dz?.addEventListener("click", () => $("fileInput").click());
   $("selectFolderBtn")?.addEventListener("click", () => $("folderUploadInput").click());
-  $("fileInput")?.addEventListener("change", (e) => {
+  $("fileInput")?.addEventListener("change", async (e) => {
     const files = Array.from(e.target.files || []);
     e.target.value = "";
     if (files.length) {
-      enqueueFiles(files, currentUploadOptions());
+      await handleIncomingFiles(files);
     }
+  });
+  $("selectTorrentBtn")?.addEventListener("click", () => {
+    $("torrentFileInput")?.click();
+  });
+  $("torrentFileInput")?.addEventListener("change", async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    await openTorrentPicker(
+      { file },
+      {
+        defaultFolder: selectedFolder(),
+        defaultTags: selectedTags(),
+        forwardToTelegram: shouldForwardToTelegram(),
+        defaultForce: shouldForceIngest(),
+      }
+    );
   });
   $("folderUploadInput")?.addEventListener("change", async (e) => {
     const files = Array.from(e.target.files || []);
@@ -353,7 +519,7 @@ export function initUploader() {
           const resolvedFiles = await Promise.all(
             looseFiles.map((ent) => new Promise((resolve, reject) => ent.file(resolve, reject)))
           );
-          enqueueFiles(resolvedFiles, currentUploadOptions());
+          handleIncomingFiles(resolvedFiles);
         }
         if (uploadedAny) {
           emit("media:changed", { source: "upload-drop" });
@@ -364,13 +530,13 @@ export function initUploader() {
     }
     const dropped = Array.from(e.dataTransfer?.files || []);
     if (dropped.length) {
-      enqueueFiles(dropped, currentUploadOptions());
+      await handleIncomingFiles(dropped);
     }
   });
 
   on("pwa:shared-files", ({ files } = {}) => {
     if (files?.length) {
-      enqueueFiles(files, currentUploadOptions());
+      handleIncomingFiles(files);
     }
   });
 

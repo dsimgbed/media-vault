@@ -26,3 +26,5 @@ class AppContext:
     integrity: Any = None
     uploads: Any = None
     subscriptions: Any = None
+    torrent: Any = None
+    gallery: Any = None

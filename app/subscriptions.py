@@ -1120,6 +1120,128 @@ class SubscriptionService:
             "has_more": safe_offset + len(items) < total,
         }
 
+    def queue_existing_entry(self, subscription_id: str, entry_key: str) -> dict[str, Any]:
+        sub = self.get_subscription(subscription_id)
+        key = str(entry_key or "").strip()
+        if not key:
+            raise SubscriptionValidationError("entry_key is required")
+        entry = self.db.get_subscription_entry(subscription_id, key)
+        if entry is None:
+            raise SubscriptionNotFoundError(
+                f"Subscription entry not found: {key}"
+            )
+        status = str(entry.get("status") or "").lower()
+        if status in ("queued", "ingested"):
+            return {
+                "subscription_id": subscription_id,
+                "entry_key": key,
+                "queued": False,
+                "reason": status,
+                "job_id": entry.get("job_id"),
+                "media_id": entry.get("media_id"),
+            }
+        url = str(entry.get("url") or "").strip()
+        if not url or not self._is_entry_url_safe(url):
+            raise SubscriptionValidationError(
+                "Entry URL targets a local, private, or invalid host"
+            )
+        now_iso = utc_now_iso()
+        folder = sanitize_folder(sub.get("folder"), self._default_folder())
+        tags = normalize_tags(sub.get("tags"))
+        job_id = self._queue_entry(
+            sub_id=subscription_id,
+            entry_key=key,
+            url=url,
+            normalized_url=entry.get("normalized_url") or normalize_source_url(url) or None,
+            title=str(entry.get("title") or "").strip() or url,
+            published_at=entry.get("published_at"),
+            folder=folder,
+            tags=tags,
+            format_spec=sub.get("format_spec"),
+            forward_to_telegram=bool(sub.get("forward_to_telegram", True)),
+            now_iso=now_iso,
+        )
+        return {
+            "subscription_id": subscription_id,
+            "entry_key": key,
+            "queued": True,
+            "job_id": job_id,
+        }
+
+    def backfill_entries(
+        self,
+        subscription_id: str,
+        *,
+        limit: int | None = None,
+        statuses: list[str] | None = None,
+    ) -> dict[str, Any]:
+        sub = self.get_subscription(subscription_id)
+        safe_limit = min(50, max(1, int(limit or sub.get("max_items_per_check") or 10)))
+        candidates = self.db.list_subscription_entries_for_backfill(
+            subscription_id, statuses=statuses or ["seen"], limit=safe_limit
+        )
+        all_urls: list[str] = []
+        for entry in candidates:
+            if entry.get("url"):
+                all_urls.append(str(entry["url"]))
+            if entry.get("normalized_url"):
+                all_urls.append(str(entry["normalized_url"]))
+        vault_map = self.db.find_media_by_source_urls(all_urls) if all_urls else {}
+
+        folder = sanitize_folder(sub.get("folder"), self._default_folder())
+        tags = normalize_tags(sub.get("tags"))
+        format_spec = sub.get("format_spec")
+        forward_to_telegram = bool(sub.get("forward_to_telegram", True))
+        now_iso = utc_now_iso()
+
+        queued_count = 0
+        skipped_duplicate_count = 0
+        job_ids: list[str] = []
+        for entry in candidates:
+            key = str(entry.get("entry_key") or "").strip()
+            url = str(entry.get("url") or "").strip()
+            norm = str(entry.get("normalized_url") or "") or (normalize_source_url(url) or "")
+            title = str(entry.get("title") or "").strip() or url
+            if not key or not url or not self._is_entry_url_safe(url):
+                continue
+            existing_media = vault_map.get(url) or (vault_map.get(norm) if norm else None)
+            if existing_media is not None:
+                skipped_duplicate_count += 1
+                self.db.upsert_subscription_entry(
+                    subscription_id,
+                    key,
+                    title=title,
+                    url=url,
+                    normalized_url=norm or None,
+                    status="seen",
+                    media_id=existing_media.get("id"),
+                    published_at=entry.get("published_at"),
+                    last_attempt_at=now_iso,
+                )
+                continue
+            job_id = self._queue_entry(
+                sub_id=subscription_id,
+                entry_key=key,
+                url=url,
+                normalized_url=norm or None,
+                title=title,
+                published_at=entry.get("published_at"),
+                folder=folder,
+                tags=tags,
+                format_spec=format_spec,
+                forward_to_telegram=forward_to_telegram,
+                now_iso=now_iso,
+            )
+            queued_count += 1
+            job_ids.append(job_id)
+
+        return {
+            "subscription_id": subscription_id,
+            "queued_count": queued_count,
+            "skipped_duplicate_count": skipped_duplicate_count,
+            "job_ids": job_ids,
+        }
+
     @staticmethod
     def _validate_source_kind(source_kind: str) -> str:
         kind = str(source_kind or "auto").strip().lower()

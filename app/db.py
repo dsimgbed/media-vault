@@ -2833,6 +2833,42 @@ class Database:
             ).fetchall()
             return [dict(r) for r in rows], total
 
+    def get_subscription_entry(self, subscription_id: str, entry_key: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM subscription_entries
+                WHERE subscription_id = ? AND entry_key = ?
+                """,
+                (subscription_id, entry_key),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_subscription_entries_for_backfill(
+        self,
+        subscription_id: str,
+        *,
+        statuses: list[str] | None = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        allowed = {"seen", "skipped", "failed"}
+        clean_statuses = [s for s in (statuses or ["seen"]) if s in allowed]
+        if not clean_statuses:
+            clean_statuses = ["seen"]
+        placeholders = ",".join("?" for _ in clean_statuses)
+        safe_limit = max(1, min(50, int(limit)))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM subscription_entries
+                WHERE subscription_id = ? AND status IN ({placeholders})
+                ORDER BY rowid ASC
+                LIMIT ?
+                """,
+                [subscription_id, *clean_statuses, safe_limit],
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     def reconcile_subscription_entries_with_jobs(self) -> int:
         now = utc_now_iso()
         with self._connect() as conn:

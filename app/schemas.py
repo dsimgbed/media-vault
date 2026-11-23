@@ -174,3 +174,40 @@ class SubscriptionUpdateRequest(BaseModel):
 class SubscriptionCheckRequest(BaseModel):
     dry_run: bool = False
 
+
+class SubscriptionQueueEntryRequest(BaseModel):
+    entry_key: str = Field(..., min_length=1, max_length=2048)
+
+
+class SubscriptionBackfillRequest(BaseModel):
+    limit: int | None = Field(default=None, ge=1, le=50)
+    statuses: list[Literal["seen", "skipped", "failed"]] = Field(
+        default_factory=lambda: ["seen"]
+    )
+
+
+class TorrentInspectRequest(BaseModel):
+    magnet: str = Field(..., min_length=1, max_length=8192)
+
+
+class TorrentIngestRequest(BaseModel):
+    inspect_id: str | None = Field(default=None, max_length=64)
+    magnet: str | None = Field(default=None, max_length=8192)
+    selected_indices: list[int] | None = None
+    folder: str | None = None
+    use_torrent_subfolder: bool = True
+    tags: list[str] | str | None = None
+    forward_to_telegram: bool = True
+    force: bool = False
+
+
+class GalleryIngestRequest(BaseModel):
+    url: str = Field(..., min_length=1, max_length=4096)
+    folder: str | None = None
+    tags: list[str] | str | None = None
+    title: str | None = Field(default=None, max_length=300)
+    archive_mode: Literal["items", "cbz", "zip"] = "items"
+    max_items: int = Field(default=200, ge=1, le=500)
+    forward_to_telegram: bool = True
+    force: bool = False
+

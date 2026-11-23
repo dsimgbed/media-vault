@@ -111,6 +111,21 @@ class Settings(BaseSettings):
     subscriptions_failure_pause_threshold: int = 5
     subscriptions_allow_private_hosts: bool = False
 
+    # Personal Cloud Torrent Leecher (aria2c) & gallery-dl Gallery Ingest settings
+    torrent_enabled: bool = True
+    torrent_concurrency: int = 2
+    torrent_max_total_mb: int = 20480
+    torrent_min_free_buffer_mb: int = 1024
+    torrent_enable_dht: bool = True
+    torrent_bt_stop_timeout_sec: int = 300
+    torrent_metadata_timeout_sec: int = 45
+    torrent_max_download_limit: str = ""
+    torrent_proxy: str = ""
+    gallery_dl_enabled: bool = True
+    gallery_dl_default_max_items: int = 200
+    gallery_dl_max_items_cap: int = 500
+    gallery_dl_max_total_mb: int = 4096
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "media.db"
@@ -134,6 +149,18 @@ class Settings(BaseSettings):
     @property
     def min_free_buffer_bytes(self) -> int:
         return self.min_free_buffer_mb * 1024 * 1024
+
+    @property
+    def torrent_max_total_bytes(self) -> int:
+        return max(0, int(self.torrent_max_total_mb)) * 1024 * 1024
+
+    @property
+    def torrent_min_free_buffer_bytes(self) -> int:
+        return max(0, int(self.torrent_min_free_buffer_mb)) * 1024 * 1024
+
+    @property
+    def gallery_dl_max_total_bytes(self) -> int:
+        return max(0, int(self.gallery_dl_max_total_mb)) * 1024 * 1024
 
     @property
     def max_upload_bytes(self) -> int:
