@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 
 from app.context import STATIC_DIR
+from app.routers.deps import read_cached_html
 
 router = APIRouter()
 
@@ -93,14 +94,14 @@ async def share_target_fallback_post(request: Request):
 
 @router.get("/", response_class=HTMLResponse)
 async def index():
-    index_file = STATIC_DIR / "index.html"
-    if not index_file.exists():
+    html = await read_cached_html(STATIC_DIR / "index.html")
+    if html is None:
         return HTMLResponse(
             "<h1>Static UI missing</h1>",
             status_code=404,
             headers={"Cache-Control": "no-cache"},
         )
     return HTMLResponse(
-        index_file.read_text(encoding="utf-8"),
+        html,
         headers={"Cache-Control": "no-cache"},
     )

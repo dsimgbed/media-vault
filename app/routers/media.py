@@ -4,17 +4,14 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse
 
 from app.allocator import sanitize_folder
 from app.context import AppContext
 from app.db import normalize_tags
 from app.media_ops import (
-    _call_iter_telegram_range,
-    _iter_file_range,
-    _parse_range_header,
-    _telegram_media_actual_size,
     build_bulk_download_response,
+    build_media_stream_response,
     delete_media_item,
     move_or_rename_media_item,
 )
@@ -228,6 +225,11 @@ async def get_media_preview(media_id: str, ctx: AppContext = Depends(get_ctx)):
 
 
 @router.get("/api/media/{media_id}/stream", dependencies=[Depends(require_auth)])
+@router.head(
+    "/api/media/{media_id}/stream",
+    dependencies=[Depends(require_auth)],
+    include_in_schema=False,
+)
 async def stream_media(
     media_id: str,
     request: Request,
@@ -237,116 +239,7 @@ async def stream_media(
     item = ctx.db.get_media(media_id)
     if not item:
         raise HTTPException(status_code=404, detail="Media item not found")
-
-    raw_path = (item.get("file_path") or "").strip()
-    file_path = Path(raw_path) if raw_path else None
-    use_local = bool(file_path and file_path.is_file())
-    parts = item.get("parts") or []
-    is_multipart = not use_local and len(parts) > 1
-
-    tg_client = None
-    tg_media = None
-    if use_local:
-        assert file_path is not None
-        file_size = file_path.stat().st_size
-    elif is_multipart:
-        file_size = int(item["size_bytes"])
-    elif item.get("telegram_chat_id") and item.get("telegram_msg_id"):
-        try:
-            tg_client, tg_media = await ctx.tg_pool.prepare_stream(
-                item["telegram_chat_id"],
-                int(item["telegram_msg_id"]),
-                worker_name=item.get("telegram_worker_name"),
-            )
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc))
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"Telegram stream error: {exc}")
-        file_size = _telegram_media_actual_size(tg_media) or int(item["size_bytes"])
-    else:
-        raise HTTPException(status_code=404, detail="File missing on drive (drive may be unmounted)")
-
-    mime_type = item.get("mime_type") or "application/octet-stream"
-    headers = {"Accept-Ranges": "bytes"}
-    if download:
-        headers["Content-Disposition"] = f'attachment; filename="{item["filename"]}"'
-
-    range_header = request.headers.get("range")
-    if range_header:
-        try:
-            start, end = _parse_range_header(range_header, file_size)
-        except ValueError:
-            raise HTTPException(
-                status_code=416,
-                headers={"Content-Range": f"bytes */{file_size}"},
-                detail="Invalid Range header",
-            )
-    else:
-        start, end = 0, max(0, file_size - 1)
-
-    prefetched_parts: dict[int, tuple[Any, Any]] | None = None
-    if is_multipart and file_size > 0:
-        overlapping = [
-            p
-            for p in sorted(parts, key=lambda x: int(x["part_index"]))
-            if int(p["end_byte"]) >= start and int(p["start_byte"]) <= end and int(p["size_bytes"]) > 0
-        ]
-        if not overlapping:
-            raise HTTPException(status_code=404, detail="Requested range has no matching media parts")
-        first_part = overlapping[0]
-        try:
-            first_stream = await ctx.tg_pool.prepare_stream(
-                first_part["telegram_chat_id"],
-                int(first_part["telegram_msg_id"]),
-                worker_name=None,
-            )
-            prefetched_parts = {int(first_part["part_index"]): first_stream}
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc))
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"Telegram stream error: {exc}")
-
-    if range_header:
-        content_length = end - start + 1
-        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-        headers["Content-Length"] = str(content_length)
-        if use_local and file_path is not None:
-            body = _iter_file_range(file_path, start, end)
-        elif is_multipart:
-            body = ctx.tg_pool.iter_telegram_multipart_range(
-                parts, start, end, prefetched=prefetched_parts
-            )
-        else:
-            body = _call_iter_telegram_range(
-                ctx.tg_pool, tg_client, tg_media, start, end, total_size=file_size
-            )
-        return StreamingResponse(
-            body,
-            status_code=206,
-            media_type=mime_type,
-            headers=headers,
-        )
-
-    headers["Content-Length"] = str(file_size)
-    if file_size == 0:
-        body = iter([b""])
-    elif use_local and file_path is not None:
-        body = _iter_file_range(file_path, 0, file_size - 1)
-    elif is_multipart:
-        body = ctx.tg_pool.iter_telegram_multipart_range(
-            parts, 0, file_size - 1, prefetched=prefetched_parts
-        )
-    else:
-        body = _call_iter_telegram_range(
-            ctx.tg_pool, tg_client, tg_media, 0, file_size - 1, total_size=file_size
-        )
-
-    return StreamingResponse(
-        body,
-        status_code=200,
-        media_type=mime_type,
-        headers=headers,
-    )
+    return await build_media_stream_response(request, ctx, item, download=download)
 
 
 @router.delete("/api/media/{media_id}", dependencies=[Depends(require_auth)])

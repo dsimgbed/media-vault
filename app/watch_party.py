@@ -2050,7 +2050,14 @@ class WatchPartyService:
             if actor is None or actor.kicked:
                 raise AuthError("Participant is not active")
             self._require_control_locked(current, actor)
-            self._sync_position_locked(current, now_mono)
+            if "position_sec" in payload and payload.get("position_sec") is not None:
+                position = self._validate_position(payload.get("position_sec"))
+            else:
+                position = current.effective_position(now_mono)
+            if current.active_duration_sec is not None and current.active_duration_sec > 0:
+                position = min(float(current.active_duration_sec), position)
+            current.position_sec = position
+            current.state_updated_mono = now_mono
             current.is_playing = False
             current.paused_for_buffering = False
             current.state_updated_at = now_wall

@@ -24,7 +24,7 @@ from app.torrent_ingest import (
 from app.gallery_ingest import (
     GalleryUnavailableError,
     find_gallery_dl_cmd,
-    get_gallery_dl_status,
+    get_gallery_dl_status_async,
     update_gallery_dl,
     validate_gallery_url,
 )
@@ -65,9 +65,15 @@ def _parse_selected_indices(raw: Any) -> list[int] | None:
 
 @router.get("/api/leech/status", dependencies=[Depends(require_auth)])
 async def leech_status(ctx: AppContext = Depends(get_ctx)):
+    torrent_st = await ctx.torrent.get_status_async() if ctx.torrent else {}
+    gallery_st = (
+        await ctx.gallery.get_status_async()
+        if ctx.gallery
+        else await get_gallery_dl_status_async(ctx.settings)
+    )
     return {
-        "torrent": ctx.torrent.get_status() if ctx.torrent else {},
-        "gallery_dl": ctx.gallery.get_status() if ctx.gallery else get_gallery_dl_status(ctx.settings),
+        "torrent": torrent_st,
+        "gallery_dl": gallery_st,
     }
 
 
@@ -231,7 +237,13 @@ async def ingest_torrent(request: Request, ctx: AppContext = Depends(get_ctx)):
             effective_indices = list(dict.fromkeys(selected_indices))
         selected_bytes = sum(f["size_bytes"] for f in parsed["files"] if f["index"] in set(effective_indices))
         try:
-            assert_staging_disk_space(cfg.staging_dir, selected_bytes, cfg.torrent_max_total_bytes, cfg.torrent_min_free_buffer_bytes)
+            await asyncio.to_thread(
+                assert_staging_disk_space,
+                cfg.staging_dir,
+                selected_bytes,
+                cfg.torrent_max_total_bytes,
+                cfg.torrent_min_free_buffer_bytes,
+            )
         except TorrentQuotaError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         name = parsed["name"]
@@ -239,7 +251,13 @@ async def ingest_torrent(request: Request, ctx: AppContext = Depends(get_ctx)):
         selected_count = len(effective_indices)
     else:
         try:
-            assert_staging_disk_space(cfg.staging_dir, 0, cfg.torrent_max_total_bytes, cfg.torrent_min_free_buffer_bytes)
+            await asyncio.to_thread(
+                assert_staging_disk_space,
+                cfg.staging_dir,
+                0,
+                cfg.torrent_max_total_bytes,
+                cfg.torrent_min_free_buffer_bytes,
+            )
         except TorrentQuotaError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         infohash = extract_magnet_infohash(magnet) if magnet else None

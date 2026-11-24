@@ -17,7 +17,7 @@ from pydantic import ValidationError
 from app.allocator import sanitize_folder
 from app.context import STATIC_DIR, AppContext
 from app.ingest import resolve_format_spec
-from app.routers.deps import get_ctx, require_auth
+from app.routers.deps import get_ctx, read_cached_html, require_auth
 from app.schemas import QuickCaptureRequest
 
 logger = logging.getLogger(__name__)
@@ -122,15 +122,15 @@ def _display_label(title: str | None, url: str) -> str:
 
 @router.get("/capture", response_class=HTMLResponse)
 async def capture_page():
-    capture_file = STATIC_DIR / "capture.html"
-    if not capture_file.is_file():
+    html = await read_cached_html(STATIC_DIR / "capture.html")
+    if html is None:
         return HTMLResponse(
             "<h1>Capture page missing</h1>",
             status_code=404,
             headers=_CAPTURE_SECURITY_HEADERS,
         )
     return HTMLResponse(
-        capture_file.read_text(encoding="utf-8"),
+        html,
         headers=_CAPTURE_SECURITY_HEADERS,
     )
 

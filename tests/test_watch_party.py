@@ -1384,3 +1384,131 @@ def test_cinema_host_watch_party_ui_wired_and_index_under_350_lines(tmp_path: Pa
         for forbidden in ("window.alert(", "window.confirm(", "window.prompt("):
             assert forbidden not in host_js.text
 
+
+def test_pause_command_accepts_optional_clamped_position_sec(tmp_path: Path):
+    settings, app = _make_client(tmp_path)
+    db = app.state.db
+    _insert_media(db, tmp_path, media_id="m1", filename="clip.mp4", payload=b"VIDEO", duration_sec=120.0)
+
+    with TestClient(app) as client:
+        room = _create_room(client, media_ids=["m1"])
+        code = room["room_code"]
+        host_token = room["host_token"]
+
+        with client.websocket_connect(f"/api/watch-party/{code}/ws") as ws:
+            ws.send_json({"type": "auth", "token": host_token})
+            assert ws.receive_json()["type"] == "auth_ok"
+
+            ws.send_json({"type": "play", "position_sec": 10.0})
+            play_msg = ws.receive_json()
+            assert play_msg["type"] == "sync_state"
+            assert play_msg["room_state"]["is_playing"] is True
+
+            # Pause with explicit position_sec sets exact position
+            ws.send_json({"type": "pause", "position_sec": 42.5})
+            pause_msg = ws.receive_json()
+            assert pause_msg["type"] == "sync_state"
+            assert pause_msg["room_state"]["is_playing"] is False
+            assert pause_msg["room_state"]["position_sec"] == pytest.approx(42.5, abs=0.01)
+
+            # Pause with out-of-range position_sec clamps to [0, duration]
+            ws.send_json({"type": "pause", "position_sec": 9999.0})
+            clamped_hi = ws.receive_json()
+            assert clamped_hi["room_state"]["position_sec"] == pytest.approx(120.0, abs=0.01)
+
+            # Pause with negative position_sec is rejected like play/seek
+            ws.send_json({"type": "pause", "position_sec": -25.0})
+            rejected = ws.receive_json()
+            assert rejected["type"] == "error"
+
+            # Pause without position_sec falls back to effective_position
+            ws.send_json({"type": "seek", "position_sec": 33.0})
+            ws.receive_json()
+            ws.send_json({"type": "pause"})
+            fallback_msg = ws.receive_json()
+            assert fallback_msg["room_state"]["is_playing"] is False
+            assert fallback_msg["room_state"]["position_sec"] == pytest.approx(33.0, abs=0.5)
+
+
+def test_watch_party_v0131_client_clock_host_sync_qr_and_strict_stream_headers(tmp_path: Path):
+    settings, app = _make_client(tmp_path)
+    db = app.state.db
+    payload = b"0123456789ABCDEF" * 4
+    _insert_media(db, tmp_path, media_id="m1", filename="clip.mp4", payload=payload)
+
+    with TestClient(app) as client:
+        room = _create_room(client, media_ids=["m1"])
+        code = room["room_code"]
+        guest_token = _join(client, code, name="Viewer").json()["guest_token"]
+
+        # Standalone page & media proxy include strict X-Robots-Tag + Cache-Control + Referrer-Policy
+        page = client.get(f"/watch/{code}")
+        assert page.status_code == 200
+        assert page.headers.get("x-robots-tag") == "noindex, nofollow"
+
+        for method in ("GET", "HEAD"):
+            res = client.request(
+                method,
+                f"/api/watch-party/{code}/media/m1/stream",
+                params={"wp_token": guest_token},
+                headers={"Range": "bytes=0-15"},
+            )
+            assert res.status_code == 206
+            assert res.headers.get("cache-control") == "private, no-store"
+            assert res.headers.get("referrer-policy") == "no-referrer"
+            assert res.headers.get("x-robots-tag") == "noindex, nofollow"
+            assert res.headers.get("content-range") == f"bytes 0-15/{len(payload)}"
+
+        res_416 = client.get(
+            f"/api/watch-party/{code}/media/m1/stream",
+            params={"wp_token": guest_token},
+            headers={"Range": "bytes=9999-10000"},
+        )
+        assert res_416.status_code == 416
+        assert res_416.headers.get("x-robots-tag") == "noindex, nofollow"
+        assert res_416.headers.get("content-range") == f"bytes */{len(payload)}"
+
+        # Unified /api/media/{id}/stream supports HEAD, Range, 416, and download=true
+        media_head = client.head("/api/media/m1/stream")
+        assert media_head.status_code == 200
+        assert media_head.headers.get("content-length") == str(len(payload))
+        assert media_head.headers.get("accept-ranges") == "bytes"
+        assert media_head.content == b""
+
+        media_head_range = client.head("/api/media/m1/stream", headers={"Range": "bytes=4-7"})
+        assert media_head_range.status_code == 206
+        assert media_head_range.headers.get("content-range") == f"bytes 4-7/{len(payload)}"
+        assert media_head_range.headers.get("content-length") == "4"
+
+        media_416 = client.get("/api/media/m1/stream", headers={"Range": "bytes=500-600"})
+        assert media_416.status_code == 416
+        assert media_416.headers.get("content-range") == f"bytes */{len(payload)}"
+
+        media_dl = client.get("/api/media/m1/stream", params={"download": "true"})
+        assert media_dl.status_code == 200
+        assert 'attachment; filename="clip.mp4"' in media_dl.headers.get("content-disposition", "")
+        assert media_dl.content == payload
+
+        # Static JS regression guards for Sections 2 & 3
+        wp_js = client.get("/static/js/watch-party.js").text
+        assert "effective_position_sec" in wp_js
+        assert "state_updated_at_ms" in wp_js
+        assert "loadedmetadata" in wp_js
+        assert "addEventListener(\"ended\"" in wp_js
+        assert "incomingSeq > lastStateSeq" in wp_js
+
+        host_js = client.get("/static/js/features/watch-party-host.js").text
+        assert "HOST_DRIFT_THRESHOLD_SEC" in host_js
+        assert "HOST_NO_RECONNECT_CODES" in host_js
+        assert "renderQrSvg" in host_js
+        assert "!activeId || queuedIds.includes(activeId)" in host_js
+        assert "if (hostRoomCode && hostToken)" in host_js
+
+        qr_js = client.get("/static/js/ui/qr.js")
+        assert qr_js.status_code == 200
+        assert "export function encodeQrMatrix" in qr_js.text
+        assert "export function renderQrSvg" in qr_js.text
+        qr_without_svg_ns = qr_js.text.replace("http://www.w3.org/2000/svg", "")
+        assert "http://" not in qr_without_svg_ns and "https://" not in qr_without_svg_ns
+
+

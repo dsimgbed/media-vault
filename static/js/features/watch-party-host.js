@@ -2,10 +2,14 @@ import { state } from "/static/js/state.js";
 import { apiFetch } from "/static/js/api.js";
 import { $, fmtDuration, fmtResolution } from "/static/js/utils.js";
 import { toast, confirmDialog } from "/static/js/ui/dialogs.js";
+import { renderQrSvg } from "/static/js/ui/qr.js";
 
 const SUPPRESS_MS = 450;
 const SEEK_DEBOUNCE_MS = 150;
 const HOST_QUEUE_LIMIT = 50;
+const HOST_DRIFT_THRESHOLD_SEC = 0.5;
+const HOST_RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 15000];
+const HOST_NO_RECONNECT_CODES = new Set([4001, 4003, 4004, 4005]);
 
 let hostDialogEl = null;
 let hostRoomCode = null;
@@ -21,6 +25,9 @@ let suppressUntil = 0;
 let isApplyingSync = false;
 let hostSyncTimer = null;
 let hostPingTimer = null;
+let hostReconnectTimer = null;
+let hostReconnectAttempt = 0;
+let hostIntentionalClose = false;
 let hostDeps = null;
 let hostCinemaSelectedHandler = null;
 
@@ -64,6 +71,13 @@ function hostWsUrl() {
   return `${proto}//${window.location.host}/api/watch-party/${encodeURIComponent(hostRoomCode || "")}/ws`;
 }
 
+function clearHostReconnectTimer() {
+  if (hostReconnectTimer) {
+    clearTimeout(hostReconnectTimer);
+    hostReconnectTimer = null;
+  }
+}
+
 function stopHostTimers() {
   if (hostSyncTimer) {
     clearTimeout(hostSyncTimer);
@@ -85,11 +99,14 @@ function startHostPing() {
   }, 15000);
 }
 
-function closeHostWs() {
+function closeHostWs({ intentional = true } = {}) {
+  hostIntentionalClose = Boolean(intentional);
+  clearHostReconnectTimer();
   stopHostTimers();
   if (hostWs) {
-    try { hostWs.close(); } catch (_) {}
+    const sock = hostWs;
     hostWs = null;
+    try { sock.close(); } catch (_) {}
   }
 }
 
@@ -112,6 +129,26 @@ function updateHostPartyButton(count) {
   const connected = Number.isFinite(total) ? Math.max(0, Math.round(total)) : 0;
   btn.classList.toggle("is-active", Boolean(hostSyncActive));
   btn.textContent = hostSyncActive ? `Party • ${connected}` : "Watch Party";
+}
+
+function getHostQueuedIds(roomState) {
+  if (!roomState) return [];
+  if (Array.isArray(roomState.media_ids)) return roomState.media_ids.map(String);
+  if (Array.isArray(roomState.queue_ids)) return roomState.queue_ids.map(String);
+  if (Array.isArray(roomState.queue)) {
+    return roomState.queue
+      .map((it) => String(it?.media_id || it?.id || ""))
+      .filter(Boolean);
+  }
+  return [];
+}
+
+function syncAddActiveBtnVisibility() {
+  const addBtn = $("wpHostAddActiveBtn");
+  if (!addBtn) return;
+  const queuedIds = getHostQueuedIds(hostState);
+  const activeId = state.cinemaActiveId ? String(state.cinemaActiveId) : null;
+  addBtn.hidden = !activeId || queuedIds.includes(activeId);
 }
 
 function bindHostCinemaSync(video) {
@@ -153,22 +190,49 @@ function bindHostCinemaSync(video) {
   });
 }
 
+function getHostExpectedPosition(roomState, fallbackSec = 0) {
+  const hasEffective =
+    roomState?.effective_position_sec !== undefined &&
+    roomState?.effective_position_sec !== null &&
+    Number.isFinite(Number(roomState.effective_position_sec));
+  const raw = hasEffective
+    ? Number(roomState.effective_position_sec)
+    : Number(roomState?.position_sec ?? fallbackSec);
+  return Number.isFinite(raw) ? Math.max(0, raw) : Math.max(0, Number(fallbackSec) || 0);
+}
+
 function applyCinemaPlaybackState(roomState) {
   const video = hostCinemaVideo();
-  if (!video) return;
-  const rate = Number(roomState?.playback_rate || 1) || 1;
-  isApplyingSync = true;
-  suppressUntil = performance.now() + SUPPRESS_MS;
-  try { video.playbackRate = rate; } catch (_) {}
-  const playing = Boolean(roomState?.is_playing);
-  const expected = Number(roomState?.effective_position_sec ?? roomState?.position_sec ?? video.currentTime) || 0;
+  if (!video || !roomState) return;
+  const rate = Number(roomState.playback_rate || 1) || 1;
+  const shouldPlay = Boolean(roomState.is_playing);
+  const currentlyPlaying = !video.paused;
+  const currentTime = Number(video.currentTime) || 0;
+  const expected = getHostExpectedPosition(roomState, currentTime);
   const duration = Number(video.duration);
   const target = Number.isFinite(duration) && duration > 0 ? Math.min(expected, duration) : expected;
-  try { video.currentTime = target; } catch (_) {}
-  if (playing) {
+
+  const needRate = Math.abs((Number(video.playbackRate) || 1) - rate) > 0.01;
+  const needSeek = Math.abs(currentTime - target) > HOST_DRIFT_THRESHOLD_SEC;
+  const needPlay = shouldPlay && !currentlyPlaying;
+  const needPause = !shouldPlay && currentlyPlaying;
+
+  if (!needRate && !needSeek && !needPlay && !needPause) {
+    return;
+  }
+
+  isApplyingSync = true;
+  suppressUntil = performance.now() + SUPPRESS_MS;
+  if (needRate) {
+    try { video.playbackRate = rate; } catch (_) {}
+  }
+  if (needSeek) {
+    try { video.currentTime = target; } catch (_) {}
+  }
+  if (needPlay) {
     const p = video.play?.();
     if (p && typeof p.catch === "function") p.catch(() => {});
-  } else {
+  } else if (needPause) {
     try { video.pause(); } catch (_) {}
   }
   window.setTimeout(() => { isApplyingSync = false; }, 0);
@@ -176,11 +240,11 @@ function applyCinemaPlaybackState(roomState) {
 
 function applyCinemaSyncState(roomState) {
   const video = hostCinemaVideo();
-  if (!video) return;
-  const nextActiveId = roomState?.active_media_id ? String(roomState.active_media_id) : null;
-  if (nextActiveId && nextActiveId !== state.cinemaActiveId) {
+  if (!video || !roomState) return;
+  const nextActiveId = roomState.active_media_id ? String(roomState.active_media_id) : null;
+  if (nextActiveId && nextActiveId !== String(state.cinemaActiveId || "")) {
     hostPlayCinema(nextActiveId, {
-      autoplay: Boolean(roomState?.is_playing),
+      autoplay: Boolean(roomState.is_playing),
       scroll: false,
       fromWatchParty: true,
     })
@@ -191,24 +255,54 @@ function applyCinemaSyncState(roomState) {
   applyCinemaPlaybackState(roomState);
 }
 
+function handleHostPermanentDisconnect(message) {
+  clearHostReconnectTimer();
+  stopHostTimers();
+  if (hostSyncActive) {
+    hostSyncActive = false;
+    setHostSyncToggle(false);
+    updateHostPartyButton(hostState?.participant_count);
+    toast(message || "Watch Party sync disconnected", { type: "info" });
+  }
+}
+
+function scheduleHostReconnect() {
+  if (hostIntentionalClose || !hostSyncActive || !hostRoomCode || !hostToken) return;
+  if (hostWs && (hostWs.readyState === WebSocket.OPEN || hostWs.readyState === WebSocket.CONNECTING)) return;
+  if (hostReconnectAttempt >= HOST_RECONNECT_DELAYS.length) {
+    handleHostPermanentDisconnect("Watch Party sync disconnected after repeated retries.");
+    return;
+  }
+  const delay = HOST_RECONNECT_DELAYS[hostReconnectAttempt];
+  hostReconnectAttempt += 1;
+  clearHostReconnectTimer();
+  hostReconnectTimer = setTimeout(() => {
+    hostReconnectTimer = null;
+    connectHostWs();
+  }, delay);
+}
+
 function connectHostWs() {
   if (!hostRoomCode || !hostToken) return;
   if (hostWs && (hostWs.readyState === WebSocket.OPEN || hostWs.readyState === WebSocket.CONNECTING)) return;
-  closeHostWs();
+  clearHostReconnectTimer();
+  stopHostTimers();
+  hostIntentionalClose = false;
+
   let socket;
   try {
     socket = new WebSocket(hostWsUrl());
   } catch (_) {
-    hostSyncActive = false;
-    setHostSyncToggle(false);
-    updateHostPartyButton(hostState?.participant_count);
+    scheduleHostReconnect();
     return;
   }
   hostWs = socket;
   socket.onopen = () => {
+    if (hostWs !== socket) return;
     hostWsSend({ type: "auth", token: hostToken });
   };
   socket.onmessage = (ev) => {
+    if (hostWs !== socket) return;
     let raw = ev?.data;
     if (typeof raw !== "string") {
       try { raw = JSON.stringify(raw); } catch (_) { return; }
@@ -218,14 +312,22 @@ function connectHostWs() {
   socket.onclose = (ev) => {
     if (hostWs === socket) hostWs = null;
     stopHostTimers();
-    if (hostSyncActive) {
-      hostSyncActive = false;
-      setHostSyncToggle(false);
-      updateHostPartyButton(hostState?.participant_count);
+    if (hostIntentionalClose || !hostSyncActive) return;
+
+    const code = ev?.code;
+    if (code && HOST_NO_RECONNECT_CODES.has(code)) {
+      let msg = "Watch Party sync disconnected.";
+      if (code === 4004) msg = "Watch Party room ended.";
+      else if (code === 4005) msg = "Watch Party sync moved to another tab.";
+      else if (code === 4001 || code === 4003) msg = "Watch Party host session expired.";
+      handleHostPermanentDisconnect(msg);
+      return;
     }
+
+    scheduleHostReconnect();
   };
   socket.onerror = () => {
-    // onclose handles cleanup.
+    // onclose handles reconnect/cleanup.
   };
 }
 
@@ -235,11 +337,23 @@ function handleHostWsMessage(raw) {
   if (!msg || typeof msg.type !== "string") return;
 
   if (msg.type === "auth_ok") {
+    hostReconnectAttempt = 0;
+    clearHostReconnectTimer();
     hostParticipantId = String(msg.participant_id || hostParticipantId || "");
+    if (msg.room_state) {
+      hostState = msg.room_state;
+      hostControlMode = String(hostState.control_mode || "host_only");
+      hostWaitForBuffering = Boolean(hostState.wait_for_buffering);
+      renderHostParticipants(hostState.participants);
+      renderHostQueue(hostState.queue);
+      syncAddActiveBtnVisibility();
+      updateHostPartyButton(hostState.participant_count);
+    }
     startHostPing();
     return;
   }
   if (msg.type === "sync_state") {
+    const prevState = hostState;
     const roomState = msg.room_state || null;
     hostState = roomState;
     if (roomState) {
@@ -247,8 +361,35 @@ function handleHostWsMessage(raw) {
       hostWaitForBuffering = Boolean(roomState.wait_for_buffering);
       renderHostParticipants(roomState.participants);
       renderHostQueue(roomState.queue);
-      if (hostControlMode === "everyone") {
-        applyCinemaSyncState(roomState);
+      syncAddActiveBtnVisibility();
+      const metaStatus = $("wpHostRoomMetaStatus");
+      if (metaStatus) {
+        const label = roomState.paused_for_buffering
+          ? "Waiting for buffering"
+          : (roomState.is_playing ? "Playing" : "Paused");
+        metaStatus.textContent = `${hostRoomCode ? `Room ${hostRoomCode}` : ""} • ${label}`.trim();
+      }
+      if (hostSyncActive) {
+        if (hostControlMode === "everyone") {
+          applyCinemaSyncState(roomState);
+        } else {
+          const video = hostCinemaVideo();
+          const bufferingPauseChanged =
+            Boolean(roomState.paused_for_buffering) !== Boolean(prevState?.paused_for_buffering);
+          const nextActiveId = roomState.active_media_id ? String(roomState.active_media_id) : null;
+          const trackChanged = Boolean(nextActiveId && nextActiveId !== String(state.cinemaActiveId || ""));
+          const playStateChanged = Boolean(video && Boolean(roomState.is_playing) !== !video.paused);
+          const expectedPos = getHostExpectedPosition(roomState, video?.currentTime ?? 0);
+          const posDrifted = Boolean(
+            video && Math.abs((Number(video.currentTime) || 0) - expectedPos) > HOST_DRIFT_THRESHOLD_SEC
+          );
+          const rateChanged = Boolean(
+            video && Math.abs((Number(video.playbackRate) || 1) - (Number(roomState.playback_rate || 1) || 1)) > 0.01
+          );
+          if (bufferingPauseChanged || trackChanged || playStateChanged || posDrifted || rateChanged) {
+            applyCinemaSyncState(roomState);
+          }
+        }
       }
     }
     updateHostPartyButton(roomState?.participant_count);
@@ -260,6 +401,11 @@ function handleHostWsMessage(raw) {
       renderHostParticipants(msg.participants);
       updateHostPartyButton(msg.participant_count ?? hostState.participants.length);
     }
+    return;
+  }
+  if (msg.type === "room_closed") {
+    hostIntentionalClose = true;
+    handleHostPermanentDisconnect(String(msg.reason || "Watch Party room ended."));
     return;
   }
   if (msg.type === "error") {
@@ -541,6 +687,23 @@ function buildHostManageView() {
   openBtn.textContent = "Open Party Room";
   inviteRow.append(inviteInput, copyBtn, openBtn);
 
+  const qrRow = document.createElement("div");
+  qrRow.id = "wpHostQrRow";
+  qrRow.className = "wp-host-qr-row";
+  qrRow.hidden = true;
+  const qrBox = document.createElement("div");
+  qrBox.id = "wpHostQrBox";
+  qrBox.className = "wp-host-qr-box";
+  const qrText = document.createElement("div");
+  const qrTitle = document.createElement("div");
+  qrTitle.className = "wp-host-name";
+  qrTitle.textContent = "Scan to join on phone";
+  const qrSub = document.createElement("div");
+  qrSub.className = "wp-host-meta";
+  qrSub.textContent = "Point a phone camera at this QR code to open the Watch Party invite URL.";
+  qrText.append(qrTitle, qrSub);
+  qrRow.append(qrBox, qrText);
+
   const syncRow = document.createElement("div");
   syncRow.className = "wp-host-row";
   const syncMain = document.createElement("div");
@@ -643,6 +806,7 @@ function buildHostManageView() {
   view.append(
     metaRow,
     inviteRow,
+    qrRow,
     syncRow,
     settingsRow,
     addRow,
@@ -756,6 +920,9 @@ async function openHostModal() {
   document.body.appendChild(dialog);
   hostDialogEl = dialog;
   wireHostDialog(dialog);
+  if (hostRoomCode && hostToken) {
+    enterHostManageView();
+  }
   try {
     await dialog.showModal();
   } catch (_) {
@@ -920,6 +1087,7 @@ async function resumeHostRoom(code) {
   hostControlMode = String(hostState?.control_mode || "host_only");
   hostWaitForBuffering = Boolean(hostState?.wait_for_buffering);
   hostSyncActive = true;
+  hostReconnectAttempt = 0;
   setHostSyncToggle(true);
   bindHostCinemaSync(hostCinemaVideo());
   connectHostWs();
@@ -938,9 +1106,26 @@ function enterHostManageView() {
   const inviteEl = $("wpHostInviteLink");
   if (metaTitle) metaTitle.textContent = String((hostState && hostState.title) || "Watch Party");
   if (metaStatus) {
-    metaStatus.textContent = `${hostRoomCode ? `Room ${hostRoomCode}` : ""} • ${hostState?.is_playing ? "Playing" : "Paused"}`.trim();
+    const label = hostState?.paused_for_buffering
+      ? "Waiting for buffering"
+      : (hostState?.is_playing ? "Playing" : "Paused");
+    metaStatus.textContent = `${hostRoomCode ? `Room ${hostRoomCode}` : ""} • ${label}`.trim();
   }
-  if (inviteEl) inviteEl.value = hostInviteUrl();
+  const inviteUrl = hostInviteUrl();
+  if (inviteEl) inviteEl.value = inviteUrl;
+
+  const qrRow = $("wpHostQrRow");
+  const qrBox = $("wpHostQrBox");
+  if (qrRow && qrBox) {
+    qrBox.replaceChildren();
+    const svg = inviteUrl ? renderQrSvg(inviteUrl, { label: `QR code for ${inviteUrl}` }) : null;
+    if (svg) {
+      qrBox.appendChild(svg);
+      qrRow.hidden = false;
+    } else {
+      qrRow.hidden = true;
+    }
+  }
 
   const modeEl = $("wpHostControlMode");
   if (modeEl) modeEl.value = hostControlMode === "everyone" ? "everyone" : "host_only";
@@ -958,26 +1143,21 @@ function enterHostManageView() {
     renderHostQueue(hostState.queue);
     renderHostParticipants(hostState.participants);
     updateHostPartyButton(hostState.participant_count);
-
-    const addBtn = $("wpHostAddActiveBtn");
-    const queuedIds = Array.isArray(hostState?.media_ids)
-      ? hostState.media_ids
-      : (Array.isArray(hostState?.queue_ids) ? hostState.queue_ids : []);
-    const activeId = state.cinemaActiveId ? String(state.cinemaActiveId) : null;
-    if (addBtn) addBtn.hidden = !activeId || !queuedIds.includes(activeId);
   }
+  syncAddActiveBtnVisibility();
 }
 
 function onHostSyncToggle() {
   if (!hostRoomCode) return;
   if (hostSyncActive) {
-    closeHostWs();
+    closeHostWs({ intentional: true });
     hostSyncActive = false;
     setHostSyncToggle(false);
     updateHostPartyButton(hostState?.participant_count);
     return;
   }
   hostSyncActive = true;
+  hostReconnectAttempt = 0;
   bindHostCinemaSync(hostCinemaVideo());
   connectHostWs();
   setHostSyncToggle(true);
@@ -1060,6 +1240,7 @@ function startWatchParty(ev) {
     hostControlMode = String(body.control_mode || "host_only");
     hostWaitForBuffering = Boolean(body.wait_for_buffering);
     hostSyncActive = true;
+    hostReconnectAttempt = 0;
     setHostSyncToggle(true);
     bindHostCinemaSync(hostCinemaVideo());
     connectHostWs();
@@ -1075,13 +1256,22 @@ function hostQueuePlay(mediaId) {
 }
 
 function hostQueueRemove(mediaId) {
-  return hostUpdateRoom({ remove_media_ids: [String(mediaId)] }).catch(() => {});
+  return hostUpdateRoom({ remove_media_ids: [String(mediaId)] })
+    .then(() => {
+      if (hostState) renderHostQueue(hostState.queue);
+      syncAddActiveBtnVisibility();
+    })
+    .catch(() => {});
 }
 
 function hostAddActiveCinemaVideo() {
   const activeId = state.cinemaActiveId ? String(state.cinemaActiveId) : null;
   if (!hostRoomCode || !activeId) return Promise.resolve(false);
-  return hostUpdateRoom({ add_media_ids: [activeId], active_media_id: activeId }).then(() => true);
+  return hostUpdateRoom({ add_media_ids: [activeId], active_media_id: activeId }).then(() => {
+    if (hostState) renderHostQueue(hostState.queue);
+    syncAddActiveBtnVisibility();
+    return true;
+  });
 }
 
 export function initWatchPartyHost({ getCinemaVideos, playCinemaVideo, getVideoElement } = {}) {

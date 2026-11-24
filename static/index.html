@@ -91,7 +91,7 @@
             Forward to Telegram Topic
           </label>
           <label class="checkbox-label"><input id="galleryModeCheck" type="checkbox" /> Gallery mode (gallery-dl)</label>
-          <select id="galleryArchiveMode" class="gallery-mode-select" hidden><option value="items">Individual Files</option><option value="cbz">Pack as CBZ (Comic)</option><option value="zip">Pack as ZIP</option></select> <span id="galleryInstallHint" class="small-muted gallery-hint" hidden>Install gallery-dl: pip install gallery-dl</span>
+          <select id="galleryArchiveMode" class="gallery-mode-select" hidden><option value="items">Individual Files</option><option value="cbz">Pack as CBZ (Comic)</option><option value="zip">Pack as ZIP</option></select><input id="galleryMaxItems" class="gallery-max-items-input" type="number" min="1" max="2000" value="200" title="Max gallery items (1-2000)" aria-label="Max gallery items" hidden /> <span id="galleryInstallHint" class="small-muted gallery-hint" hidden>Install gallery-dl: pip install gallery-dl</span>
         </div>
       </div>
 
@@ -113,9 +113,9 @@
       <div class="drop-row">
         <div id="dropzone" class="dropzone">
           <strong>Drop files, folders, or .torrent</strong> (or click to choose — up to <span id="maxMbLabel">20480</span> MB)
-          <input id="fileInput" type="file" multiple hidden />
-          <input id="folderUploadInput" type="file" webkitdirectory directory multiple hidden />
-          <input id="torrentFileInput" type="file" accept=".torrent,application/x-bittorrent" hidden />
+          <input id="fileInput" class="sr-only-input" type="file" multiple />
+          <input id="folderUploadInput" class="sr-only-input" type="file" webkitdirectory directory multiple />
+          <input id="torrentFileInput" class="sr-only-input" type="file" accept=".torrent,application/x-bittorrent" />
         </div>
         <button type="button" id="selectFolderBtn" class="secondary select-folder-btn">Select Folder</button>
         <button type="button" id="selectTorrentBtn" class="secondary select-folder-btn">Leech .torrent</button>

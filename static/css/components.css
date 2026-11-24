@@ -125,6 +125,7 @@
 }
 
 .dropzone {
+  position: relative;
   flex: 1;
   min-width: 240px;
   border: 1.5px dashed var(--border);
@@ -3166,6 +3167,12 @@ dialog.torrent-modal {
   border-color: var(--accent);
 }
 
+.gallery-max-items-input {
+  width: 84px;
+  padding: 6px 8px;
+  font-size: 0.85rem;
+}
+
 .gallery-status-hint {
   font-size: 0.8rem;
   color: var(--muted);
@@ -3226,6 +3233,34 @@ dialog.wp-host-dialog::backdrop {
   flex: 1 1 220px;
   font-family: monospace;
   font-size: 0.8rem;
+}
+
+.wp-host-qr-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.wp-host-qr-box {
+  flex: none;
+  width: 112px;
+  height: 112px;
+  padding: 4px;
+  background: #ffffff;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.wp-host-qr-svg {
+  width: 100%;
+  height: 100%;
+  display: block;
 }
 
 .wp-host-list {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import importlib.metadata
 import json
@@ -11,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -40,9 +42,12 @@ class GalleryQuotaError(GalleryError):
 
 _gallery_dl_update_lock = asyncio.Lock()
 
-# Version probes spawn ``gallery-dl --version``; cache per binary path so
-# ``/api/health`` does not fork a process on every request.
-_gallery_dl_version_cache: dict[str, str | None] = {}
+# Version probes spawn ``gallery-dl --version``; cache per binary path with a
+# TTL so ``/api/health`` and ``/api/leech/status`` never fork a subprocess on
+# every request.
+_GALLERY_DL_VERSION_TTL_SEC = 300.0
+_gallery_dl_version_lock = threading.Lock()
+_gallery_dl_version_cache: dict[str, tuple[float, str | None]] = {}
 
 _GALLERY_MAX_TOTAL_MB_DEFAULT = 4096
 
@@ -66,6 +71,14 @@ _WHITESPACE_RE = re.compile(r"\s+")
 _NATURAL_SPLIT_RE = re.compile(r"(\d+)")
 
 
+async def _rmtree_async(path: Path) -> None:
+    try:
+        await asyncio.to_thread(shutil.rmtree, path, ignore_errors=True)
+    except asyncio.CancelledError:
+        shutil.rmtree(path, ignore_errors=True)
+        raise
+
+
 def find_gallery_dl_cmd() -> list[str] | None:
     """Locate the gallery-dl executable (venv console script first)."""
     venv_gallery_dl = Path(sys.executable).parent / "gallery-dl"
@@ -78,11 +91,21 @@ def find_gallery_dl_cmd() -> list[str] | None:
 
 
 def _clear_gallery_dl_version_cache() -> None:
-    _gallery_dl_version_cache.clear()
+    with _gallery_dl_version_lock:
+        _gallery_dl_version_cache.clear()
+
+
+def _get_cached_gallery_dl_version(cache_key: str) -> tuple[bool, str | None]:
+    now = time.monotonic()
+    with _gallery_dl_version_lock:
+        entry = _gallery_dl_version_cache.get(cache_key)
+        if entry is not None and (now - entry[0]) < _GALLERY_DL_VERSION_TTL_SEC:
+            return True, entry[1]
+    return False, None
 
 
 def get_gallery_dl_version_sync() -> str | None:
-    """Return the installed gallery-dl version without blocking health checks."""
+    """Return the installed gallery-dl version (TTL-cached)."""
     try:
         return importlib.metadata.version("gallery-dl")
     except importlib.metadata.PackageNotFoundError:
@@ -95,8 +118,9 @@ def get_gallery_dl_version_sync() -> str | None:
         return None
 
     cache_key = str(cmd[0])
-    if cache_key in _gallery_dl_version_cache:
-        return _gallery_dl_version_cache[cache_key]
+    hit, cached = _get_cached_gallery_dl_version(cache_key)
+    if hit:
+        return cached
 
     version: str | None = None
     try:
@@ -115,8 +139,28 @@ def get_gallery_dl_version_sync() -> str | None:
     except Exception:
         version = None
 
-    _gallery_dl_version_cache[cache_key] = version
+    with _gallery_dl_version_lock:
+        _gallery_dl_version_cache[cache_key] = (time.monotonic(), version)
     return version
+
+
+async def get_gallery_dl_version_async() -> str | None:
+    """Return the installed gallery-dl version without blocking the event loop."""
+    try:
+        return importlib.metadata.version("gallery-dl")
+    except importlib.metadata.PackageNotFoundError:
+        pass
+    except Exception:
+        pass
+
+    cmd = find_gallery_dl_cmd()
+    if cmd is None:
+        return None
+
+    hit, cached = _get_cached_gallery_dl_version(str(cmd[0]))
+    if hit:
+        return cached
+    return await asyncio.to_thread(get_gallery_dl_version_sync)
 
 
 def get_gallery_dl_status(settings: Settings | None = None) -> dict[str, Any]:
@@ -141,6 +185,29 @@ def get_gallery_dl_status(settings: Settings | None = None) -> dict[str, Any]:
     }
 
 
+async def get_gallery_dl_status_async(settings: Settings | None = None) -> dict[str, Any]:
+    """Async variant of :func:`get_gallery_dl_status` that never blocks the loop."""
+    cmd = find_gallery_dl_cmd()
+    enabled = bool(getattr(settings, "gallery_dl_enabled", True)) if settings else True
+    version = await get_gallery_dl_version_async() if cmd is not None else None
+    return {
+        "enabled": enabled,
+        "installed": cmd is not None,
+        "binary": cmd[0] if cmd else None,
+        "version": version,
+        "default_max_items": int(getattr(settings, "gallery_dl_default_max_items", 200))
+        if settings
+        else 200,
+        "max_items_cap": int(getattr(settings, "gallery_dl_max_items_cap", 500))
+        if settings
+        else 500,
+        "max_total_mb": int(getattr(settings, "gallery_dl_max_total_mb", 4096))
+        if settings
+        else 4096,
+        "install_hint": "pip install gallery-dl" if cmd is None else None,
+    }
+
+
 async def update_gallery_dl() -> dict[str, Any]:
     """Upgrade gallery-dl in the current Python environment."""
     async with _gallery_dl_update_lock:
@@ -150,7 +217,7 @@ async def update_gallery_dl() -> dict[str, Any]:
                 "gallery-dl is not installed. Install it with: pip install gallery-dl"
             )
 
-        before = get_gallery_dl_version_sync()
+        before = await get_gallery_dl_version_async()
         code, out, err = await ingest_mod._run_subprocess(
             sys.executable,
             "-m",
@@ -164,7 +231,7 @@ async def update_gallery_dl() -> dict[str, Any]:
             raise RuntimeError(f"Failed to update gallery-dl: {detail}")
 
         _clear_gallery_dl_version_cache()
-        after = get_gallery_dl_version_sync()
+        after = await get_gallery_dl_version_async()
         return {
             "ok": True,
             "before": before,
@@ -418,6 +485,20 @@ class GalleryIngestService:
     def get_status(self) -> dict[str, Any]:
         return get_gallery_dl_status(self.settings)
 
+    async def get_status_async(self) -> dict[str, Any]:
+        return await get_gallery_dl_status_async(self.settings)
+
+    @contextlib.asynccontextmanager
+    async def _acquire_active_slot(self, sem: asyncio.Semaphore):
+        async with sem:
+            self.ingest._active_slots = getattr(self.ingest, "_active_slots", 0) + 1
+            try:
+                yield
+            finally:
+                self.ingest._active_slots = max(
+                    0, getattr(self.ingest, "_active_slots", 0) - 1
+                )
+
     def _staging_buffer_bytes(self) -> int:
         raw_mb = getattr(self.settings, "torrent_min_free_buffer_mb", None)
         if raw_mb is None:
@@ -482,7 +563,6 @@ class GalleryIngestService:
         on_progress: ProgressHook | None = None,
     ) -> list[dict[str, Any]]:
         job_dir: Path | None = None
-        slot_acquired = False
         try:
             if job_id in self.ingest._cancelled_jobs:
                 raise asyncio.CancelledError()
@@ -514,10 +594,7 @@ class GalleryIngestService:
             await asyncio.to_thread(self._ensure_staging_free, buffer_bytes)
 
             sem = self.ingest.semaphore
-            slot_acquired = False
-            self.ingest._active_slots = getattr(self.ingest, "_active_slots", 0) + 1
-            slot_acquired = True
-            async with sem:
+            async with self._acquire_active_slot(sem):
                 if job_id in self.ingest._cancelled_jobs:
                     raise asyncio.CancelledError()
 
@@ -736,7 +813,7 @@ class GalleryIngestService:
                         archive_mode=mode,
                     )
                     # Free the raw pages before the archive is uploaded/mirrored.
-                    shutil.rmtree(download_dir, ignore_errors=True)
+                    await _rmtree_async(download_dir)
 
                     async def report_archive(
                         pct: float, message: str
@@ -768,6 +845,7 @@ class GalleryIngestService:
                     items.append(item)
                 else:
                     total = len(files)
+                    base_item_url = clean_url.split("#", 1)[0]
                     for idx, file_path in enumerate(files, start=1):
                         if job_id in self.ingest._cancelled_jobs:
                             raise asyncio.CancelledError()
@@ -814,7 +892,7 @@ class GalleryIngestService:
                             if on_progress:
                                 await on_progress(overall, message)
 
-                        file_source_url = f"{clean_url}#item={idx}"
+                        file_source_url = f"{base_item_url}#item={idx}"
                         item = await self.ingest.finalize_staged_file(
                             file_path,
                             folder=safe_folder,
@@ -827,7 +905,7 @@ class GalleryIngestService:
                             progress_cb=report_item,
                             force=force,
                         )
-                        file_path.unlink(missing_ok=True)
+                        await asyncio.to_thread(file_path.unlink, missing_ok=True)
                         items.append(item)
 
                 if items and all(i.get("deduplicated") for i in items):
@@ -878,12 +956,8 @@ class GalleryIngestService:
             )
             raise
         finally:
-            if slot_acquired:
-                self.ingest._active_slots = max(
-                    0, getattr(self.ingest, "_active_slots", 0) - 1
-                )
             if job_dir is not None:
-                shutil.rmtree(job_dir, ignore_errors=True)
+                await _rmtree_async(job_dir)
                 try:
                     self.ingest.unregister_staging_dir(job_dir)
                 except Exception:

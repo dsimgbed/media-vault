@@ -983,3 +983,364 @@ def test_cbz_cover_thumbnail_skips_traversal_entries(tmp_path):
     assert ok is True
     assert out_path.is_file() and out_path.stat().st_size > 0
 
+
+# ---------- v0.13.1 Regression Tests ----------
+
+
+def test_normalize_source_url_preserves_item_fragment_and_backfills_legacy_rows(tmp_path: Path):
+    from app.db import Database, normalize_source_url
+
+    base = "https://example.com/gallery/42"
+    assert normalize_source_url(f"{base}#item=1") == f"{base}#item=1"
+    assert normalize_source_url(f"{base}#item=2") == f"{base}#item=2"
+    assert normalize_source_url(f"{base}#ITEM=Page_3") == f"{base}#item=Page_3"
+    # Arbitrary web fragments are still stripped
+    assert normalize_source_url(f"{base}#comments") == base
+    assert normalize_source_url(f"{base}?utm_source=x#top") == base
+
+    # Legacy DB rows that had `#item=...` stripped in normalized_source_url are repaired on init
+    # while single-URL rows remain untouched.
+    db_path = tmp_path / "legacy.db"
+    db = Database(db_path)
+    single_row = db.insert_media(
+        media_id="single-1",
+        title="Single",
+        filename="single.jpg",
+        media_type="image",
+        mime_type="image/jpeg",
+        size_bytes=100,
+        drive_name="local",
+        file_path=str(tmp_path / "single.jpg"),
+        thumb_filename=None,
+        folder="General",
+        source_origin="web",
+        source_kind="url",
+        source_url="https://example.com/post/1#top",
+    )
+    assert single_row["normalized_source_url"] == "https://example.com/post/1"
+
+    db.insert_media(
+        media_id="gal-1",
+        title="Gal 1",
+        filename="01.jpg",
+        media_type="image",
+        mime_type="image/jpeg",
+        size_bytes=100,
+        drive_name="local",
+        file_path=str(tmp_path / "01.jpg"),
+        thumb_filename=None,
+        folder="General",
+        source_origin="web",
+        source_kind="gallery",
+        source_url=f"{base}#item=1",
+    )
+    db.insert_media(
+        media_id="gal-2",
+        title="Gal 2",
+        filename="02.jpg",
+        media_type="image",
+        mime_type="image/jpeg",
+        size_bytes=100,
+        drive_name="local",
+        file_path=str(tmp_path / "02.jpg"),
+        thumb_filename=None,
+        folder="General",
+        source_origin="web",
+        source_kind="gallery",
+        source_url=f"{base}#item=2",
+    )
+    # Simulate pre-v0.13.1 corrupted normalized_source_url values
+    with db._connect() as conn:
+        conn.execute(
+            "UPDATE media_items SET normalized_source_url = ? WHERE id IN ('gal-1', 'gal-2')",
+            (base,),
+        )
+    db.close()
+
+    reopened = Database(db_path)
+    try:
+        assert reopened.get_media("single-1")["normalized_source_url"] == "https://example.com/post/1"
+        assert reopened.get_media("gal-1")["normalized_source_url"] == f"{base}#item=1"
+        assert reopened.get_media("gal-2")["normalized_source_url"] == f"{base}#item=2"
+        assert reopened.find_media_by_source_url(f"{base}#item=1")["id"] == "gal-1"
+        assert reopened.find_media_by_source_url(f"{base}#item=2")["id"] == "gal-2"
+    finally:
+        reopened.close()
+
+
+@pytest.mark.anyio
+async def test_gallery_items_mode_multi_file_saves_all_distinct_and_deduplicates_second_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    settings = _make_settings(tmp_path)
+    app = create_app(settings)
+    db = app.state.db
+    gallery_svc = app.state.gallery
+
+    colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+    images: list[bytes] = []
+    for color in colors:
+        buf = io.BytesIO()
+        Image.new("RGB", (32, 32), color).save(buf, format="PNG")
+        images.append(buf.getvalue())
+
+    async def fake_streaming(*args, on_line=None, on_proc=None):
+        dest_idx = args.index("--dest") + 1
+        dest_dir = Path(args[dest_idx])
+        sub = dest_dir / "artist_set"
+        sub.mkdir(parents=True, exist_ok=True)
+        for i, payload in enumerate(images, start=1):
+            (sub / f"{i:02d}.png").write_bytes(payload)
+        return 0, []
+
+    monkeypatch.setattr("app.ingest._run_subprocess_streaming", fake_streaming)
+    monkeypatch.setattr("app.gallery_ingest.find_gallery_dl_cmd", lambda: ["gallery-dl"])
+
+    gallery_url = "https://example.com/albums/multi-set"
+
+    # First run with force=False (default): all 3 distinct images must be saved as 3 distinct media_items.
+    job1 = db.create_job("web", "gallery", gallery_url)
+    items1 = await gallery_svc.ingest_gallery_job(
+        job1,
+        gallery_url,
+        folder="Albums",
+        archive_mode="items",
+        forward_to_telegram=False,
+        force=False,
+    )
+    assert len(items1) == 3
+    ids1 = [it["id"] for it in items1]
+    assert len(set(ids1)) == 3
+    assert all(not it.get("deduplicated") for it in items1)
+    assert [it["normalized_source_url"] for it in items1] == [
+        f"{gallery_url}#item=1",
+        f"{gallery_url}#item=2",
+        f"{gallery_url}#item=3",
+    ]
+    _, total1 = db.list_media(limit=100)
+    assert total1 == 3
+
+    # Second run with force=False: all 3 items must cleanly deduplicate back to the existing 3 rows.
+    job2 = db.create_job("web", "gallery", gallery_url)
+    items2 = await gallery_svc.ingest_gallery_job(
+        job2,
+        gallery_url,
+        folder="Albums",
+        archive_mode="items",
+        forward_to_telegram=False,
+        force=False,
+    )
+    assert len(items2) == 3
+    assert [it["id"] for it in items2] == ids1
+    assert all(it.get("deduplicated") is True for it in items2)
+    _, total2 = db.list_media(limit=100)
+    assert total2 == 3
+
+
+def test_extract_magnet_infohash_bep52_btmh_and_hybrid():
+    v2_digest = "A1B2C3D4" * 8  # 64 hex chars
+    v2_magnet = f"magnet:?xt=urn:btmh:1220{v2_digest}&dn=v2-release"
+    assert extract_magnet_infohash(v2_magnet) == v2_digest[:40].lower()
+
+    # Hybrid magnet with both btih and btmh prefers btih
+    v1_hash = "deadbeef" * 5
+    hybrid = f"magnet:?xt=urn:btmh:1220{v2_digest}&xt=urn:btih:{v1_hash}"
+    assert extract_magnet_infohash(hybrid) == v1_hash
+
+    # Invalid btmh length (not 64 hex chars after 1220) returns None
+    bad_btmh = "magnet:?xt=urn:btmh:1220" + "ab" * 10
+    assert extract_magnet_infohash(bad_btmh) is None
+
+
+def test_parse_torrent_bytes_bep52_file_tree_and_traversal_rejection():
+    info_multi = {
+        b"file tree": {
+            b"Season1": {
+                b"ep01.mp4": {b"": {b"length": 4096, b"pieces root": b"\x11" * 32}},
+                b"notes.txt": {b"": {b"length": 128}},
+            },
+            b".pad": {
+                b"0": {b"": {b"length": 512, b"attr": b"p"}},
+            },
+        },
+        b"meta version": 2,
+        b"name": b"MyV2Show",
+        b"piece length": 16384,
+    }
+    raw_multi = bencode({b"announce": b"http://tracker.local/announce", b"info": info_multi})
+    parsed = parse_torrent_bytes(raw_multi)
+    expected_hash = hashlib.sha256(bencode(info_multi)).hexdigest()[:40]
+    assert parsed["infohash"] == expected_hash
+    assert parsed["name"] == "MyV2Show"
+    assert parsed["is_multi_file"] is True
+    assert parsed["file_count"] == 3
+    by_name = {f["name"]: f for f in parsed["files"]}
+    assert by_name["ep01.mp4"]["path"] == "MyV2Show/Season1/ep01.mp4"
+    assert by_name["ep01.mp4"]["size_bytes"] == 4096
+    assert by_name["ep01.mp4"]["selected_default"] is True
+    assert by_name["notes.txt"]["selected_default"] is False
+    assert by_name["0"]["selected_default"] is False
+
+    # Single-file BEP-52 tree
+    info_single = {
+        b"file tree": {
+            b"solo.mkv": {b"": {b"length": 2048, b"pieces root": b"\x22" * 32}},
+        },
+        b"meta version": 2,
+        b"name": b"solo.mkv",
+        b"piece length": 16384,
+    }
+    parsed_single = parse_torrent_bytes(bencode({b"info": info_single}))
+    assert parsed_single["is_multi_file"] is False
+    assert parsed_single["file_count"] == 1
+    assert parsed_single["files"][0]["path"] == "solo.mkv"
+    assert parsed_single["files"][0]["size_bytes"] == 2048
+
+    # Traversal inside file tree must be rejected via _validate_path_segment()
+    info_evil = {
+        b"file tree": {
+            b"..": {
+                b"escape.mp4": {b"": {b"length": 100}},
+            },
+        },
+        b"meta version": 2,
+        b"name": b"EvilV2",
+        b"piece length": 16384,
+    }
+    with pytest.raises(BencodeError):
+        parse_torrent_bytes(bencode({b"info": info_evil}))
+
+
+@pytest.mark.anyio
+async def test_active_slots_incremented_only_inside_semaphore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    settings = _make_settings(tmp_path)
+    settings.torrent_concurrency = 1
+    settings.ingest_concurrency = 1
+    app = create_app(settings)
+    db = app.state.db
+    ingest = app.state.ingest
+
+    # --- Torrent concurrency=1: second job waits on semaphore; _active_slots must stay 1 ---
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    call_num = 0
+
+    async def fake_aria2(*args, on_line=None, on_proc=None):
+        nonlocal call_num
+        call_num += 1
+        my_num = call_num
+        d = Path(args[args.index("--dir") + 1])
+        (d / f"clip_{my_num}.mp4").write_bytes(b"video-data")
+        if my_num == 1:
+            first_entered.set()
+            await release_first.wait()
+        return 0, []
+
+    monkeypatch.setattr("app.ingest._run_subprocess_streaming", fake_aria2)
+    monkeypatch.setattr("app.torrent_ingest.find_aria2c", lambda: "/usr/bin/aria2c")
+
+    t1_id = db.create_job("web", "torrent", "magnet:?xt=urn:btih:" + "1" * 40)
+    t2_id = db.create_job("web", "torrent", "magnet:?xt=urn:btih:" + "2" * 40)
+    task1 = asyncio.create_task(
+        app.state.torrent.process_torrent_job(
+            t1_id, magnet="magnet:?xt=urn:btih:" + "1" * 40, forward_to_telegram=False
+        )
+    )
+    await first_entered.wait()
+    task2 = asyncio.create_task(
+        app.state.torrent.process_torrent_job(
+            t2_id, magnet="magnet:?xt=urn:btih:" + "2" * 40, forward_to_telegram=False
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert ingest._active_slots == 1
+    release_first.set()
+    await asyncio.gather(task1, task2)
+    assert ingest._active_slots == 0
+
+    # --- Gallery concurrency=1: second job waits on semaphore; _active_slots must stay 1 ---
+    g_entered = asyncio.Event()
+    g_release = asyncio.Event()
+    g_num = 0
+
+    async def fake_gallery(*args, on_line=None, on_proc=None):
+        nonlocal g_num
+        g_num += 1
+        my_num = g_num
+        d = Path(args[args.index("--dest") + 1])
+        buf = io.BytesIO()
+        Image.new("RGB", (16, 16), (10 * my_num, 20, 30)).save(buf, format="PNG")
+        (d / f"img_{my_num}.png").write_bytes(buf.getvalue())
+        if my_num == 1:
+            g_entered.set()
+            await g_release.wait()
+        return 0, []
+
+    monkeypatch.setattr("app.ingest._run_subprocess_streaming", fake_gallery)
+    monkeypatch.setattr("app.gallery_ingest.find_gallery_dl_cmd", lambda: ["gallery-dl"])
+
+    g1_id = db.create_job("web", "gallery", "https://example.com/g/1")
+    g2_id = db.create_job("web", "gallery", "https://example.com/g/2")
+    gtask1 = asyncio.create_task(
+        app.state.gallery.ingest_gallery_job(
+            g1_id, "https://example.com/g/1", forward_to_telegram=False
+        )
+    )
+    await g_entered.wait()
+    gtask2 = asyncio.create_task(
+        app.state.gallery.ingest_gallery_job(
+            g2_id, "https://example.com/g/2", forward_to_telegram=False
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert ingest._active_slots == 1
+    g_release.set()
+    await asyncio.gather(gtask1, gtask2)
+    assert ingest._active_slots == 0
+
+
+@pytest.mark.anyio
+async def test_aria2c_and_gallery_dl_version_probes_are_ttl_cached(monkeypatch: pytest.MonkeyPatch):
+    import subprocess
+    from types import SimpleNamespace
+    import app.torrent_ingest as ti
+    import app.gallery_ingest as gi
+
+    ti._clear_aria2c_version_cache()
+    gi._clear_gallery_dl_version_cache()
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if cmd[0] == "/fake/aria2c":
+            return SimpleNamespace(returncode=0, stdout="aria2 version 1.37.0\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="1.27.5\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(ti, "find_aria2c", lambda: "/fake/aria2c")
+    monkeypatch.setattr(gi, "find_gallery_dl_cmd", lambda: ["/fake/gallery-dl"])
+
+    v1 = await ti.get_aria2c_version_async()
+    v2 = await ti.get_aria2c_version_async()
+    assert v1 == "1.37.0" and v2 == "1.37.0"
+    assert sum(1 for c in calls if c[0] == "/fake/aria2c") == 1
+
+    g1 = await gi.get_gallery_dl_version_async()
+    g2 = await gi.get_gallery_dl_version_async()
+    assert g1 == "1.27.5" and g2 == "1.27.5"
+    assert sum(1 for c in calls if c[0] == "/fake/gallery-dl") == 1
+
+    # Cache invalidation / force refresh re-probes
+    await ti.get_aria2c_version_async(force_refresh=True)
+    gi._clear_gallery_dl_version_cache()
+    await gi.get_gallery_dl_version_async()
+    assert sum(1 for c in calls if c[0] == "/fake/aria2c") == 2
+    assert sum(1 for c in calls if c[0] == "/fake/gallery-dl") == 2
+
+    ti._clear_aria2c_version_cache()
+    gi._clear_gallery_dl_version_cache()
+
+

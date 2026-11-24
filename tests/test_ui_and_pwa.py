@@ -182,3 +182,60 @@ def test_module1_multi_tag_filtering_and_tag_picker_ui(tmp_path: Path):
 
         res_combined = client.get("/api/media?tag=soap&tags=4k").json()
         assert [it["id"] for it in res_combined["items"]] == ["m2"]
+
+
+def test_v0131_uploader_gallery_controls_sr_only_inputs_and_sw_v7(tmp_path: Path):
+    settings = _make_settings(tmp_path)
+    app = create_app(settings)
+
+    index_text = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    assert len(index_text.splitlines()) < 350
+
+    with TestClient(app) as client:
+        html = client.get("/").text
+        # #galleryMaxItems compact numeric input is present alongside #galleryArchiveMode
+        assert 'id="galleryMaxItems"' in html
+        assert 'min="1"' in html and 'max="2000"' in html and 'value="200"' in html
+
+        # File inputs use visually-hidden .sr-only-input class instead of hidden attribute (Android WebView)
+        for input_id in ("fileInput", "folderUploadInput", "torrentFileInput"):
+            assert f'id="{input_id}" class="sr-only-input"' in html
+
+        base_css = client.get("/static/css/base.css").text
+        assert ".sr-only-input" in base_css
+        assert "pointer-events: none;" in base_css
+
+        uploader_js = client.get("/static/js/features/uploader.js").text
+        # galleryInstallHint must be hidden when BOTH galleryDlInstalled && galleryDlEnabled are truthy
+        assert "installHint.hidden = Boolean(state.galleryDlInstalled && state.galleryDlEnabled)" in uploader_js
+
+        sw_js = client.get("/sw.js").text
+        assert 'const CACHE_NAME = "media-vault-shell-v7";' in sw_js
+
+
+def test_v0131_read_cached_html_caches_by_mtime_and_invalidates(tmp_path: Path):
+    import asyncio
+    import os
+    from app.routers.deps import clear_html_cache, read_cached_html
+
+    clear_html_cache()
+    page = tmp_path / "sample.html"
+    page.write_text("<h1>v1</h1>", encoding="utf-8")
+
+    first = asyncio.run(read_cached_html(page))
+    assert first == "<h1>v1</h1>"
+    second = asyncio.run(read_cached_html(page))
+    assert second == "<h1>v1</h1>"
+
+    # Update content and bump mtime_ns -> cache must invalidate and return new content
+    page.write_text("<h1>v2</h1>", encoding="utf-8")
+    st = page.stat()
+    os.utime(page, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+    third = asyncio.run(read_cached_html(page))
+    assert third == "<h1>v2</h1>"
+
+    # Deleted file returns None
+    page.unlink()
+    assert asyncio.run(read_cached_html(page)) is None
+    clear_html_cache()
+

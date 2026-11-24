@@ -15,6 +15,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 _TAG_TOKEN_RE = re.compile(r"[^a-z0-9_-]+")
 _FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]+")
+_ITEM_FRAGMENT_RE = re.compile(r"^item=[A-Za-z0-9._-]+$", re.IGNORECASE)
 
 _TRACKING_QUERY_PARAMS = {
     "si",
@@ -98,7 +99,10 @@ def normalize_source_url(url: str | None) -> str | None:
 
     filtered_params.sort(key=lambda kv: (kv[0], kv[1]))
     query = urlencode(filtered_params, doseq=True)
-    return urlunsplit((scheme, netloc, path, query, ""))
+    fragment = ""
+    if parts.fragment and _ITEM_FRAGMENT_RE.match(parts.fragment):
+        fragment = f"item={parts.fragment[5:]}"
+    return urlunsplit((scheme, netloc, path, query, fragment))
 
 
 def normalize_tags(raw: str | list[str] | tuple[str, ...] | None) -> list[str]:
@@ -512,13 +516,26 @@ class Database:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_media_size_bytes ON media_items(size_bytes)")
 
             url_rows = conn.execute(
-                "SELECT id, source_url FROM media_items WHERE source_url IS NOT NULL AND source_url != '' AND normalized_source_url IS NULL"
+                """
+                SELECT id, source_url, normalized_source_url FROM media_items
+                WHERE source_url IS NOT NULL AND source_url != ''
+                  AND (
+                      normalized_source_url IS NULL
+                      OR (source_url LIKE '%#item=%' AND normalized_source_url NOT LIKE '%#item=%')
+                  )
+                """
             ).fetchall()
             if url_rows:
-                conn.executemany(
-                    "UPDATE media_items SET normalized_source_url = ? WHERE id = ?",
-                    [(normalize_source_url(r["source_url"]), r["id"]) for r in url_rows],
-                )
+                updates = [
+                    (new_norm, r["id"])
+                    for r in url_rows
+                    if (new_norm := normalize_source_url(r["source_url"])) != r["normalized_source_url"]
+                ]
+                if updates:
+                    conn.executemany(
+                        "UPDATE media_items SET normalized_source_url = ? WHERE id = ?",
+                        updates,
+                    )
 
             job_cols = {r["name"] for r in conn.execute("PRAGMA table_info(ingest_jobs)").fetchall()}
             if "progress" not in job_cols:

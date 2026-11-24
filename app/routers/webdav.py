@@ -9,8 +9,11 @@ from fastapi.responses import Response, StreamingResponse
 from app.context import AppContext
 from app.media_ops import (
     _parse_range_header,
+    build_range_headers,
     iter_source_range,
+    normalize_range_header,
     prefetch_multipart_first,
+    resolve_head_file_size,
     resolve_media_source,
 )
 from app.routers.deps import get_ctx
@@ -66,13 +69,6 @@ def _webdav_prefix(request: Request) -> str:
     if root_path.endswith("/webdav"):
         return root_path
     return f"{root_path}/webdav"
-
-
-def _normalize_range(range_header: str) -> str:
-    normalized = str(range_header or "").strip()
-    if normalized[:6].lower() == "bytes=":
-        normalized = "bytes=" + normalized[6:].strip()
-    return normalized
 
 
 def _node_metadata(node: WebDavNode) -> tuple[str, str]:
@@ -198,20 +194,8 @@ def _head_file_metadata(
     full_item = ctx.db.get_media(str(item.get("id") or ""))
     if full_item is None:
         return None
-
-    raw_path = str(full_item.get("file_path") or "").strip()
-    local_path = Path(raw_path) if raw_path else None
-    parts = full_item.get("parts") or []
-    try:
-        if local_path is not None and local_path.is_file():
-            file_size = local_path.stat().st_size
-        elif len(parts) > 1:
-            file_size = int(full_item.get("size_bytes") or 0)
-        elif full_item.get("telegram_chat_id") and full_item.get("telegram_msg_id"):
-            file_size = int(full_item.get("size_bytes") or 0)
-        else:
-            return None
-    except (OSError, TypeError, ValueError):
+    file_size = resolve_head_file_size(full_item)
+    if file_size is None:
         return None
     return full_item, file_size
 
@@ -271,28 +255,28 @@ async def _handle_head(
             },
         )
 
-    start, end = 0, max(0, file_size - 1)
+    bounds: tuple[int, int] | None = None
     if range_header:
         try:
-            start, end = _parse_range_header(
-                _normalize_range(range_header), file_size
+            bounds = _parse_range_header(
+                normalize_range_header(range_header), file_size
             )
         except (ValueError, TypeError):
             return _range_not_satisfiable(file_size)
 
-    headers = {
-        "Content-Type": str(full_item.get("mime_type") or "application/octet-stream"),
-        "Accept-Ranges": "bytes",
-        "Content-Length": str(end - start + 1 if range_header else file_size),
-        "ETag": etag,
-        "Last-Modified": last_modified,
-        "DAV": "1",
-        "Cache-Control": "private, no-cache",
-    }
-    if range_header:
-        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+    status_code, headers = build_range_headers(
+        file_size,
+        range_bounds=bounds,
+        base_headers={
+            "Content-Type": str(full_item.get("mime_type") or "application/octet-stream"),
+            "ETag": etag,
+            "Last-Modified": last_modified,
+            "DAV": "1",
+            "Cache-Control": "private, no-cache",
+        },
+    )
     return Response(
-        status_code=206 if range_header else 200,
+        status_code=status_code,
         content=b"",
         headers=headers,
     )
@@ -348,14 +332,16 @@ async def _handle_get(
             int(exc.status_code), str(exc.detail), **{"Cache-Control": "no-store"}
         )
 
-    start, end = 0, max(0, file_size - 1)
+    bounds: tuple[int, int] | None = None
     if range_header:
         try:
-            start, end = _parse_range_header(
-                _normalize_range(range_header), file_size
+            bounds = _parse_range_header(
+                normalize_range_header(range_header), file_size
             )
         except (ValueError, TypeError):
             return _range_not_satisfiable(file_size)
+
+    start, end = bounds if bounds is not None else (0, max(0, file_size - 1))
 
     prefetched: dict[int, tuple[Any, Any]] | None = None
     if source["kind"] == "multipart" and file_size > 0:
@@ -371,20 +357,20 @@ async def _handle_get(
     else:
         body = iter([b""])
 
-    headers = {
-        "Accept-Ranges": "bytes",
-        "Content-Length": str(end - start + 1 if range_header else file_size),
-        "ETag": etag,
-        "Last-Modified": last_modified,
-        "DAV": "1",
-        "Cache-Control": "private, no-cache",
-    }
-    if range_header:
-        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+    status_code, headers = build_range_headers(
+        file_size,
+        range_bounds=bounds,
+        base_headers={
+            "ETag": etag,
+            "Last-Modified": last_modified,
+            "DAV": "1",
+            "Cache-Control": "private, no-cache",
+        },
+    )
 
     return StreamingResponse(
         body,
-        status_code=206 if range_header else 200,
+        status_code=status_code,
         media_type=str(full_item.get("mime_type") or "application/octet-stream"),
         headers=headers,
     )

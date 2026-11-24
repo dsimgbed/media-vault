@@ -77,7 +77,7 @@ function syncGalleryControls() {
     if (formatSelect) formatSelect.hidden = true;
     if (inspectFormatsBtn) inspectFormatsBtn.hidden = true;
     if (inspectPlaylistBtn) inspectPlaylistBtn.hidden = true;
-    if (installHint) installHint.hidden = !(state.galleryDlInstalled && state.galleryDlEnabled);
+    if (installHint) installHint.hidden = Boolean(state.galleryDlInstalled && state.galleryDlEnabled);
   } else {
     if (archiveModeEl) archiveModeEl.hidden = true;
     if (maxItemsEl) maxItemsEl.hidden = true;
@@ -296,7 +296,7 @@ export function initUploader() {
               folder: selectedFolder(),
               tags: selectedTags(),
               archive_mode: $("galleryArchiveMode")?.value || "items",
-              max_items: Number($("galleryMaxItems")?.value || 200),
+              max_items: Math.max(1, Math.min(2000, Math.round(Number($("galleryMaxItems")?.value)) || 200)),
               forward_to_telegram: shouldForwardToTelegram(),
               force: shouldForceIngest(),
             }),

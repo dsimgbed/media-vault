@@ -23,16 +23,11 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 
 from app.context import STATIC_DIR, AppContext
-from app.media_ops import (
-    _parse_range_header,
-    iter_source_range,
-    prefetch_multipart_first,
-    resolve_media_source,
-)
-from app.routers.deps import get_ctx, require_auth
+from app.media_ops import build_media_stream_response
+from app.routers.deps import get_ctx, read_cached_html, require_auth
 from app.schemas import (
     WatchPartyCreateRequest,
     WatchPartyHostSessionRequest,
@@ -60,6 +55,7 @@ _WATCH_PARTY_SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "no-referrer",
+    "X-Robots-Tag": "noindex, nofollow",
     "Content-Security-Policy": (
         "default-src 'self'; script-src 'self'; style-src 'self'; "
         "img-src 'self' data: blob:; media-src 'self' blob:; "
@@ -73,6 +69,7 @@ _MEDIA_PROXY_HEADERS = {
     "Cache-Control": "private, no-store",
     "Referrer-Policy": "no-referrer",
     "X-Content-Type-Options": "nosniff",
+    "X-Robots-Tag": "noindex, nofollow",
 }
 
 _THUMB_HEADERS = {
@@ -185,15 +182,15 @@ async def watch_party_page(room_code: str):
             status_code=400,
             headers=_WATCH_PARTY_SECURITY_HEADERS,
         )
-    page = STATIC_DIR / "watch-party.html"
-    if not page.is_file():
+    html = await read_cached_html(STATIC_DIR / "watch-party.html")
+    if html is None:
         return HTMLResponse(
             "<h1>Watch party page missing</h1>",
             status_code=404,
             headers=_WATCH_PARTY_SECURITY_HEADERS,
         )
     return HTMLResponse(
-        page.read_text(encoding="utf-8"),
+        html,
         headers=_WATCH_PARTY_SECURITY_HEADERS,
     )
 
@@ -376,80 +373,11 @@ async def stream_watch_party_media(
 ):
     token = _extract_room_token(request, wp_token)
     item = _authorized_media_item(ctx, room_code, media_id, token)
-    mime_type = str(item.get("mime_type") or "application/octet-stream")
-
-    if request.method == "HEAD":
-        # Metadata only: never issue a Telegram RPC for a HEAD request.
-        raw_path = str(item.get("file_path") or "").strip()
-        local_path = Path(raw_path) if raw_path else None
-        try:
-            if local_path is not None and local_path.is_file():
-                file_size = local_path.stat().st_size
-            else:
-                file_size = int(item.get("size_bytes") or 0)
-        except (OSError, TypeError, ValueError):
-            file_size = 0
-
-        headers = dict(_MEDIA_PROXY_HEADERS)
-        range_header = request.headers.get("range")
-        if range_header:
-            try:
-                start, end = _parse_range_header(range_header, file_size)
-            except (TypeError, ValueError):
-                headers["Content-Range"] = f"bytes */{file_size}"
-                headers["Content-Length"] = "0"
-                return Response(status_code=416, content=b"", headers=headers)
-            status_code = 206
-            headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-            headers["Content-Length"] = str(end - start + 1)
-        else:
-            status_code = 200
-            headers["Content-Length"] = str(file_size)
-        return Response(
-            status_code=status_code,
-            content=b"",
-            media_type=mime_type,
-            headers=headers,
-        )
-
-    source = await resolve_media_source(ctx, item)
-    file_size = int(source["size"])
-
-    headers = dict(_MEDIA_PROXY_HEADERS)
-    range_header = request.headers.get("range")
-    if range_header:
-        try:
-            start, end = _parse_range_header(range_header, file_size)
-        except (TypeError, ValueError):
-            headers["Content-Range"] = f"bytes */{file_size}"
-            headers["Content-Length"] = "0"
-            return StreamingResponse(
-                iter([b""]),
-                status_code=416,
-                media_type=mime_type,
-                headers=headers,
-            )
-        status_code = 206
-        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-        headers["Content-Length"] = str(end - start + 1)
-    else:
-        start, end = 0, max(0, file_size - 1)
-        status_code = 200
-        headers["Content-Length"] = str(file_size)
-
-    if file_size > 0:
-        prefetched = None
-        if source["kind"] == "multipart":
-            prefetched = await prefetch_multipart_first(ctx, source, start, end)
-        body = iter_source_range(ctx, source, start, end, prefetched=prefetched)
-    else:
-        body = iter([b""])
-
-    return StreamingResponse(
-        body,
-        status_code=status_code,
-        media_type=mime_type,
-        headers=headers,
+    return await build_media_stream_response(
+        request,
+        ctx,
+        item,
+        extra_headers=_MEDIA_PROXY_HEADERS,
     )
 
 

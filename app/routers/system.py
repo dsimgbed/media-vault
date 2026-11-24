@@ -12,13 +12,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from app.allocator import sanitize_folder
 from app.context import AppContext
 from app.db import normalize_source_url
-from app.gallery_ingest import get_gallery_dl_status
+from app.gallery_ingest import get_gallery_dl_status_async
 from app.ingest import (
     expand_ytdlp_playlist,
     is_cookie_recoverable_ytdlp_job,
     list_ytdlp_formats,
 )
-from app.torrent_ingest import find_aria2c, get_aria2c_version
+from app.torrent_ingest import find_aria2c, get_aria2c_version_async
 from app.routers.deps import get_ctx, require_auth
 from app.schemas import CookiesRequest, FormatsRequest, PlaylistRequest
 
@@ -37,7 +37,18 @@ async def health(ctx: AppContext = Depends(get_ctx)):
         ytdlp_ver = "unknown"
     telemetry = ctx.tg_pool.get_telemetry()
     latest_backup = ctx.db.get_latest_backup_record()
-    gallery_st = ctx.gallery.get_status() if ctx.gallery else get_gallery_dl_status(cfg)
+    gallery_st = (
+        await ctx.gallery.get_status_async()
+        if ctx.gallery
+        else await get_gallery_dl_status_async(cfg)
+    )
+    if ctx.torrent:
+        torrent_st = await ctx.torrent.get_status_async()
+        aria2c_installed = bool(torrent_st["aria2c_installed"])
+        aria2c_version = torrent_st["aria2c_version"]
+    else:
+        aria2c_installed = find_aria2c() is not None
+        aria2c_version = await get_aria2c_version_async()
     webdav_summary = cfg.get_webdav_status_summary()
     return {
         "ok": True,
@@ -61,8 +72,8 @@ async def health(ctx: AppContext = Depends(get_ctx)):
         "ytdlp_version": ytdlp_ver,
         "subscriptions_enabled": bool(cfg.subscriptions_enabled),
         "torrent_enabled": bool(cfg.torrent_enabled),
-        "aria2c_installed": bool(ctx.torrent.get_status()["aria2c_installed"]) if ctx.torrent else (find_aria2c() is not None),
-        "aria2c_version": ctx.torrent.get_status()["aria2c_version"] if ctx.torrent else get_aria2c_version(),
+        "aria2c_installed": aria2c_installed,
+        "aria2c_version": aria2c_version,
         "gallery_dl_enabled": bool(cfg.gallery_dl_enabled),
         "gallery_dl_installed": bool(gallery_st["installed"]),
         "gallery_dl_version": gallery_st["version"],
@@ -77,6 +88,12 @@ async def system_status(ctx: AppContext = Depends(get_ctx)):
     cfg = ctx.settings
     backups = ctx.backup.list_backups(limit=100) if ctx.backup else []
     latest_backup = backups[0] if backups else ctx.db.get_latest_backup_record()
+    torrent_st = await ctx.torrent.get_status_async() if ctx.torrent else {}
+    gallery_st = (
+        await ctx.gallery.get_status_async()
+        if ctx.gallery
+        else await get_gallery_dl_status_async(cfg)
+    )
     return {
         "ok": True,
         "storage_mode": cfg.storage_mode,
@@ -97,8 +114,8 @@ async def system_status(ctx: AppContext = Depends(get_ctx)):
             else {"l1_entries": len(ctx.zip_cache)}
         ),
         "leech": {
-            "torrent": ctx.torrent.get_status() if ctx.torrent else {},
-            "gallery_dl": ctx.gallery.get_status() if ctx.gallery else get_gallery_dl_status(cfg),
+            "torrent": torrent_st,
+            "gallery_dl": gallery_st,
         },
         "ingest": {
             "concurrency": cfg.ingest_concurrency,

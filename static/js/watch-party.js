@@ -33,6 +33,8 @@ let isApplyingSync = false;
 let lastBufferingSent = null;
 let lastControlToastAt = 0;
 let activeMediaId = null;
+let pendingMetadataSeekHandler = null;
+let lastAutoAdvancedFrom = null;
 
 function ssKey() {
   return `wp_session_${roomCode}`;
@@ -472,7 +474,6 @@ function renderReactionBar() {
     btn.setAttribute("aria-label", `React ${emoji}`);
     btn.addEventListener("click", () => {
       sendWs({ type: "reaction", emoji });
-      spawnReaction(emoji);
     });
     bar.appendChild(btn);
   }
@@ -573,14 +574,22 @@ function getEstimatedServerNowMs() {
 
 function getExpectedPositionSec() {
   if (!roomState) return 0;
-  const base = Number(roomState.position_sec || 0);
+  const hasEffective =
+    roomState.effective_position_sec !== undefined &&
+    roomState.effective_position_sec !== null &&
+    Number.isFinite(Number(roomState.effective_position_sec));
+  const base = hasEffective
+    ? Number(roomState.effective_position_sec)
+    : Number(roomState.position_sec || 0);
+  const refTimeMs = hasEffective
+    ? Number(roomState.server_time_ms || 0)
+    : Number(roomState.state_updated_at_ms || roomState.server_time_ms || 0);
   const rate = Number(roomState.playback_rate || 1) || 1;
   const playing = Boolean(roomState.is_playing);
-  const serverTimeMs = Number(roomState.server_time_ms || 0);
-  let expected = base;
-  if (playing && Number.isFinite(serverTimeMs) && serverTimeMs > 0) {
-    const elapsed = Math.max(0, (getEstimatedServerNowMs() - serverTimeMs) / 1000);
-    expected = base + elapsed * rate;
+  let expected = Number.isFinite(base) ? base : 0;
+  if (playing && Number.isFinite(refTimeMs) && refTimeMs > 0) {
+    const elapsed = Math.max(0, (getEstimatedServerNowMs() - refTimeMs) / 1000);
+    expected = expected + elapsed * rate;
   }
   const video = $("wpVideo");
   if (video && Number.isFinite(video.duration) && video.duration > 0) {
@@ -591,20 +600,31 @@ function getExpectedPositionSec() {
   return expected;
 }
 
+function clearPendingMetadataSeek(video) {
+  if (pendingMetadataSeekHandler && video) {
+    video.removeEventListener("loadedmetadata", pendingMetadataSeekHandler);
+  }
+  pendingMetadataSeekHandler = null;
+}
+
 function ensureActiveMedia() {
   const video = $("wpVideo");
   if (!video || !session) return;
   const item = getActiveItem();
   const nextId = item ? String(item.media_id || item.id || "") : "";
   if (!nextId) {
+    clearPendingMetadataSeek(video);
     activeMediaId = null;
+    lastAutoAdvancedFrom = null;
     video.removeAttribute("src");
     video.load();
     updateNowPlaying();
     return;
   }
   if (nextId !== activeMediaId) {
+    clearPendingMetadataSeek(video);
     activeMediaId = nextId;
+    lastAutoAdvancedFrom = null;
     isApplyingSync = true;
     suppressLocalUntil = performance.now() + 1000;
     video.pause();
@@ -613,9 +633,29 @@ function ensureActiveMedia() {
     const rate = Number(roomState?.playback_rate || 1) || 1;
     video.playbackRate = rate;
     video.defaultPlaybackRate = rate;
-    const expected = getExpectedPositionSec();
-    try { video.currentTime = expected; } catch (_) {}
-    window.setTimeout(() => { isApplyingSync = false; }, 0);
+    const seekToExpected = () => {
+      const targetRate = Number(roomState?.playback_rate || 1) || 1;
+      const targetPos = getExpectedPositionSec();
+      isApplyingSync = true;
+      suppressLocalUntil = performance.now() + SUPPRESS_MS;
+      try { video.playbackRate = targetRate; } catch (_) {}
+      try { video.currentTime = targetPos; } catch (_) {}
+      window.setTimeout(() => { isApplyingSync = false; }, 0);
+    };
+    if (video.readyState >= 1) {
+      seekToExpected();
+    } else {
+      const handler = () => {
+        if (pendingMetadataSeekHandler === handler) {
+          pendingMetadataSeekHandler = null;
+        }
+        if (activeMediaId !== nextId) return;
+        seekToExpected();
+      };
+      pendingMetadataSeekHandler = handler;
+      video.addEventListener("loadedmetadata", handler, { once: true });
+      window.setTimeout(() => { isApplyingSync = false; }, 0);
+    }
   }
   updateNowPlaying();
 }
@@ -830,9 +870,35 @@ function handleWsMessage(raw) {
     }
     case "presence": {
       if (msg.room_state) {
-        applyRoomState(msg.room_state, { force: true });
+        const incomingSeq = Number(msg.room_state.state_seq ?? msg.room_state.seq ?? 0);
+        if (!roomState || incomingSeq > lastStateSeq) {
+          applyRoomState(msg.room_state, { force: false });
+        } else {
+          if (Array.isArray(msg.room_state.participants)) {
+            roomState.participants = msg.room_state.participants;
+          } else if (Array.isArray(msg.participants)) {
+            roomState.participants = msg.participants;
+          }
+          if (msg.room_state.viewer_count != null) {
+            roomState.viewer_count = msg.room_state.viewer_count;
+          } else if (msg.participant_count != null) {
+            roomState.viewer_count = msg.participant_count;
+          }
+          if (msg.room_state.participant_count != null) {
+            roomState.participant_count = msg.room_state.participant_count;
+          }
+          if (msg.room_state.paused_for_buffering !== undefined) {
+            roomState.paused_for_buffering = Boolean(msg.room_state.paused_for_buffering);
+          }
+          renderParticipants();
+          updateTopMeta();
+        }
       } else if (Array.isArray(msg.participants) && roomState) {
         roomState.participants = msg.participants;
+        if (msg.participant_count != null) {
+          roomState.viewer_count = msg.participant_count;
+          roomState.participant_count = msg.participant_count;
+        }
         renderParticipants();
         updateTopMeta();
       }
@@ -1019,6 +1085,22 @@ function bindVideoEvents() {
   });
   video.addEventListener("canplay", () => {
     if (!video.paused) reportBuffering(false);
+  });
+
+  video.addEventListener("ended", () => {
+    if (!canControl() || !roomState || !activeMediaId) return;
+    if (lastAutoAdvancedFrom === activeMediaId) return;
+    const queue = Array.isArray(roomState.queue) ? roomState.queue : [];
+    const currentIdx = queue.findIndex(
+      (it) => String(it?.media_id || it?.id || "") === String(activeMediaId)
+    );
+    if (currentIdx < 0 || currentIdx + 1 >= queue.length) return;
+    const nextItem = queue[currentIdx + 1];
+    const nextId = String(nextItem?.media_id || nextItem?.id || "");
+    if (!nextId) return;
+    lastAutoAdvancedFrom = activeMediaId;
+    sendWs({ type: "select_item", media_id: nextId });
+    sendWs({ type: "play", position_sec: 0 });
   });
 }
 

@@ -12,8 +12,8 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from fastapi import HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import HTTPException, Request
+from fastapi.responses import Response, StreamingResponse
 
 from app.allocator import sanitize_folder
 from app.context import AppContext
@@ -344,6 +344,142 @@ def iter_source_range(
         start,
         end,
         total_size=source.get("size"),
+    )
+
+
+def normalize_range_header(range_header: str) -> str:
+    normalized = str(range_header or "").strip()
+    if normalized[:6].lower() == "bytes=":
+        normalized = "bytes=" + normalized[6:].strip()
+    return normalized
+
+
+def resolve_head_file_size(item: dict[str, Any]) -> int | None:
+    """Resolve backing file size using local stat or SQLite metadata only (no Telegram RPC)."""
+    raw_path = str(item.get("file_path") or "").strip()
+    local_path = Path(raw_path) if raw_path else None
+    parts = item.get("parts") or []
+    try:
+        if local_path is not None and local_path.is_file():
+            return int(local_path.stat().st_size)
+        if len(parts) > 1:
+            return int(item.get("size_bytes") or 0)
+        if item.get("telegram_chat_id") and item.get("telegram_msg_id"):
+            return int(item.get("size_bytes") or 0)
+    except (OSError, TypeError, ValueError):
+        return None
+    return None
+
+
+def build_range_headers(
+    file_size: int,
+    *,
+    range_bounds: tuple[int, int] | None = None,
+    base_headers: dict[str, str] | None = None,
+) -> tuple[int, dict[str, str]]:
+    headers = {"Accept-Ranges": "bytes"}
+    if base_headers:
+        headers.update(base_headers)
+    if range_bounds is not None:
+        start, end = range_bounds
+        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+        headers["Content-Length"] = str(end - start + 1)
+        return 206, headers
+    headers["Content-Length"] = str(file_size)
+    return 200, headers
+
+
+async def build_media_stream_response(
+    request: Request,
+    ctx: AppContext,
+    item: dict[str, Any],
+    *,
+    extra_headers: dict[str, str] | None = None,
+    download: bool = False,
+) -> Response:
+    """Build a unified HTTP GET/HEAD response for local, single-part Telegram, or multi-part Telegram media."""
+    mime_type = str(item.get("mime_type") or "application/octet-stream")
+    base_headers: dict[str, str] = {"Accept-Ranges": "bytes"}
+    if extra_headers:
+        base_headers.update(extra_headers)
+    if download:
+        safe_name = (
+            str(item.get("filename") or "download")
+            .replace('"', "")
+            .replace("\r", "")
+            .replace("\n", "")
+        )
+        base_headers["Content-Disposition"] = f'attachment; filename="{safe_name}"'
+
+    range_header = request.headers.get("range")
+
+    if request.method == "HEAD":
+        file_size = await asyncio.to_thread(resolve_head_file_size, item)
+        if file_size is None:
+            raise HTTPException(
+                status_code=404,
+                detail="File missing on drive (drive may be unmounted)",
+            )
+        bounds: tuple[int, int] | None = None
+        if range_header:
+            try:
+                bounds = _parse_range_header(normalize_range_header(range_header), file_size)
+            except (TypeError, ValueError):
+                err_headers = dict(base_headers)
+                err_headers["Content-Range"] = f"bytes */{file_size}"
+                err_headers["Content-Length"] = "0"
+                return Response(
+                    status_code=416,
+                    content=b"",
+                    media_type=mime_type,
+                    headers=err_headers,
+                )
+        status_code, headers = build_range_headers(
+            file_size, range_bounds=bounds, base_headers=base_headers
+        )
+        return Response(
+            status_code=status_code,
+            content=b"",
+            media_type=mime_type,
+            headers=headers,
+        )
+
+    source = await resolve_media_source(ctx, item)
+    file_size = int(source["size"])
+
+    bounds = None
+    if range_header:
+        try:
+            bounds = _parse_range_header(normalize_range_header(range_header), file_size)
+        except (TypeError, ValueError):
+            err_headers = dict(base_headers)
+            err_headers["Content-Range"] = f"bytes */{file_size}"
+            err_headers["Content-Length"] = "0"
+            return Response(
+                status_code=416,
+                content=b"",
+                media_type=mime_type,
+                headers=err_headers,
+            )
+
+    start, end = bounds if bounds is not None else (0, max(0, file_size - 1))
+
+    prefetched: dict[int, tuple[Any, Any]] | None = None
+    if file_size > 0:
+        if source["kind"] == "multipart":
+            prefetched = await prefetch_multipart_first(ctx, source, start, end)
+        body = iter_source_range(ctx, source, start, end, prefetched=prefetched)
+    else:
+        body = iter([b""])
+
+    status_code, headers = build_range_headers(
+        file_size, range_bounds=bounds, base_headers=base_headers
+    )
+    return StreamingResponse(
+        body,
+        status_code=status_code,
+        media_type=mime_type,
+        headers=headers,
     )
 
 

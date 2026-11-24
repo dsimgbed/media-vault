@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urlparse
@@ -374,6 +375,71 @@ def parse_torrent_bytes(data: bytes) -> dict[str, Any]:
         total_bytes += size_bytes
         if selected_default:
             selected_default_bytes += size_bytes
+    elif b"file tree" in info:
+        raw_tree = info[b"file tree"]
+        if not isinstance(raw_tree, dict) or not raw_tree:
+            raise BencodeError("file tree must be a non-empty dict")
+
+        tree_entries: list[tuple[list[str], int, bool]] = []
+
+        def _walk_file_tree(node: Any, prefix: list[str], depth: int) -> None:
+            if depth > MAX_BENCODE_DEPTH:
+                raise BencodeError("file tree exceeds maximum depth")
+            if not isinstance(node, dict) or not node:
+                raise BencodeError("file tree node must be a non-empty dict")
+            if b"" in node:
+                if len(node) != 1:
+                    raise BencodeError("file tree leaf cannot contain sibling directory entries")
+                meta = node[b""]
+                if not isinstance(meta, dict):
+                    raise BencodeError("file tree leaf metadata must be dict")
+                length = meta.get(b"length")
+                if not isinstance(length, int) or isinstance(length, bool):
+                    raise BencodeError("missing or invalid length in file tree leaf")
+                size_bytes = int(length)
+                if size_bytes < 0:
+                    raise BencodeError("negative length")
+                if not prefix:
+                    raise BencodeError("file tree leaf missing path")
+                attr = meta.get(b"attr")
+                attr_bytes = attr if isinstance(attr, (bytes, bytearray)) else b""
+                is_pad = (b"p" in attr_bytes) or (".pad" in [s.lower() for s in prefix])
+                tree_entries.append((list(prefix), size_bytes, is_pad))
+                return
+
+            for raw_seg, child in node.items():
+                if isinstance(raw_seg, (bytes, bytearray)):
+                    seg = bytes(raw_seg).decode("utf-8", errors="replace")
+                else:
+                    seg = str(raw_seg)
+                _validate_path_segment(seg)
+                _walk_file_tree(child, prefix + [seg], depth + 1)
+
+        _walk_file_tree(raw_tree, [], 0)
+        if not tree_entries:
+            raise BencodeError("file tree contains no files")
+
+        is_single_named = len(tree_entries) == 1 and tree_entries[0][0] == [name]
+        is_multi = not is_single_named
+        for idx, (segments, size_bytes, is_pad) in enumerate(tree_entries, start=1):
+            leaf = segments[-1]
+            rel_path = name if is_single_named else f"{name}/" + "/".join(segments)
+            media_type, mime_type = classify_media(Path(leaf))
+            selected_default = (not is_pad) and is_default_selected(rel_path, size_bytes, media_type)
+            if is_pad:
+                selected_default = False
+            files_list.append({
+                "index": idx,
+                "path": rel_path,
+                "name": leaf,
+                "size_bytes": size_bytes,
+                "media_type": media_type,
+                "mime_type": mime_type,
+                "selected_default": bool(selected_default),
+            })
+            total_bytes += size_bytes
+            if selected_default:
+                selected_default_bytes += size_bytes
     else:
         raise BencodeError("torrent has neither length nor files")
 
@@ -405,22 +471,10 @@ def validate_magnet_uri(magnet: str) -> str:
     low = s.lower()
     if not low.startswith("magnet:?"):
         raise ValueError("not a magnet uri")
-    # normalize prefix
-    # parse query
-    # ensure magnet:? prefix exactly
-    # reconstruct normalized: keep original casing? requirement: normalized to magnet:?
-    # We'll normalize prefix to "magnet:?"
-    rest = s[len("magnet:?"):] if low.startswith("magnet:?") else s
-    # Actually s starts magnet:? (case-insensitive). Normalize:
     idx = low.find("magnet:?")
-    prefix = s[:idx]
-    # should be empty
     s = "magnet:?" + s[idx + len("magnet:?"):]
-    low = s.lower()
-    # parse params
     parsed = urlparse(s)
     qs = parse_qs(parsed.query, keep_blank_values=True)
-    # xt
     xt_vals = qs.get("xt", [])
     ok = False
     for v in xt_vals:
@@ -431,7 +485,6 @@ def validate_magnet_uri(magnet: str) -> str:
                 ok = True
                 break
             if len(payload) == 32:
-                # base32
                 try:
                     base64.b32decode(payload.upper() + "=" * ((8 - len(payload) % 8) % 8))
                     ok = True
@@ -455,6 +508,7 @@ def extract_magnet_infohash(magnet: str) -> str | None:
         return None
     parsed = urlparse(clean)
     qs = parse_qs(parsed.query, keep_blank_values=True)
+    btmh_hash: str | None = None
     for v in qs.get("xt", []):
         vl = v.lower()
         if vl.startswith("urn:btih:"):
@@ -467,7 +521,12 @@ def extract_magnet_infohash(magnet: str) -> str | None:
                     return decoded.hex()
                 except Exception:
                     return None
-    return None
+        elif vl.startswith("urn:btmh:1220") and btmh_hash is None:
+            digest = v[len("urn:btmh:1220"):]
+            if len(digest) == 64 and all(c in "0123456789abcdefABCDEF" for c in digest):
+                # Truncate to 40 hex chars to stay consistent with BEP-52 truncated infohash in parse_torrent_bytes()
+                btmh_hash = digest[:40].lower()
+    return btmh_hash
 
 
 def is_magnet_uri(value: str) -> bool:
@@ -489,37 +548,52 @@ def validate_download_limit(raw: str) -> str:
 
 # ---------- Binary / disk ----------
 
-_aria2c_version_cache: str | None = None
-_aria2c_version_checked: bool = False
+_ARIA2C_VERSION_TTL_SEC = 300.0
+_aria2c_version_lock = threading.Lock()
+_aria2c_version_cache: tuple[float, str | None, str | None] | None = None
+
+
+def _clear_aria2c_version_cache() -> None:
+    global _aria2c_version_cache
+    with _aria2c_version_lock:
+        _aria2c_version_cache = None
 
 
 def find_aria2c() -> str | None:
     return shutil.which("aria2c")
 
 
-def get_aria2c_version() -> str | None:
-    global _aria2c_version_cache, _aria2c_version_checked
-    if _aria2c_version_checked:
-        return _aria2c_version_cache
-    _aria2c_version_checked = True
+def get_aria2c_version(*, force_refresh: bool = False) -> str | None:
+    global _aria2c_version_cache
     aria = find_aria2c()
-    if not aria:
-        _aria2c_version_cache = None
-        return None
-    try:
-        import subprocess
-        res = subprocess.run([aria, "--version"], capture_output=True, text=True, timeout=3)
-        line = (res.stdout or "").splitlines()[0] if res.stdout else ""
-        # aria2 version 1.37.0
-        m = re.search(r"aria2 version (\S+)", line)
-        if m:
-            _aria2c_version_cache = m.group(1)
-        else:
-            # maybe first line
-            _aria2c_version_cache = line.strip() or None
-    except Exception:
-        _aria2c_version_cache = None
-    return _aria2c_version_cache
+    now = time.monotonic()
+    with _aria2c_version_lock:
+        if not force_refresh and _aria2c_version_cache is not None:
+            ts, cached_aria, cached_ver = _aria2c_version_cache
+            if cached_aria == aria and (now - ts) < _ARIA2C_VERSION_TTL_SEC:
+                return cached_ver
+
+    version: str | None = None
+    if aria:
+        try:
+            import subprocess
+            res = subprocess.run([aria, "--version"], capture_output=True, text=True, timeout=3)
+            line = (res.stdout or "").splitlines()[0] if res.stdout else ""
+            m = re.search(r"aria2 version (\S+)", line)
+            if m:
+                version = m.group(1)
+            else:
+                version = line.strip() or None
+        except Exception:
+            version = None
+
+    with _aria2c_version_lock:
+        _aria2c_version_cache = (time.monotonic(), aria, version)
+    return version
+
+
+async def get_aria2c_version_async(*, force_refresh: bool = False) -> str | None:
+    return await asyncio.to_thread(get_aria2c_version, force_refresh=force_refresh)
 
 
 def check_staging_disk_space(staging_dir: Path, required_bytes: int, max_total_bytes: int, min_free_buffer_bytes: int) -> dict[str, Any]:
@@ -645,6 +719,18 @@ class TorrentIngestService:
             "enable_dht": bool(getattr(s, "torrent_enable_dht", True)),
             "bt_stop_timeout_sec": int(getattr(s, "torrent_bt_stop_timeout_sec", 300)),
         }
+
+    async def get_status_async(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self.get_status)
+
+    @asynccontextmanager
+    async def _acquire_active_slot(self, sem: asyncio.Semaphore):
+        async with sem:
+            self.ingest._active_slots = getattr(self.ingest, "_active_slots", 0) + 1
+            try:
+                yield
+            finally:
+                self.ingest._active_slots = max(0, getattr(self.ingest, "_active_slots", 1) - 1)
 
     def cache_inspect(self, torrent_bytes: bytes, parsed: dict[str, Any], *, magnet: str | None = None) -> str:
         inspect_id = uuid.uuid4().hex[:16]
@@ -859,7 +945,7 @@ class TorrentIngestService:
                     self.ingest.unregister_proc(inspect_key, proc)
                 except Exception:
                     pass
-            shutil.rmtree(meta_dir, ignore_errors=True)
+            await asyncio.to_thread(shutil.rmtree, meta_dir, True)
             self.ingest.unregister_staging_dir(meta_dir)
 
     def build_aria2c_leech_cmd(
@@ -1006,9 +1092,8 @@ class TorrentIngestService:
         dl_weight = 70.0 if uses_tg else 95.0
 
         sem = self._semaphore
-        self.ingest._active_slots = getattr(self.ingest, "_active_slots", 0) + 1
         try:
-            async with sem:
+            async with self._acquire_active_slot(sem):
                 if job_id in self.ingest._cancelled_jobs:
                     raise asyncio.CancelledError()
                 job_dir = Path(tempfile.mkdtemp(prefix="torrent_", dir=staging_dir))
@@ -1237,7 +1322,7 @@ class TorrentIngestService:
                         )
                         items.append(item)
                         try:
-                            file_path.unlink(missing_ok=True)
+                            await asyncio.to_thread(file_path.unlink, missing_ok=True)
                         except OSError:
                             pass
 
@@ -1252,7 +1337,7 @@ class TorrentIngestService:
                         await on_progress(100.0, f"Saved {len(items)} file(s) to {target_folder}")
                     return items
                 finally:
-                    shutil.rmtree(job_dir, ignore_errors=True)
+                    await asyncio.to_thread(shutil.rmtree, job_dir, True)
                     self.ingest.unregister_staging_dir(job_dir)
         except asyncio.CancelledError:
             if self.ingest._job_tasks.get(job_id) in (None, asyncio.current_task()):
@@ -1269,7 +1354,6 @@ class TorrentIngestService:
             self.db.update_job(job_id, status="failed", message=str(exc))
             raise
         finally:
-            self.ingest._active_slots = max(0, self.ingest._active_slots - 1)
             if self.ingest._job_tasks.get(job_id) in (None, asyncio.current_task()):
                 self.ingest._active_procs.pop(job_id, None)
 
