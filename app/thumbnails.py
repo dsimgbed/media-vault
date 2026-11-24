@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import math
 import re
 import shutil
 import zipfile
@@ -158,22 +159,42 @@ def _make_image_thumb(src: Path, dst: Path) -> bool:
         return False
 
 
-PREVIEW_FRAME_COUNT = 10
+PREVIEW_MIN_FRAMES = 2
+PREVIEW_MAX_FRAMES = 20
+PREVIEW_DEFAULT_FRAMES = 10
+PREVIEW_FRAME_COUNT = PREVIEW_DEFAULT_FRAMES
 PREVIEW_FRAME_DURATION_MS = 600
 PREVIEW_MAX_WIDTH = 320
 PREVIEW_WEBP_QUALITY = 50
 
 
+def compute_preview_frame_count(duration_sec: float | None) -> int:
+    dur = _parse_float(duration_sec)
+    if dur is None:
+        return PREVIEW_DEFAULT_FRAMES
+    scaled = int(round(0.6 * math.sqrt(dur)))
+    return max(PREVIEW_MIN_FRAMES, min(PREVIEW_MAX_FRAMES, scaled))
+
+
+def compute_preview_frame_duration_ms(frame_count: int) -> int:
+    count = max(1, int(frame_count))
+    return min(750, max(400, int(round(6000 / count))))
+
+
 def _compute_preview_timestamps(
     duration_sec: float | None,
-    count: int = PREVIEW_FRAME_COUNT,
+    count: int | None = None,
 ) -> list[float]:
-    if count <= 0 or duration_sec is None or duration_sec <= 0:
+    dur = _parse_float(duration_sec)
+    if dur is None:
         return []
-    safe_end = max(0.01, duration_sec - min(0.05, duration_sec * 0.02))
+    target_count = compute_preview_frame_count(dur) if count is None else int(count)
+    if target_count <= 0:
+        return []
+    safe_end = max(0.01, dur - min(0.05, dur * 0.02))
     return [
-        round(min(max(0.0, ((i + 0.5) / count) * duration_sec), safe_end), 3)
-        for i in range(count)
+        round(min(max(0.0, ((i + 0.5) / target_count) * dur), safe_end), 3)
+        for i in range(target_count)
     ]
 
 
@@ -325,7 +346,7 @@ async def generate_video_preview(
     thumbs_dir: Path,
     media_id: str,
     duration_sec: float | None = None,
-    frame_count: int = PREVIEW_FRAME_COUNT,
+    frame_count: int | None = None,
 ) -> str | None:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg or not src.is_file():
@@ -340,7 +361,12 @@ async def generate_video_preview(
         meta = await extract_media_metadata(src, "video")
         effective_duration = _parse_float(meta.get("duration_sec"))
 
-    timestamps = _compute_preview_timestamps(effective_duration, count=frame_count)
+    target_count = (
+        max(1, int(frame_count))
+        if frame_count is not None
+        else compute_preview_frame_count(effective_duration)
+    )
+    timestamps = _compute_preview_timestamps(effective_duration, count=target_count)
     frame_paths: list[Path] = []
 
     try:
@@ -375,7 +401,7 @@ async def generate_video_preview(
                         "-vf",
                         vf_expr,
                         "-frames:v",
-                        str(max(1, int(frame_count))),
+                        str(target_count),
                         "-an",
                         "-sn",
                         "-dn",
@@ -392,7 +418,13 @@ async def generate_video_preview(
                     pass
 
         if frame_paths:
-            ok = await asyncio.to_thread(_save_animated_webp_from_pngs, frame_paths, dst)
+            frame_duration_ms = compute_preview_frame_duration_ms(len(frame_paths))
+            ok = await asyncio.to_thread(
+                _save_animated_webp_from_pngs,
+                frame_paths,
+                dst,
+                duration_ms=frame_duration_ms,
+            )
             if ok and dst.is_file() and dst.stat().st_size > 0:
                 return preview_name
     except Exception:

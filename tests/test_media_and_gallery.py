@@ -393,9 +393,11 @@ def test_rich_metadata_video_preview_fallback_and_telegram_zerocopy(tmp_path: Pa
             assert prev_resp.status_code == 200
             assert prev_resp.headers["content-type"] == "image/webp"
             assert prev_resp.headers["cache-control"] == "public, max-age=31536000, immutable"
+            from app.thumbnails import compute_preview_frame_count
+
             with Image.open(io.BytesIO(prev_resp.content)) as im:
                 assert im.format == "WEBP"
-                assert getattr(im, "n_frames", 1) == 10
+                assert getattr(im, "n_frames", 1) == compute_preview_frame_count(vid_item["duration_sec"])
 
             # Deleting video unlinks both thumb and animated preview
             del_resp = client.delete(f"/api/media/{vid_id}")
@@ -403,10 +405,29 @@ def test_rich_metadata_video_preview_fallback_and_telegram_zerocopy(tmp_path: Pa
             assert not prev_path.exists()
             assert client.get(f"/api/media/{vid_id}/preview").status_code == 404
 
-    # 2b) Multi-segment video (red -> green -> blue over 12s) produces 10 screenshots spanning full duration
-    from app.thumbnails import PREVIEW_FRAME_COUNT, _compute_preview_timestamps
+    # 2b) Adaptive frame count scales by duration with min=2 and hard max=20
+    from app.thumbnails import (
+        PREVIEW_DEFAULT_FRAMES,
+        PREVIEW_MAX_FRAMES,
+        PREVIEW_MIN_FRAMES,
+        _compute_preview_timestamps,
+        compute_preview_frame_count,
+        compute_preview_frame_duration_ms,
+    )
 
-    assert _compute_preview_timestamps(100.0) == [5.0, 15.0, 25.0, 35.0, 45.0, 55.0, 65.0, 75.0, 85.0, 95.0]
+    assert compute_preview_frame_count(None) == PREVIEW_DEFAULT_FRAMES
+    assert compute_preview_frame_count(0.0) == PREVIEW_DEFAULT_FRAMES
+    assert compute_preview_frame_count(5.0) == PREVIEW_MIN_FRAMES
+    assert compute_preview_frame_count(30.0) == 3
+    assert compute_preview_frame_count(60.0) == 5
+    assert compute_preview_frame_count(360.0) == 11
+    assert compute_preview_frame_count(1200.0) == PREVIEW_MAX_FRAMES
+    assert compute_preview_frame_count(7200.0) == PREVIEW_MAX_FRAMES
+    assert compute_preview_frame_duration_ms(3) == 750
+    assert compute_preview_frame_duration_ms(10) == 600
+    assert compute_preview_frame_duration_ms(20) == 400
+    assert _compute_preview_timestamps(100.0, count=10) == [5.0, 15.0, 25.0, 35.0, 45.0, 55.0, 65.0, 75.0, 85.0, 95.0]
+    assert _compute_preview_timestamps(60.0) == [6.0, 18.0, 30.0, 42.0, 54.0]
     assert _compute_preview_timestamps(None) == []
     assert _compute_preview_timestamps(0.0) == []
 
@@ -431,14 +452,20 @@ def test_rich_metadata_video_preview_fallback_and_telegram_zerocopy(tmp_path: Pa
         )
         if proc.returncode == 0 and multi_mp4.is_file():
             multi_prev = asyncio.run(
-                generate_video_preview(multi_mp4, settings.thumbs_dir, "multi_seg", duration_sec=12.0)
+                generate_video_preview(
+                    multi_mp4,
+                    settings.thumbs_dir,
+                    "multi_seg",
+                    duration_sec=12.0,
+                    frame_count=10,
+                )
             )
             assert multi_prev == "multi_seg_preview.webp"
             multi_path = settings.thumbs_dir / multi_prev
             assert multi_path.is_file()
             with Image.open(multi_path) as im:
                 assert im.format == "WEBP"
-                assert getattr(im, "n_frames", 1) == PREVIEW_FRAME_COUNT
+                assert getattr(im, "n_frames", 1) == 10
                 # Sample center pixel at frame 0 (red ~0.6s), frame 4 (green ~5.4s), frame 9 (blue ~11.4s)
                 im.seek(0)
                 r0, g0, b0 = im.convert("RGB").getpixel((160, 90))
@@ -456,7 +483,7 @@ def test_rich_metadata_video_preview_fallback_and_telegram_zerocopy(tmp_path: Pa
     bad_mp4.write_bytes(b"not-a-real-video")
     assert asyncio.run(extract_media_metadata(bad_mp4, "video")) == {}
 
-    # 4) generate_video_preview samples timestamps via ffmpeg seeks and falls back when duration is unknown
+    # 4) generate_video_preview adapts seek count by duration (60s -> 5, 3600s -> 20 cap) and falls back
     class FakeProc:
         def __init__(self, rc: int) -> None:
             self.returncode = rc
@@ -473,7 +500,7 @@ def test_rich_metadata_video_preview_fallback_and_telegram_zerocopy(tmp_path: Pa
             ss_idx = args_list.index("-ss")
             seek_timestamps.append(args_list[ss_idx + 1])
             idx = len(seek_timestamps)
-            Image.new("RGB", (160, 90), color=(20 * idx, 100, 200)).save(out_arg, format="PNG")
+            Image.new("RGB", (160, 90), color=((idx * 17) % 255, (idx * 37) % 255, 200)).save(out_arg, format="PNG")
             return FakeProc(0)
         return FakeProc(1)
 
@@ -482,17 +509,29 @@ def test_rich_metadata_video_preview_fallback_and_telegram_zerocopy(tmp_path: Pa
 
     dummy_mp4 = tmp_path / "dummy.mp4"
     dummy_mp4.write_bytes(b"fake")
+
     preview_name = asyncio.run(
-        generate_video_preview(dummy_mp4, settings.thumbs_dir, "seek_preview", duration_sec=20.0)
+        generate_video_preview(dummy_mp4, settings.thumbs_dir, "seek_60s", duration_sec=60.0)
     )
-    assert preview_name == "seek_preview_preview.webp"
-    assert len(seek_timestamps) == 10
-    assert sorted(float(t) for t in seek_timestamps) == [1.0, 3.0, 5.0, 7.0, 9.0, 11.0, 13.0, 15.0, 17.0, 19.0]
+    assert preview_name == "seek_60s_preview.webp"
+    assert len(seek_timestamps) == 5
+    assert sorted(float(t) for t in seek_timestamps) == [6.0, 18.0, 30.0, 42.0, 54.0]
     seek_prev_path = settings.thumbs_dir / preview_name
     assert seek_prev_path.is_file()
     with Image.open(seek_prev_path) as im:
         assert im.format == "WEBP"
-        assert getattr(im, "n_frames", 1) == 10
+        assert getattr(im, "n_frames", 1) == 5
+
+    # Long video (60 min) is capped at PREVIEW_MAX_FRAMES (20)
+    seek_timestamps.clear()
+    long_preview_name = asyncio.run(
+        generate_video_preview(dummy_mp4, settings.thumbs_dir, "seek_3600s", duration_sec=3600.0)
+    )
+    assert long_preview_name == "seek_3600s_preview.webp"
+    assert len(seek_timestamps) == 20
+    with Image.open(settings.thumbs_dir / long_preview_name) as im:
+        assert im.format == "WEBP"
+        assert getattr(im, "n_frames", 1) == 20
 
     # Fallback single-pass PNG extraction when duration cannot be probed
     async def fake_meta(_src, _mtype):
