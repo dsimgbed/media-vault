@@ -1137,3 +1137,234 @@ def test_cookies_upload_auto_retries_failed_youtube_jobs(tmp_path: Path, monkeyp
         assert res2.json()["cookies_changed"] is False
         assert res2.json()["retried_count"] == 0
 
+
+def test_youtube_playlist_unavailable_filtering_auto_expand_and_retry_resilience(
+    tmp_path: Path, monkeypatch
+):
+    import asyncio
+    from app.ingest import _download_ytdlp, expand_ytdlp_playlist, is_playlist_only_url
+
+    # 1) Pure playlist URL detection (must NOT trigger on watch?v=...&list=...)
+    assert is_playlist_only_url("https://youtube.com/playlist?list=PLFCC1F1101A1975C6&si=abc") is True
+    assert is_playlist_only_url("https://www.youtube.com/playlist?list=FLkjpVWYgyPUvOLSJUGZMP-g") is True
+    assert is_playlist_only_url("https://music.youtube.com/playlist?list=PL123") is True
+    assert is_playlist_only_url("https://www.youtube.com/watch?v=abc12345678&list=PL123") is False
+    assert is_playlist_only_url("https://www.youtube.com/watch?v=abc12345678") is False
+    assert is_playlist_only_url("https://example.com/playlist?list=123") is False
+
+    # 2) expand_ytdlp_playlist filters removed/deleted/private entries & tracks unavailable_count
+    async def fake_expand_subproc(*args: str):
+        payload = {
+            "_type": "playlist",
+            "id": "PL_MIXED",
+            "title": "Outdoor Fights",
+            "webpage_url": "https://www.youtube.com/playlist?list=PL_MIXED",
+            "entries": [
+                {
+                    "id": "CeP1SOAgL4g",
+                    "title": None,
+                    "duration": None,
+                    "channel_url": None,
+                    "uploader_url": None,
+                    "ie_key": "Youtube",
+                    "url": "https://www.youtube.com/watch?v=CeP1SOAgL4g",
+                },
+                {
+                    "id": "del12345678",
+                    "title": "[Deleted video]",
+                    "duration": None,
+                    "ie_key": "Youtube",
+                    "url": "https://www.youtube.com/watch?v=del12345678",
+                },
+                {
+                    "id": "prv12345678",
+                    "title": "[Private video]",
+                    "duration": None,
+                    "ie_key": "Youtube",
+                    "url": "https://www.youtube.com/watch?v=prv12345678",
+                },
+                {
+                    "id": "vidGood0001",
+                    "title": "Working Clip 1",
+                    "duration": 49,
+                    "channel_url": "https://www.youtube.com/channel/UC1",
+                    "ie_key": "Youtube",
+                    "url": "https://www.youtube.com/watch?v=vidGood0001",
+                },
+                {
+                    "id": "vidGood0002",
+                    "title": "Working Clip 2",
+                    "duration": 76,
+                    "channel_url": "https://www.youtube.com/channel/UC2",
+                    "ie_key": "Youtube",
+                    "url": "https://www.youtube.com/watch?v=vidGood0002",
+                },
+            ],
+        }
+        return 0, json.dumps(payload), ""
+
+    monkeypatch.setattr("app.ingest._run_subprocess", fake_expand_subproc)
+    pl = asyncio.run(
+        expand_ytdlp_playlist("https://youtube.com/playlist?list=PL_MIXED", max_items=2)
+    )
+    assert pl["is_playlist"] is True
+    assert pl["unavailable_count"] == 3
+    assert [e["id"] for e in pl["entries"]] == ["vidGood0001", "vidGood0002"]
+
+    # 3) _download_ytdlp keeps completed files on partial playlist exit code != 0
+    #    while ignoring .part and unmerged .f251.webm files
+    partial_dir = tmp_path / "partial_pl"
+    partial_dir.mkdir()
+
+    async def fake_partial_streaming(*args: str, on_line=None, on_proc=None):
+        if on_line:
+            await on_line("ERROR: [youtube] CeP1SOAgL4g: This video has been removed")
+            for i in range(90):
+                await on_line(f"[download] line {i}")
+            await on_line("[download] Finished downloading playlist: Favorites")
+        (partial_dir / "Clip One [vidGood0001].mp4").write_bytes(b"real-video-1")
+        (partial_dir / "Clip Two [vidGood0002].mp4").write_bytes(b"real-video-2")
+        (partial_dir / "Clip Three [vidBad00003].f251.webm").write_bytes(b"unmerged-audio")
+        (partial_dir / "Clip Four [vidBad00004].mp4.part").write_bytes(b"incomplete")
+        return 1, ["[download] Finished downloading playlist: Favorites"]
+
+    monkeypatch.setattr("app.ingest._run_subprocess_streaming", fake_partial_streaming)
+    completed = asyncio.run(
+        _download_ytdlp("https://example.com/set", partial_dir)
+    )
+    assert [p.name for p in completed] == [
+        "Clip One [vidGood0001].mp4",
+        "Clip Two [vidGood0002].mp4",
+    ]
+
+    # When 0 completed files exist and ERROR scrolled out of tail, the real ERROR line is still reported
+    empty_err_dir = tmp_path / "empty_err"
+    empty_err_dir.mkdir()
+
+    async def fake_scrolled_err_streaming(*args: str, on_line=None, on_proc=None):
+        if on_line:
+            await on_line("ERROR: [youtube] CeP1SOAgL4g: Video removed for ToS")
+            for i in range(90):
+                await on_line(f"[info] filler line {i}")
+        (empty_err_dir / "Clip [CeP1SOAgL4g].f251.webm").write_bytes(b"unmerged")
+        return 1, ["[info] filler line 89"]
+
+    monkeypatch.setattr("app.ingest._run_subprocess_streaming", fake_scrolled_err_streaming)
+    try:
+        asyncio.run(_download_ytdlp("https://example.com/fail", empty_err_dir))
+        raise AssertionError("Expected RuntimeError when no completed files exist")
+    except RuntimeError as exc:
+        assert "Video removed for ToS" in str(exc)
+
+    # 4) Full API tests: auto-expand pure playlist URL with expand_playlist=False,
+    #    retry of existing monolithic failed playlist job with partial per-entry failure,
+    #    and multi-file single-URL job without sibling source_url deduplication.
+    settings = _make_settings(tmp_path / "api", storage_mode="drives")
+    app = create_app(settings)
+    db = app.state.db
+
+    async def fake_is_ddl(url: str, **_kwargs) -> bool:
+        return False
+
+    downloaded_urls: list[str] = []
+
+    async def fake_ytdlp_dl(url: str, job_dir: Path, **_kwargs):
+        downloaded_urls.append(url)
+        if "vidFail0002" in url:
+            raise RuntimeError("yt-dlp failed: ERROR: [youtube] vidFail0002: Video unavailable")
+        if "multi-clip" in url:
+            f1 = job_dir / "Part 1.mp4"
+            f2 = job_dir / "Part 2.mp4"
+            f1.write_bytes(b"multi-clip-video-one")
+            f2.write_bytes(b"multi-clip-video-two")
+            return [f1, f2]
+        slug = url.rsplit("=", 1)[-1]
+        out = job_dir / f"Title [{slug}].mp4"
+        out.write_bytes(f"video-bytes-{slug}".encode())
+        return [out]
+
+    monkeypatch.setattr("app.ingest.is_direct_download", fake_is_ddl)
+    monkeypatch.setattr("app.routers.ingest.is_direct_download", fake_is_ddl)
+    monkeypatch.setattr("app.ingest._download_ytdlp", fake_ytdlp_dl)
+
+    with TestClient(app) as client:
+        # 4a) POST /api/ingest/url with pure playlist URL and expand_playlist=False auto-expands
+        #     into per-video jobs, preserves requested folder ("Bellysitting"), skips unavailable entries
+        res = client.post(
+            "/api/ingest/url",
+            json={
+                "url": "https://youtube.com/playlist?list=PL_MIXED",
+                "folder": "Bellysitting",
+                "tags": "#othersplaylist",
+                "expand_playlist": False,
+            },
+        )
+        assert res.status_code == 202, res.text
+        body = res.json()
+        assert body["count"] == 2
+        for jid in body["job_ids"]:
+            assert _wait_for_job(client, jid)["status"] == "done"
+        items = client.get("/api/media?folder=Bellysitting").json()["items"]
+        assert len(items) == 2
+        assert {it["source_url"] for it in items} == {
+            "https://www.youtube.com/watch?v=vidGood0001",
+            "https://www.youtube.com/watch?v=vidGood0002",
+        }
+
+        # 4b) Retry of an existing failed playlist job processes entries individually,
+        #     skips already-archived & unavailable entries, and tolerates a failing entry
+        async def fake_retry_expand(*args: str):
+            payload = {
+                "_type": "playlist",
+                "id": "PL_RETRY",
+                "title": "Favorites",
+                "entries": [
+                    {"id": "dead0000001", "title": None, "duration": None, "ie_key": "Youtube"},
+                    {"id": "vidGood0001", "title": "Already Saved", "duration": 49, "ie_key": "Youtube"},
+                    {"id": "vidFail0002", "title": "Region Blocked", "duration": 60, "ie_key": "Youtube"},
+                    {"id": "vidNew00003", "title": "Fresh Video", "duration": 80, "ie_key": "Youtube"},
+                ],
+            }
+            return 0, json.dumps(payload), ""
+
+        monkeypatch.setattr("app.ingest._run_subprocess", fake_retry_expand)
+        old_pl_job = db.create_job(
+            "web",
+            "url",
+            "https://youtube.com/playlist?list=PL_RETRY",
+            params={
+                "url": "https://youtube.com/playlist?list=PL_RETRY",
+                "folder": "Bellysitting",
+                "tags": "#othersplaylist",
+                "forward_to_telegram": False,
+                "format_spec": "best",
+                "force": False,
+                "source_origin": "web",
+            },
+        )
+        db.update_job(old_pl_job, status="failed", message="yt-dlp failed: removed")
+
+        retry_res = client.post(f"/api/jobs/{old_pl_job}/retry")
+        assert retry_res.status_code == 202, retry_res.text
+        done_retry = _wait_for_job(client, old_pl_job)
+        assert done_retry["status"] == "done", done_retry
+        assert "Saved 1 file(s) to Bellysitting" in done_retry["message"]
+        assert "1 duplicate skipped" in done_retry["message"]
+        assert "1 failed" in done_retry["message"]
+        assert "1 unavailable skipped" in done_retry["message"]
+        assert len(done_retry["media_ids"]) == 2
+        assert client.get("/api/media?folder=Bellysitting").json()["total"] == 3
+
+        # 4c) Single non-playlist URL producing multiple files must save ALL files
+        #     (must not falsely deduplicate file #2 against file #1 by shared source_url)
+        multi_res = client.post(
+            "/api/ingest/url",
+            json={"url": "https://example.com/multi-clip", "folder": "Multi"},
+        )
+        assert multi_res.status_code == 202
+        done_multi = _wait_for_job(client, multi_res.json()["job_id"])
+        assert done_multi["status"] == "done"
+        assert "Saved 2 file(s) to Multi" in done_multi["message"]
+        assert client.get("/api/media?folder=Multi").json()["total"] == 2
+
+

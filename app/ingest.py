@@ -19,7 +19,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterator
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import httpx
 
@@ -104,6 +104,59 @@ def _is_youtube_url(url: str) -> bool:
     if not host:
         return False
     return any(host == dom or host.endswith(f".{dom}") for dom in _YOUTUBE_HOST_SUFFIXES)
+
+
+def is_playlist_only_url(url: str) -> bool:
+    """Return True for dedicated playlist URLs (not single videos with &list=)."""
+    if not _is_youtube_url(url):
+        return False
+    try:
+        parsed = urlparse(str(url or "").strip())
+    except ValueError:
+        return False
+    path = (parsed.path or "").rstrip("/").lower()
+    if path != "/playlist":
+        return False
+    qs = parse_qs(parsed.query)
+    list_ids = [v.strip() for v in qs.get("list", []) if v and v.strip()]
+    video_ids = [v.strip() for v in qs.get("v", []) if v and v.strip()]
+    return bool(list_ids) and not video_ids
+
+
+_UNAVAILABLE_PLAYLIST_TITLES = frozenset(
+    {
+        "[deleted video]",
+        "[private video]",
+        "[unavailable video]",
+    }
+)
+_UNMERGED_STREAM_RE = re.compile(r"\]\.f[A-Za-z0-9_-]+\.[^.]+$")
+_YOUTUBE_FILENAME_ID_RE = re.compile(r"\[([A-Za-z0-9_-]{11})\]$")
+
+
+def _is_unavailable_playlist_entry(entry: dict[str, Any]) -> bool:
+    if "title" not in entry:
+        return False
+    raw_title = entry.get("title")
+    if isinstance(raw_title, str):
+        if raw_title.strip().lower() in _UNAVAILABLE_PLAYLIST_TITLES:
+            return True
+        return False
+    if raw_title is None:
+        has_metadata = any(
+            entry.get(k) not in (None, "")
+            for k in ("duration", "channel_url", "uploader_url", "channel", "uploader")
+        )
+        return not has_metadata
+    return False
+
+
+def _extract_youtube_item_url(filename: str) -> str | None:
+    stem = Path(filename).stem
+    m = _YOUTUBE_FILENAME_ID_RE.search(stem)
+    if not m:
+        return None
+    return f"https://www.youtube.com/watch?v={m.group(1)}"
 
 
 async def _assert_public_url(url: str) -> str:
@@ -682,12 +735,15 @@ async def expand_ytdlp_playlist(
     max_items: int = 100,
 ) -> dict[str, Any]:
     limit = max(1, int(max_items))
+    # Request extra flat entries so unavailable/deleted playlist slots don't
+    # prematurely truncate the requested number of playable items.
+    fetch_end = min(max(limit * 3, limit + 100), 5000)
     with _isolated_cookies_copy(cookies_file) as iso_cookies:
         args = [
             *_ytdlp_base_args(cookies_file=iso_cookies, proxy=proxy, no_playlist=False),
             "--flat-playlist",
             "--playlist-end",
-            str(limit),
+            str(fetch_end),
             "-J",
             url,
         ]
@@ -718,8 +774,12 @@ async def expand_ytdlp_playlist(
             return flat
 
         entries: list[dict[str, Any]] = []
+        unavailable_count = 0
         parent_web = str(info.get("webpage_url") or url).lower()
         for entry in _flatten_entries(list(raw_entries or [])):
+            if _is_unavailable_playlist_entry(entry):
+                unavailable_count += 1
+                continue
             cand_url = str(entry.get("url") or "").strip()
             cand_web = str(entry.get("webpage_url") or "").strip()
             if cand_url.startswith(("http://", "https://")):
@@ -750,9 +810,14 @@ async def expand_ytdlp_playlist(
             if len(entries) >= limit:
                 break
         return {
-            "is_playlist": len(entries) > 1 or info.get("_type") in ("playlist", "multi_video"),
+            "is_playlist": (
+                len(entries) > 1
+                or info.get("_type") in ("playlist", "multi_video")
+                or unavailable_count > 0
+            ),
             "playlist_title": info.get("title") or info.get("playlist_title") or "",
             "entries": entries,
+            "unavailable_count": unavailable_count,
             "webpage_url": info.get("webpage_url") or url,
         }
 
@@ -767,6 +832,7 @@ async def expand_ytdlp_playlist(
                 "duration": info.get("duration"),
             }
         ],
+        "unavailable_count": 0,
         "webpage_url": info.get("webpage_url") or url,
     }
 
@@ -822,6 +888,31 @@ def _format_ytdlp_error(stderr: str) -> str:
     return f"yt-dlp failed: {detail[:400]}"
 
 
+def _collect_completed_ytdlp_files(
+    job_dir: Path,
+    baseline_names: set[str] | None = None,
+    *,
+    require_non_empty: bool = False,
+) -> list[Path]:
+    excluded = baseline_names or set()
+    files: list[Path] = []
+    for p in sorted(job_dir.iterdir(), key=lambda x: x.name):
+        if not p.is_file() or p.name in excluded:
+            continue
+        if p.name.lower().endswith(_INCOMPLETE_DOWNLOAD_SUFFIXES):
+            continue
+        if _UNMERGED_STREAM_RE.search(p.name):
+            continue
+        if require_non_empty:
+            try:
+                if p.stat().st_size <= 0:
+                    continue
+            except OSError:
+                continue
+        files.append(p)
+    return files
+
+
 async def _download_ytdlp(
     url: str,
     job_dir: Path,
@@ -837,9 +928,12 @@ async def _download_ytdlp(
     fallback_fmt = _fallback_format_args(format_spec)
     last_report = 0.0
     baseline_names = {p.name for p in job_dir.iterdir() if p.is_file()}
+    attempt_error_lines: deque[str] = deque(maxlen=20)
 
     async def handle_line(line: str) -> None:
         nonlocal last_report
+        if line.startswith("ERROR:"):
+            attempt_error_lines.append(line)
         if not on_progress:
             return
         m = _YTDLP_DL_RE.search(line)
@@ -864,12 +958,21 @@ async def _download_ytdlp(
             if p.is_file() and p.name not in baseline_names:
                 p.unlink(missing_ok=True)
 
+    def _combine_error_text(tail_lines: list[str]) -> str:
+        tail_text = "\n".join(tail_lines)
+        if attempt_error_lines and not any(
+            line.strip().startswith("ERROR:") for line in tail_lines
+        ):
+            return "\n".join([*attempt_error_lines, *tail_lines])
+        return tail_text
+
     async def _run_attempt(
         *,
         use_cookies: bool,
         attempt_fmt_args: list[str],
         extractor_args: str | None = None,
     ) -> tuple[int, list[str]]:
+        attempt_error_lines.clear()
         with _isolated_cookies_copy(cookies_file if use_cookies else None) as iso_cookies:
             args: list[str] = [
                 *_ytdlp_base_args(
@@ -893,9 +996,14 @@ async def _download_ytdlp(
             return await _invoke_streaming(*args, on_line=handle_line, on_proc=on_proc)
 
     code, tail = await _run_attempt(use_cookies=True, attempt_fmt_args=fmt_args)
-    raw_err = "\n".join(tail)
+    raw_err = _combine_error_text(tail)
+    completed_on_err = (
+        _collect_completed_ytdlp_files(job_dir, baseline_names, require_non_empty=True)
+        if code != 0
+        else []
+    )
 
-    if code != 0 and _is_ytdlp_format_unavailable_error(raw_err):
+    if code != 0 and not completed_on_err and _is_ytdlp_format_unavailable_error(raw_err):
         _cleanup_failed_attempt_files()
         attempt_fmt = fallback_fmt or fmt_args
         last_authed_err = raw_err
@@ -928,7 +1036,13 @@ async def _download_ytdlp(
                 )
                 if code == 0:
                     break
-                cand_err = "\n".join(tail)
+                completed_on_err = _collect_completed_ytdlp_files(
+                    job_dir, baseline_names, require_non_empty=True
+                )
+                if completed_on_err:
+                    raw_err = _combine_error_text(tail)
+                    break
+                cand_err = _combine_error_text(tail)
                 _cleanup_failed_attempt_files()
                 if use_cookies:
                     last_authed_err = cand_err
@@ -946,17 +1060,29 @@ async def _download_ytdlp(
         elif attempt_fmt != fmt_args:
             code, tail = await _run_attempt(use_cookies=True, attempt_fmt_args=attempt_fmt)
             if code != 0:
-                _cleanup_failed_attempt_files()
-                raw_err = "\n".join(tail)
+                completed_on_err = _collect_completed_ytdlp_files(
+                    job_dir, baseline_names, require_non_empty=True
+                )
+                if not completed_on_err:
+                    _cleanup_failed_attempt_files()
+                raw_err = _combine_error_text(tail)
 
     if code != 0:
+        completed_on_err = _collect_completed_ytdlp_files(
+            job_dir, baseline_names, require_non_empty=True
+        )
+        if completed_on_err:
+            logger.warning(
+                "yt-dlp exited with code %s for %s after producing %d completed file(s); keeping completed files (%s)",
+                code,
+                url,
+                len(completed_on_err),
+                _format_ytdlp_error(raw_err),
+            )
+            return completed_on_err
         raise RuntimeError(_format_ytdlp_error(raw_err))
 
-    files = [
-        p
-        for p in job_dir.iterdir()
-        if p.is_file() and not p.name.lower().endswith(_INCOMPLETE_DOWNLOAD_SUFFIXES)
-    ]
+    files = _collect_completed_ytdlp_files(job_dir, baseline_names)
     if not files:
         raise RuntimeError("yt-dlp finished but produced no file.")
     return files
@@ -1565,11 +1691,12 @@ class IngestService:
         progress_cb: ProgressHook | None = None,
         force: bool = False,
         precomputed_sha256: str | None = None,
+        check_source_url_dup: bool = True,
     ) -> dict[str, Any]:
         sha256 = (precomputed_sha256 or await async_compute_file_sha256(local_path)).lower()
         if not force:
             existing = self.db.find_media_by_sha256(sha256)
-            if not existing and source_url:
+            if not existing and source_url and check_source_url_dup:
                 existing = self.db.find_media_by_source_url(source_url)
             if existing:
                 local_path.unlink(missing_ok=True)
@@ -1663,6 +1790,211 @@ class IngestService:
             preview_filename=preview_filename,
         )
 
+    async def _process_playlist_url_job(
+        self,
+        job_id: str,
+        url: str,
+        job_dir: Path,
+        *,
+        source_origin: str,
+        safe_folder: str,
+        normalized_tags: list[str],
+        forward_to_telegram: bool,
+        format_spec: str | None,
+        effective_proxy: str,
+        dl_weight: float,
+        on_progress: ProgressHook | None,
+        on_proc: ProcHook,
+        force: bool,
+        enforce_public: bool,
+    ) -> list[dict[str, Any]]:
+        self.db.update_job(
+            job_id,
+            status="downloading",
+            progress=1.0,
+            message=f"Expanding playlist → {safe_folder}...",
+        )
+        pl_info = await expand_ytdlp_playlist(
+            url,
+            cookies_file=self.settings.ytdlp_cookies_file,
+            proxy=effective_proxy,
+            max_items=500,
+        )
+        entries = pl_info.get("entries") or []
+        unavail_count = int(pl_info.get("unavailable_count") or 0)
+        if not entries:
+            if unavail_count > 0:
+                raise RuntimeError(
+                    f"Playlist has no available videos ({unavail_count} unavailable/removed)."
+                )
+            raise RuntimeError("Playlist has no downloadable entries.")
+
+        total = len(entries)
+        items: list[dict[str, Any]] = []
+        saved_count = 0
+        dup_count = 0
+        failed_count = 0
+        last_err = ""
+        dl_ratio = dl_weight / 100.0
+
+        for idx, entry in enumerate(entries, start=1):
+            if job_id in self._cancelled_jobs:
+                raise asyncio.CancelledError()
+            entry_url = str(entry.get("url") or "").strip()
+            if not entry_url:
+                continue
+            entry_title = str(entry.get("title") or "").strip() or None
+            label = (entry_title or entry_url)[:60]
+            slice_start = ((idx - 1) / total) * 99.0
+            slice_span = 99.0 / total
+
+            if not force:
+                existing = self.db.find_media_by_source_url(entry_url)
+                if existing:
+                    items.append(dict(existing, deduplicated=True))
+                    dup_count += 1
+                    pct = max(1.0, min(99.0, slice_start + slice_span))
+                    msg = f"Playlist {idx}/{total}: skipped duplicate ({label})"
+                    self.db.update_job(
+                        job_id,
+                        status="downloading",
+                        progress=pct,
+                        message=msg,
+                        media_ids_json=json.dumps([i["id"] for i in items]),
+                    )
+                    if on_progress:
+                        await on_progress(pct, msg)
+                    continue
+
+            async def entry_report_dl(
+                pct: float,
+                msg: str,
+                *,
+                _idx: int = idx,
+                _start: float = slice_start,
+                _span: float = slice_span,
+            ) -> None:
+                overall = max(1.0, min(99.0, _start + (pct / 100.0) * _span * dl_ratio))
+                full_msg = f"Playlist {_idx}/{total}: {msg}"
+                self.db.update_job(job_id, status="downloading", progress=overall, message=full_msg)
+                if on_progress:
+                    await on_progress(overall, full_msg)
+
+            async def entry_report_ul(
+                pct: float,
+                msg: str,
+                *,
+                _idx: int = idx,
+                _start: float = slice_start,
+                _span: float = slice_span,
+            ) -> None:
+                overall = max(
+                    1.0,
+                    min(99.0, _start + _span * (dl_ratio + (pct / 100.0) * (1.0 - dl_ratio))),
+                )
+                full_msg = f"Playlist {_idx}/{total}: {msg}"
+                self.db.update_job(job_id, status="allocating", progress=overall, message=full_msg)
+                if on_progress:
+                    await on_progress(overall, full_msg)
+
+            start_msg = f"Playlist {idx}/{total}: downloading {label}..."
+            self.db.update_job(
+                job_id,
+                status="downloading",
+                progress=max(1.0, slice_start),
+                message=start_msg,
+            )
+
+            entry_dir = job_dir / f"pl_{idx:04d}"
+            entry_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                if enforce_public:
+                    await _assert_public_url(entry_url)
+                yt_kwargs: dict[str, Any] = {
+                    "cookies_file": self.settings.ytdlp_cookies_file,
+                    "proxy": effective_proxy,
+                    "format_spec": format_spec,
+                    "concurrent_fragments": self.settings.ytdlp_concurrent_fragments,
+                    "on_progress": entry_report_dl,
+                }
+                if _accepts_kwarg(_download_ytdlp, "on_proc"):
+                    yt_kwargs["on_proc"] = on_proc
+                entry_files = await _download_ytdlp(entry_url, entry_dir, **yt_kwargs)
+
+                if job_id in self._cancelled_jobs:
+                    raise asyncio.CancelledError()
+
+                for f in entry_files:
+                    item = await self.finalize_staged_file(
+                        f,
+                        folder=safe_folder,
+                        tags=normalized_tags,
+                        source_origin=source_origin,
+                        source_kind="ytdlp",
+                        source_url=entry_url,
+                        title=entry_title or f.stem,
+                        forward_to_telegram=forward_to_telegram,
+                        progress_cb=entry_report_ul,
+                        force=force,
+                        check_source_url_dup=(len(entry_files) == 1),
+                    )
+                    items.append(item)
+                    if item.get("deduplicated"):
+                        dup_count += 1
+                    else:
+                        saved_count += 1
+                self.db.update_job(
+                    job_id,
+                    status="allocating",
+                    progress=max(1.0, min(99.0, slice_start + slice_span)),
+                    message=f"Playlist {idx}/{total}: saved ({label})",
+                    media_ids_json=json.dumps([i["id"] for i in items]),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as entry_exc:
+                if job_id in self._cancelled_jobs:
+                    raise asyncio.CancelledError()
+                failed_count += 1
+                last_err = str(entry_exc)
+                logger.warning(
+                    "Playlist job %s item %d/%d (%s) failed: %s",
+                    job_id,
+                    idx,
+                    total,
+                    entry_url,
+                    entry_exc,
+                )
+            finally:
+                shutil.rmtree(entry_dir, ignore_errors=True)
+
+        if not items:
+            raise RuntimeError(
+                f"All {total} playlist item(s) failed: {last_err or 'unknown error'}"
+            )
+
+        notes: list[str] = []
+        if dup_count > 0 and saved_count > 0:
+            notes.append(f"{dup_count} duplicate skipped")
+        if failed_count > 0:
+            notes.append(f"{failed_count} failed")
+        if unavail_count > 0:
+            notes.append(f"{unavail_count} unavailable skipped")
+        suffix = f" ({', '.join(notes)})" if notes else ""
+        if saved_count == 0 and dup_count > 0:
+            done_msg = f"All {dup_count} playlist item(s) already in vault{suffix}"
+        else:
+            done_msg = f"Saved {saved_count} file(s) to {safe_folder}{suffix}"
+
+        self.db.update_job(
+            job_id,
+            status="done",
+            progress=100.0,
+            message=done_msg,
+            media_ids_json=json.dumps([i["id"] for i in items]),
+        )
+        return items
+
     async def process_url_job(
         self,
         job_id: str,
@@ -1690,7 +2022,8 @@ class IngestService:
             )
         )
 
-        if not force:
+        is_pl_url = is_playlist_only_url(url)
+        if not force and not is_pl_url:
             existing = self.db.find_media_by_source_url(url)
             if existing:
                 self.db.update_job(
@@ -1742,6 +2075,23 @@ class IngestService:
                     if enforce_public and _accepts_kwarg(is_direct_download, "block_private_hosts"):
                         ddl_check_kwargs["block_private_hosts"] = True
                     ddl = await is_direct_download(url, **ddl_check_kwargs)
+                    if not ddl and is_pl_url:
+                        return await self._process_playlist_url_job(
+                            job_id,
+                            url,
+                            job_dir,
+                            source_origin=source_origin,
+                            safe_folder=safe_folder,
+                            normalized_tags=normalized_tags,
+                            forward_to_telegram=forward_to_telegram,
+                            format_spec=format_spec,
+                            effective_proxy=effective_proxy,
+                            dl_weight=dl_weight,
+                            on_progress=on_progress,
+                            on_proc=_on_proc,
+                            force=force,
+                            enforce_public=enforce_public,
+                        )
                     kind = "ddl" if ddl else "ytdlp"
                     self.db.update_job(
                         job_id,
@@ -1781,18 +2131,32 @@ class IngestService:
                         message=f"Saving to {safe_folder}...",
                     )
                     items: list[dict[str, Any]] = []
+                    multi_file = len(files) > 1
                     for f in files:
+                        item_source_url = url
+                        check_url_dup = True
+                        if multi_file:
+                            derived_yt_url = (
+                                _extract_youtube_item_url(f.name) if _is_youtube_url(url) else None
+                            )
+                            if derived_yt_url:
+                                item_source_url = derived_yt_url
+                            else:
+                                # Avoid deduplicating sibling files from the same multi-file URL
+                                # against each other while preserving SHA-256 content dedup.
+                                check_url_dup = False
                         item = await self.finalize_staged_file(
                             f,
                             folder=safe_folder,
                             tags=normalized_tags,
                             source_origin=source_origin,
                             source_kind=kind,
-                            source_url=url,
-                            title=title or f.stem,
+                            source_url=item_source_url,
+                            title=(title if not multi_file else None) or f.stem,
                             forward_to_telegram=forward_to_telegram,
                             progress_cb=report_ul,
                             force=force,
+                            check_source_url_dup=check_url_dup,
                         )
                         items.append(item)
 
@@ -1800,7 +2164,8 @@ class IngestService:
                         first = items[0]
                         done_msg = f"Duplicate skipped (already in {first['folder']}: {first['filename']})"
                     else:
-                        done_msg = f"Saved {len(items)} file(s) to {safe_folder}"
+                        saved_items = sum(1 for i in items if not i.get("deduplicated"))
+                        done_msg = f"Saved {saved_items if multi_file else len(items)} file(s) to {safe_folder}"
 
                     self.db.update_job(
                         job_id,

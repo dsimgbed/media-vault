@@ -83,12 +83,17 @@ function renderError(bodyEl, titleEl, message) {
 
 function renderPlaylistContent(dialog, bodyEl, titleEl, data, opts) {
   const entries = Array.isArray(data.entries) ? data.entries : [];
+  const unavailCount = Math.max(0, Number(data.unavailable_count || 0));
   const plTitle = (data.playlist_title || "").trim() || "Playlist Preview";
   titleEl.textContent = plTitle;
 
   if (!entries.length) {
+    const emptyMsg =
+      unavailCount > 0
+        ? `No available videos found (${unavailCount} unavailable/removed skipped).`
+        : "No entries found for this URL.";
     bodyEl.innerHTML = `
-      <div class="pl-empty">No entries found for this URL.</div>
+      <div class="pl-empty">${escapeHtml(emptyMsg)}</div>
       <div class="toolbar-group modal-actions-end">
         <button type="button" class="secondary" data-pl-close>Close</button>
       </div>
@@ -173,6 +178,7 @@ function renderPlaylistContent(dialog, bodyEl, titleEl, data, opts) {
         <button type="button" class="secondary btn-xs" data-pl-select="new">Select New Only</button>
         <button type="button" class="secondary btn-xs" data-pl-select="none">Deselect All</button>
         ${dupCount > 0 ? `<span class="pill warn pl-dup-summary">${dupCount} already in vault</span>` : ""}
+        ${unavailCount > 0 ? `<span class="pill pl-unavail-summary">${unavailCount} unavailable skipped</span>` : ""}
       </div>
     </div>
 
@@ -355,7 +361,7 @@ export async function openPlaylistPicker(
     const data = await apiFetch("/api/ytdlp/playlist", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url: targetUrl, max_items: 200 }),
+      body: JSON.stringify({ url: targetUrl, max_items: 500 }),
       signal: controller.signal,
     });
     if (controller.signal.aborted || !dialog.open) return;

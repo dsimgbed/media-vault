@@ -13,7 +13,13 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from app.allocator import sanitize_folder
 from app.context import AppContext
-from app.ingest import _accepts_kwarg, expand_ytdlp_playlist, is_direct_download, resolve_format_spec
+from app.ingest import (
+    _accepts_kwarg,
+    expand_ytdlp_playlist,
+    is_direct_download,
+    is_playlist_only_url,
+    resolve_format_spec,
+)
 from app.torrent_ingest import (
     TorrentQuotaError,
     assert_staging_disk_space,
@@ -101,8 +107,11 @@ async def ingest_url(
 
     base_folder = payload.folder
     queue_items: list[tuple[str, str | None, str | None]] = []
+    needs_playlist_expansion = payload.expand_playlist or any(
+        is_playlist_only_url(u) for u in raw_urls
+    )
     effective_proxy = (
-        await ctx.ingest.get_effective_proxy() if payload.expand_playlist else ""
+        await ctx.ingest.get_effective_proxy() if needs_playlist_expansion else ""
     )
     for u in raw_urls:
         if u.lower().startswith("magnet:?"):
@@ -157,7 +166,8 @@ async def ingest_url(
             )
             magnet_job_ids.append(job_id)
             continue
-        if payload.expand_playlist:
+        auto_playlist = is_playlist_only_url(u)
+        if payload.expand_playlist or auto_playlist:
             is_ddl = (
                 await is_direct_download(u, proxy=effective_proxy)
                 if effective_proxy and _accepts_kwarg(is_direct_download, "proxy")
@@ -173,10 +183,19 @@ async def ingest_url(
                     )
                 except Exception as exc:
                     raise HTTPException(status_code=400, detail=str(exc))
-                if pl_info.get("is_playlist") and pl_info.get("entries"):
+                if pl_info.get("is_playlist"):
+                    entries = pl_info.get("entries") or []
+                    if not entries:
+                        unavail = int(pl_info.get("unavailable_count") or 0)
+                        detail = (
+                            f"Playlist has no available videos ({unavail} unavailable/removed)."
+                            if unavail > 0
+                            else "Playlist has no downloadable videos."
+                        )
+                        raise HTTPException(status_code=400, detail=detail)
                     pl_title = (pl_info.get("playlist_title") or "").strip()
                     entry_folder = base_folder
-                    if payload.use_playlist_folder and pl_title:
+                    if payload.expand_playlist and payload.use_playlist_folder and pl_title:
                         clean_base = (base_folder or "").strip()
                         if (
                             not clean_base
@@ -187,7 +206,7 @@ async def ingest_url(
                             entry_folder = sanitize_folder(
                                 f"{clean_base}/{pl_title}", cfg.default_folder
                             )
-                    for entry in pl_info["entries"]:
+                    for entry in entries:
                         queue_items.append((entry["url"], entry.get("title"), entry_folder))
                     continue
         queue_items.append((u, payload.title if len(raw_urls) == 1 else None, base_folder))

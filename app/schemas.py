@@ -15,13 +15,13 @@ class UrlIngestRequest(BaseModel):
     format_spec: str | None = None
     expand_playlist: bool = False
     use_playlist_folder: bool = True
-    max_playlist_items: int = 50
+    max_playlist_items: int = 500
     force: bool = False
 
 
 class PlaylistRequest(BaseModel):
     url: str
-    max_items: int = 50
+    max_items: int = 200
 
 
 class QuickCaptureRequest(BaseModel):
