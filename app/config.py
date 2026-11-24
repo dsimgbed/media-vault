@@ -127,6 +127,19 @@ class Settings(BaseSettings):
     gallery_dl_max_items_cap: int = 500
     gallery_dl_max_total_mb: int = 4096
 
+    # Live Watch Party Rooms (Multiplayer Synced Cinema)
+    watch_party_enabled: bool = True
+    watch_party_max_rooms: int = 20
+    watch_party_max_participants: int = 20
+    watch_party_default_ttl_sec: int = 21600
+    watch_party_idle_timeout_sec: int = 3600
+    watch_party_reaper_interval_sec: int = 60
+    watch_party_pin_max_attempts: int = 5
+    watch_party_pin_window_sec: int = 300
+    watch_party_chat_history_limit: int = 100
+    watch_party_chat_rate_limit_count: int = 5
+    watch_party_chat_rate_limit_sec: float = 5.0
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "media.db"

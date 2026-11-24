@@ -10,6 +10,7 @@ import {
 } from "/static/js/utils.js";
 import { getMode, onModeChange } from "/static/js/mode.js";
 import { toast } from "/static/js/ui/dialogs.js";
+import { initWatchPartyHost, notifyCinemaVideoSelected } from "/static/js/features/watch-party-host.js";
 
 let activeLoadSeq = 0;
 
@@ -201,7 +202,7 @@ function renderNowMeta(item) {
   }
 }
 
-export async function playCinemaVideo(mediaId, { autoplay = true, scroll = true } = {}) {
+export async function playCinemaVideo(mediaId, { autoplay = true, scroll = true, fromWatchParty = false } = {}) {
   const stage = $("cinemaStage");
   const video = $("cinemaVideo");
   const overlay = $("cinemaEmptyOverlay");
@@ -243,6 +244,10 @@ export async function playCinemaVideo(mediaId, { autoplay = true, scroll = true 
   state.cinemaActiveId = item.id;
   state.cinemaActiveItem = item;
   renderNowMeta(item);
+
+  if (!fromWatchParty) {
+    notifyCinemaVideoSelected(item.id);
+  }
 
   const streamUrl = withToken(`/api/media/${item.id}/stream`);
   if (item.thumb_filename) {
@@ -379,6 +384,12 @@ export function initCinema() {
     if (!state.cinemaActiveId) return;
     if (!video.paused) video.pause();
     emit("media:open", { id: state.cinemaActiveId });
+  });
+
+  initWatchPartyHost({
+    getCinemaVideos,
+    playCinemaVideo,
+    getVideoElement: () => $("cinemaVideo"),
   });
 
   $("cinemaQueueList")?.addEventListener("click", (e) => {

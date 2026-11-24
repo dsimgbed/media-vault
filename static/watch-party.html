@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0d1117" />
+  <meta name="color-scheme" content="dark" />
+  <title>Media Vault — Watch Party</title>
+  <link rel="icon" type="image/svg+xml" href="/static/icons/icon.svg" />
+  <link rel="stylesheet" href="/static/css/base.css" />
+  <link rel="stylesheet" href="/static/css/watch-party.css" />
+</head>
+<body>
+  <div id="wpToastRegion" aria-live="polite"></div>
+
+  <section id="wpErrorView" hidden>
+    <div class="wp-error-card">
+      <span class="wp-error-icon" aria-hidden="true">&#9888;</span>
+      <h1 id="wpErrorTitle">Unable to join</h1>
+      <p id="wpErrorMessage" class="wp-error-message"></p>
+    </div>
+  </section>
+
+  <section id="wpJoinView" hidden>
+    <div class="wp-join-card">
+      <span class="wp-join-brand">Media Vault • Watch Party</span>
+      <h1 id="wpJoinTitle">Join Watch Party</h1>
+      <p id="wpJoinMeta" class="wp-join-meta">Enter your display name to join.</p>
+
+      <form id="wpJoinForm">
+        <label class="wp-field" for="wpNameInput">
+          <span class="wp-label">Display Name</span>
+          <input id="wpNameInput" type="text" maxlength="40" required autocomplete="nickname" placeholder="Your display name" />
+        </label>
+
+        <div id="wpPinField" class="wp-field" hidden>
+          <label class="wp-label" for="wpPinInput">Room PIN</label>
+          <input id="wpPinInput" type="password" maxlength="32" autocomplete="off" placeholder="Enter room PIN" />
+        </div>
+
+        <p id="wpJoinError" class="wp-join-error" hidden></p>
+
+        <button id="wpJoinBtn" type="submit">Join Watch Party</button>
+      </form>
+    </div>
+  </section>
+
+  <section id="wpRoomView" hidden>
+    <header class="wp-topbar">
+      <div class="wp-topbar-left">
+        <span class="wp-brand-badge">Media Vault</span>
+        <span id="wpRoomTitle" class="wp-room-title">Watch Party</span>
+      </div>
+      <div class="wp-topbar-right">
+        <span id="wpSyncBadge" class="pill wp-badge-ok">Synced</span>
+        <span id="wpRttBadge" class="pill">RTT &mdash;</span>
+        <span id="wpControlBadge" class="pill">Host Controls</span>
+        <span id="wpViewerCountBadge" class="pill">0 watching</span>
+        <button id="wpCopyInviteBtn" type="button" class="secondary btn-sm" hidden>Copy Invite</button>
+        <button id="wpLeaveBtn" type="button" class="secondary btn-sm">Leave</button>
+        <button id="wpEndRoomBtn" type="button" class="danger btn-sm" hidden>End Party</button>
+      </div>
+    </header>
+
+    <div class="wp-main">
+      <section class="wp-stage">
+        <div id="wpVideoWrap" class="wp-video-wrap">
+          <video id="wpVideo" controls playsinline preload="metadata"></video>
+
+          <div id="wpEmptyStage" class="wp-empty-stage">
+            <span class="wp-empty-icon" aria-hidden="true">&#127916;</span>
+            <span class="wp-empty-text">Waiting for host to select a video</span>
+          </div>
+
+          <div id="wpReactionsLayer" class="wp-reactions-layer"></div>
+
+          <div id="wpAutoplayOverlay" class="wp-autoplay-overlay" hidden>
+            <button id="wpAutoplayBtn" type="button" class="wp-autoplay-btn">&#9654; Click to Sync &amp; Unmute</button>
+          </div>
+
+          <div id="wpBufferingBanner" class="wp-buffering-banner" hidden>
+            <span id="wpBufferingText" class="wp-buffering-text">Buffering&hellip;</span>
+          </div>
+        </div>
+
+        <div class="wp-now-bar">
+          <div class="wp-now-info">
+            <div id="wpNowTitle" class="wp-now-title">Nothing playing</div>
+            <div id="wpNowMeta" class="wp-now-meta">Waiting for the host to pick something.</div>
+          </div>
+          <div class="wp-now-controls">
+            <span id="wpDriftLabel" class="small-muted">In sync</span>
+            <button id="wpResyncBtn" type="button" class="secondary btn-sm">Re-sync</button>
+            <select id="wpSpeedSelect" aria-label="Playback speed">
+              <option value="0.5">0.5</option>
+              <option value="0.75">0.75</option>
+              <option value="1" selected>1</option>
+              <option value="1.25">1.25</option>
+              <option value="1.5">1.5</option>
+              <option value="2">2</option>
+            </select>
+          </div>
+        </div>
+
+        <div id="wpHostControlsBar" class="wp-host-bar" hidden>
+          <button id="wpToggleControlsBtn" type="button" class="secondary btn-xs">Allow Everyone</button>
+          <button id="wpToggleWaitBufferBtn" type="button" class="secondary btn-xs">Wait for Buffering: Off</button>
+        </div>
+      </section>
+
+      <aside class="wp-sidebar">
+        <div class="wp-tabs" role="tablist" aria-label="Room panels">
+          <button id="wpTabChat" class="wp-tab is-active" type="button" data-tab="chat" role="tab" aria-selected="true">Chat</button>
+          <button id="wpTabQueue" class="wp-tab" type="button" data-tab="queue" role="tab" aria-selected="false">Up Next <span id="wpQueueCount" class="wp-tab-count">0</span></button>
+          <button id="wpTabViewers" class="wp-tab" type="button" data-tab="viewers" role="tab" aria-selected="false">Viewers <span id="wpViewersCount" class="wp-tab-count">0</span></button>
+        </div>
+
+        <section id="wpPanelChat" class="wp-panel">
+          <div id="wpChatMessages" class="wp-chat-messages"></div>
+
+          <div id="wpReactionBar" class="wp-reaction-bar"></div>
+
+          <form id="wpChatForm" class="wp-chat-form">
+            <input id="wpChatInput" type="text" maxlength="500" placeholder="Say something..." autocomplete="off" />
+            <span id="wpChatCharCount" class="small-muted wp-chat-char-count">0/500</span>
+            <button id="wpChatSendBtn" type="submit">Send</button>
+          </form>
+        </section>
+
+        <section id="wpPanelQueue" class="wp-panel" hidden>
+          <div id="wpQueueList" class="wp-queue-list"></div>
+        </section>
+
+        <section id="wpPanelViewers" class="wp-panel" hidden>
+          <div id="wpViewersList" class="wp-viewers-list"></div>
+        </section>
+      </aside>
+    </div>
+  </section>
+
+  <script type="module" src="/static/js/watch-party.js"></script>
+</body>
+</html>

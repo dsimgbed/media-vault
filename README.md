@@ -171,4 +171,49 @@ rclone mount mediavault: ~/MediaVault --read-only --vfs-cache-mode full
 
 The **Capture Tools → External Players & WebDAV Mount (Read-Only)** card in the System sheet shows the live status, copyable endpoints, and ready-to-paste client snippets. Your real WebDAV password is never shown or embedded; the vault token only appears in copied recipes when the existing "Include my active auth token in recipes" opt-in is enabled.
 
+### 11. Live Watch Party Rooms (Multiplayer Synced Cinema)
+
+Media Vault's **Cinema → Watch Party** mode adds real-time multiplayer "watch together" syncing on top of the Cinema theater: the host drives playback from the Cinema player while remote guests watch the same title in sync.
+
+1. **Starting & managing a Watch Party from Cinema → Watch Party**:
+   - The host creates a room with a **queue selection** of vault videos (the Up Next queue, max 200 media items) plus an optional starting **active media**.
+   - Optional room **PIN** (4–32 chars, stored only as a PBKDF2-HMAC-SHA256 digest), **control mode** (`host_only` — default, playback is host-only — or `everyone` — guests may also play/pause/seek/rate), optional **"Wait for buffering"** (hold playback until connected peers are ready), a room **TTL** (default `WATCH_PARTY_DEFAULT_TTL_SEC=21600`, i.e. 6 h, extendable) and a **max participants** cap (default `WATCH_PARTY_MAX_PARTICIPANTS=20`).
+   - The room is issued a short room code and host session token, and the invite link is `/watch/<room_code>` (e.g. `http://your-host:8080/watch/A1bC2dEfGhI`).
+   - The host manages the room via the API/WebSocket: update settings, set/add/remove **Up Next** queue items, select the active item, **kick** a participant, or **End Party** (`DELETE /api/watch-party/rooms/{room_code}` or the host `close_room` WebSocket message). Rooms also expire automatically via the background reaper (idle timeout / TTL).
+
+2. **Standalone Guest Room UI (`GET /watch/<room_code>`)**:
+   - The guest page is served with **strict CSP security headers** (`default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' ws: wss:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`) plus `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and `Cache-Control: no-cache` on guest responses.
+   - Guests join with a display name + optional PIN via `POST /api/watch-party/{room_code}/join` and receive a room-scoped guest token, used for the WebSocket auth frame and the media/thumbnail proxies (`?wp_token=...`).
+   - **Smart drift correction**: playback state is server-authoritative over the room WebSocket (`sync_state` frames with `state_seq` + server/client clock sync); small desync is corrected by **playback-rate nudging**, larger desync falls back to a **hard seek**, and an **autoplay-unmute overlay** ("Click to Sync & Unmute") releases the `<video>` element when needed.
+   - The room UI ships an **Up Next** queue tab, **Viewers** tab with live presence + buffering indicators, **live chat** (100-message history, rate limited) and **floating emoji reactions**.
+
+3. **Shared Two-Tier Stream Cache**:
+   - All room viewers stream through `/api/watch-party/<room_code>/media/<media_id>/stream` (thumbnails via the sibling `/media/<media_id>/thumb` route), backed by Media Vault's existing range-streaming + hot-block cache (`app/stream_cache.py`) — canonical fixed-grid blocking, single-flight coalescing, RAM L1 + opt-in disk L2 hot-block cache, and bounded sequential read-ahead prefetch.
+   - Net effect: each Telegram chunk is fetched **once** and shared across all simultaneous room viewers, so the Cinema sync bridge never fans out duplicate range requests.
+
+4. **Security model**:
+   - Room-scoped tokens are **256-bit** random host/guest session tokens (issued via `secrets.token_urlsafe(32)`), returned exactly once and stored as SHA-256 digests compared in constant time; the global `WEB_AUTH_TOKEN` is never accepted by guest endpoints and never exposed to guests.
+   - **Strict queue allowlist**: guests may only access media that is queued/active in their room; unqueued vault media is rejected with `403`.
+   - **PIN protection**: PBKDF2-HMAC-SHA256 (100k iterations, per-room random salt) digest only — the plaintext PIN is never retained; per-IP brute-force throttling via `WATCH_PARTY_PIN_MAX_ATTEMPTS` / `WATCH_PARTY_PIN_WINDOW_SEC` (→ `429`).
+   - **Non-leaking `/info`**: room metadata is sanitized before leaving the service and never leaks filesystem paths, Telegram identifiers or source URLs before PIN verification.
+   - **Immediate revocation**: tokens are cleared on queue removal, kick, or room close.
+
+5. **`.env` settings** (see also [`app/config.py`](app/config.py) and [`.env.example`](.env.example)):
+
+```env
+WATCH_PARTY_ENABLED=true            # master switch (default: true; rooms answer 503 when disabled)
+WATCH_PARTY_MAX_ROOMS=20            # max concurrent watch party rooms
+WATCH_PARTY_MAX_PARTICIPANTS=20    # default max participants per room
+WATCH_PARTY_DEFAULT_TTL_SEC=21600  # default room TTL in seconds (6 h; allowed range 300–86400)
+WATCH_PARTY_IDLE_TIMEOUT_SEC=3600  # idle room timeout before the reaper closes it
+WATCH_PARTY_REAPER_INTERVAL_SEC=60 # background expiry reaper tick (seconds)
+WATCH_PARTY_PIN_MAX_ATTEMPTS=5     # max PIN attempts before per-IP throttle kicks in
+WATCH_PARTY_PIN_WINDOW_SEC=300     # PIN brute-force window (seconds)
+WATCH_PARTY_CHAT_HISTORY_LIMIT=100 # chat history retention per room
+WATCH_PARTY_CHAT_RATE_LIMIT_COUNT=5    # chat messages allowed per rate-limit window
+WATCH_PARTY_CHAT_RATE_LIMIT_SEC=5.0    # chat rate-limit window (seconds)
+```
+
+For the full architecture decision record, see [`docs/decisions/watch-party.md`](docs/decisions/watch-party.md).
+
 

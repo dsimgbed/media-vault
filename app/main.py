@@ -29,11 +29,13 @@ from app.routers import pwa as pwa_router
 from app.routers import subscriptions as subscriptions_router
 from app.routers import system as system_router
 from app.routers import uploads as uploads_router
+from app.routers import watch_party as watch_party_router
 from app.routers import webdav as webdav_router
 from app.routers import zip_explorer as zip_explorer_router
 from app.subscriptions import SubscriptionService
 from app.telegram_mtproto import TelegramPool
 from app.uploads import UploadSessionService
+from app.watch_party import WatchPartyService
 from app.zip_cache import ZipDirectoryCache
 
 logging.basicConfig(
@@ -80,6 +82,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         max_db_rows=cfg.zip_cache_db_max_rows,
         max_db_bytes=cfg.zip_cache_db_max_bytes,
     )
+    watch_party = WatchPartyService(cfg, db)
     ctx = AppContext(
         settings=cfg,
         db=db,
@@ -93,6 +96,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         subscriptions=subscriptions,
         torrent=torrent,
         gallery=gallery,
+        watch_party=watch_party,
     )
     ingest.recover_on_startup()
     db.recover_interrupted_maintenance_runs()
@@ -106,9 +110,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         backup.start_scheduler()
         uploads.start_gc()
         subscriptions.start_scheduler()
+        watch_party.start_reaper()
         try:
             yield
         finally:
+            await watch_party.stop_reaper()
             await subscriptions.stop_scheduler()
             await backup.stop_scheduler()
             await integrity.shutdown()
@@ -148,6 +154,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.subscriptions = subscriptions
     app.state.torrent = torrent
     app.state.gallery = gallery
+    app.state.watch_party = watch_party
 
     app.include_router(system_router.router)
     app.include_router(maintenance_router.router)
@@ -159,6 +166,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(media_router.router)
     app.include_router(zip_explorer_router.router)
     app.include_router(webdav_router.router)
+    app.include_router(watch_party_router.router)
 
     if STATIC_DIR.exists():
         app.mount("/static", RevalidatingStaticFiles(directory=str(STATIC_DIR)), name="static")

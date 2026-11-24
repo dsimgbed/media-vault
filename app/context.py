@@ -28,3 +28,4 @@ class AppContext:
     subscriptions: Any = None
     torrent: Any = None
     gallery: Any = None
+    watch_party: Any = None

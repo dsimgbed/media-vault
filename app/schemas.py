@@ -218,3 +218,44 @@ class GalleryIngestRequest(BaseModel):
     forward_to_telegram: bool = True
     force: bool = False
 
+
+class WatchPartyCreateRequest(BaseModel):
+    title: str | None = Field(default=None, max_length=120)
+    media_ids: list[str] = Field(default_factory=list, max_length=200)
+    active_media_id: str | None = Field(default=None, max_length=128)
+    pin: str | None = Field(default=None, max_length=32)
+    control_mode: Literal["host_only", "everyone"] = "host_only"
+    wait_for_buffering: bool = False
+    ttl_sec: int | None = Field(default=None, ge=300, le=86400)
+    max_participants: int | None = Field(default=None, ge=2, le=100)
+    host_name: str = Field(default="Host", min_length=1, max_length=40)
+    initial_position_sec: float = Field(default=0.0, ge=0.0)
+    initial_is_playing: bool = False
+    initial_playback_rate: float = Field(default=1.0, ge=0.25, le=4.0)
+
+
+class WatchPartyUpdateRequest(BaseModel):
+    title: str | None = Field(default=None, max_length=120)
+    control_mode: Literal["host_only", "everyone"] | None = None
+    wait_for_buffering: bool | None = None
+    queue: list[str] | None = Field(default=None, max_length=200)
+    add_media_ids: list[str] | None = Field(default=None, max_length=200)
+    remove_media_ids: list[str] | None = Field(default=None, max_length=200)
+    active_media_id: str | None = Field(default=None, max_length=128)
+    pin: str | None = Field(default=None, max_length=32)
+    clear_pin: bool = False
+    extend_ttl_sec: int | None = Field(default=None, ge=300, le=86400)
+
+
+class WatchPartyJoinRequest(BaseModel):
+    display_name: str = Field(..., min_length=1, max_length=40)
+    pin: str | None = Field(default=None, max_length=32)
+
+
+class WatchPartyHostSessionRequest(BaseModel):
+    display_name: str = Field(default="Host", min_length=1, max_length=40)
+
+
+class WatchPartyKickRequest(BaseModel):
+    participant_id: str = Field(..., min_length=1, max_length=128)
+

@@ -462,6 +462,12 @@ async def delete_media_item(ctx: AppContext, media_id: str) -> dict[str, Any] | 
         if preview_path.exists():
             preview_path.unlink(missing_ok=True)
 
+    if getattr(ctx, "watch_party", None) is not None:
+        try:
+            await ctx.watch_party.handle_media_deleted(media_id)
+        except Exception as exc:
+            logger.warning("Watch party cleanup failed for deleted media %s: %s", media_id, exc)
+
     return item
 
 
