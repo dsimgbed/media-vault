@@ -9,6 +9,12 @@ const SEEK_DEBOUNCE_MS = 150;
 const SUPPRESS_MS = 450;
 const DRIFT_SYNCED_SEC = 0.45;
 const DRIFT_NUDGE_SEC = 1.5;
+const BUFFERING_REPORT_DELAY_MS = 650;
+const BUFFERING_RESUME_AHEAD_SEC = 1.5;
+const BUFFERING_CHECK_INTERVAL_MS = 300;
+const BUFFERING_READY_FALLBACK_MS = 1500;
+const POST_RESUME_GRACE_MS = 1200;
+const LOCAL_SEEK_LOCK_MS = 1500;
 const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 15000];
 const NO_RECONNECT_CODES = new Set([4001, 4003, 4004, 4005]);
 const MAX_CHAT_LEN = 500;
@@ -28,9 +34,20 @@ let seekSendTimer = null;
 let lastStateSeq = -1;
 let clockOffsetMs = 0;
 let clockSamples = 0;
+let stateReceivedPerfMs = 0;
 let suppressLocalUntil = 0;
 let isApplyingSync = false;
-let lastBufferingSent = null;
+let lastBufferingSent = false;
+let bufferingReportTimer = null;
+let bufferingReadyTimer = null;
+let bufferingReportedAt = 0;
+let postResumeGraceUntil = 0;
+let userSeeking = false;
+let pendingSeekTargetSec = null;
+let localSeekLockUntil = 0;
+let programmaticSeekTarget = null;
+let programmaticSeekUntil = 0;
+let lastTimeUpdatePos = -1;
 let lastControlToastAt = 0;
 let activeMediaId = null;
 let pendingMetadataSeekHandler = null;
@@ -330,7 +347,8 @@ function updateBufferingBanner(participants) {
   const text = $("wpBufferingText");
   const buffering = (participants || []).filter((p) => p.is_buffering);
   if (!banner || !text) return;
-  if (buffering.length === 0) {
+  const activePlayback = Boolean(roomState?.is_playing || roomState?.paused_for_buffering);
+  if (buffering.length === 0 || !activePlayback) {
     banner.hidden = true;
     text.textContent = "";
     return;
@@ -338,9 +356,10 @@ function updateBufferingBanner(participants) {
   banner.hidden = false;
   const names = buffering.map((p) => String(p.display_name || "Someone")).slice(0, 3);
   const extra = buffering.length - names.length;
-  text.textContent = extra > 0
-    ? `Waiting for ${names.join(", ")} +${extra} to buffer...`
-    : `Waiting for ${names.join(", ")} to buffer...`;
+  const who = extra > 0 ? `${names.join(", ")} +${extra}` : names.join(", ");
+  text.textContent = roomState?.paused_for_buffering
+    ? `Waiting for ${who} to buffer...`
+    : `${who} buffering...`;
 }
 
 function renderQueue() {
@@ -572,6 +591,36 @@ function getEstimatedServerNowMs() {
   return Date.now() + clockOffsetMs;
 }
 
+function isUserSeeking() {
+  return Boolean(userSeeking || seekSendTimer !== null || performance.now() < localSeekLockUntil);
+}
+
+function setVideoTimeSynced(video, targetPos) {
+  if (!video || !Number.isFinite(targetPos)) return;
+  let clamped = Math.max(0, targetPos);
+  if (Number.isFinite(video.duration) && video.duration > 0) {
+    clamped = Math.min(video.duration, clamped);
+  }
+  programmaticSeekTarget = clamped;
+  programmaticSeekUntil = performance.now() + 8000;
+  try { video.currentTime = clamped; } catch (_) {}
+}
+
+function isProgrammaticSeekEvent(video, { consume = false } = {}) {
+  if (programmaticSeekTarget === null) return false;
+  if (performance.now() > programmaticSeekUntil) {
+    programmaticSeekTarget = null;
+    return false;
+  }
+  const pos = Number(video?.currentTime ?? NaN);
+  if (Number.isFinite(pos) && Math.abs(pos - programmaticSeekTarget) <= 1.5) {
+    if (consume) programmaticSeekTarget = null;
+    return true;
+  }
+  programmaticSeekTarget = null;
+  return false;
+}
+
 function getExpectedPositionSec() {
   if (!roomState) return 0;
   const hasEffective =
@@ -587,8 +636,15 @@ function getExpectedPositionSec() {
   const rate = Number(roomState.playback_rate || 1) || 1;
   const playing = Boolean(roomState.is_playing);
   let expected = Number.isFinite(base) ? base : 0;
-  if (playing && Number.isFinite(refTimeMs) && refTimeMs > 0) {
-    const elapsed = Math.max(0, (getEstimatedServerNowMs() - refTimeMs) / 1000);
+  if (playing) {
+    let elapsed = 0;
+    if (clockSamples > 0 && Number.isFinite(refTimeMs) && refTimeMs > 0) {
+      elapsed = Math.max(0, (getEstimatedServerNowMs() - refTimeMs) / 1000);
+    } else if (hasEffective && stateReceivedPerfMs > 0) {
+      elapsed = Math.max(0, (performance.now() - stateReceivedPerfMs) / 1000);
+    } else if (Number.isFinite(refTimeMs) && refTimeMs > 0) {
+      elapsed = Math.max(0, (getEstimatedServerNowMs() - refTimeMs) / 1000);
+    }
     expected = expected + elapsed * rate;
   }
   const video = $("wpVideo");
@@ -614,6 +670,9 @@ function ensureActiveMedia() {
   const nextId = item ? String(item.media_id || item.id || "") : "";
   if (!nextId) {
     clearPendingMetadataSeek(video);
+    clearBufferingTimers();
+    lastBufferingSent = false;
+    programmaticSeekTarget = null;
     activeMediaId = null;
     lastAutoAdvancedFrom = null;
     video.removeAttribute("src");
@@ -623,10 +682,14 @@ function ensureActiveMedia() {
   }
   if (nextId !== activeMediaId) {
     clearPendingMetadataSeek(video);
+    clearBufferingTimers();
+    lastBufferingSent = false;
+    programmaticSeekTarget = null;
     activeMediaId = nextId;
     lastAutoAdvancedFrom = null;
     isApplyingSync = true;
     suppressLocalUntil = performance.now() + 1000;
+    postResumeGraceUntil = performance.now() + POST_RESUME_GRACE_MS;
     video.pause();
     video.src = mediaStreamUrl(nextId);
     video.load();
@@ -638,8 +701,11 @@ function ensureActiveMedia() {
       const targetPos = getExpectedPositionSec();
       isApplyingSync = true;
       suppressLocalUntil = performance.now() + SUPPRESS_MS;
+      postResumeGraceUntil = performance.now() + POST_RESUME_GRACE_MS;
       try { video.playbackRate = targetRate; } catch (_) {}
-      try { video.currentTime = targetPos; } catch (_) {}
+      if (Number.isFinite(targetPos) && Math.abs((video.currentTime || 0) - targetPos) > DRIFT_SYNCED_SEC) {
+        setVideoTimeSynced(video, targetPos);
+      }
       window.setTimeout(() => { isApplyingSync = false; }, 0);
     };
     if (video.readyState >= 1) {
@@ -665,13 +731,20 @@ function showAutoplayOverlay(show) {
   if (overlay) overlay.hidden = !show;
 }
 
-async function tryPlaySynced() {
+async function tryPlaySynced({ forceSeek = false } = {}) {
   const video = $("wpVideo");
   if (!video) return;
+  cancelPendingBufferingReport();
   const expected = getExpectedPositionSec();
+  const needSeek =
+    Number.isFinite(expected) &&
+    (forceSeek || Math.abs((video.currentTime || 0) - expected) > DRIFT_SYNCED_SEC);
   isApplyingSync = true;
   suppressLocalUntil = performance.now() + SUPPRESS_MS;
-  try { video.currentTime = expected; } catch (_) {}
+  postResumeGraceUntil = performance.now() + POST_RESUME_GRACE_MS;
+  if (needSeek) {
+    setVideoTimeSynced(video, expected);
+  }
   const rate = Number(roomState?.playback_rate || 1) || 1;
   try { video.playbackRate = rate; } catch (_) {}
   try {
@@ -681,11 +754,12 @@ async function tryPlaySynced() {
     showAutoplayOverlay(true);
     setBadge($("wpSyncBadge"), "Tap to sync", "wp-badge-warn");
   } finally {
+    suppressLocalUntil = Math.max(suppressLocalUntil, performance.now() + SUPPRESS_MS);
     window.setTimeout(() => { isApplyingSync = false; }, 0);
   }
 }
 
-function applyPlaybackState() {
+function applyPlaybackState({ reason = "" } = {}) {
   const video = $("wpVideo");
   if (!video || !roomState) return;
   ensureActiveMedia();
@@ -695,38 +769,73 @@ function applyPlaybackState() {
   if (roomState.is_playing) {
     if (video.paused) {
       void tryPlaySynced();
+    } else {
+      if (Math.abs((video.playbackRate || 1) - nominalRate) > 0.01 && reason === "rate") {
+        isApplyingSync = true;
+        suppressLocalUntil = performance.now() + SUPPRESS_MS;
+        try { video.playbackRate = nominalRate; } catch (_) {}
+        window.setTimeout(() => { isApplyingSync = false; }, 0);
+      }
+      if (reason === "seek" && !isUserSeeking()) {
+        const expected = getExpectedPositionSec();
+        if (Number.isFinite(expected) && Math.abs((video.currentTime || 0) - expected) > DRIFT_SYNCED_SEC) {
+          cancelPendingBufferingReport();
+          isApplyingSync = true;
+          suppressLocalUntil = performance.now() + SUPPRESS_MS;
+          postResumeGraceUntil = performance.now() + POST_RESUME_GRACE_MS;
+          try { video.playbackRate = nominalRate; } catch (_) {}
+          setVideoTimeSynced(video, expected);
+          window.setTimeout(() => { isApplyingSync = false; }, 0);
+        }
+      }
     }
   } else {
+    cancelPendingBufferingReport();
+    if (!roomState.paused_for_buffering) {
+      reportBuffering(false);
+    }
     if (!video.paused) {
       isApplyingSync = true;
       suppressLocalUntil = performance.now() + SUPPRESS_MS;
       try { video.pause(); } catch (_) {}
       window.setTimeout(() => { isApplyingSync = false; }, 0);
     }
-    // Keep paused position close to authoritative.
-    const expected = getExpectedPositionSec();
-    if (Number.isFinite(expected)) {
-      const delta = Math.abs(video.currentTime - expected);
-      if (delta > DRIFT_SYNCED_SEC) {
-        isApplyingSync = true;
-        suppressLocalUntil = performance.now() + SUPPRESS_MS;
-        try { video.currentTime = expected; } catch (_) {}
-        window.setTimeout(() => { isApplyingSync = false; }, 0);
+    // Keep paused position close to authoritative, but avoid flushing a peer's
+    // in-flight buffer over a small delta during a buffering pause.
+    if (!isUserSeeking()) {
+      const expected = getExpectedPositionSec();
+      const alignThreshold = roomState.paused_for_buffering ? DRIFT_NUDGE_SEC : DRIFT_SYNCED_SEC;
+      if (Number.isFinite(expected)) {
+        const delta = Math.abs((video.currentTime || 0) - expected);
+        if (delta > alignThreshold) {
+          isApplyingSync = true;
+          suppressLocalUntil = performance.now() + SUPPRESS_MS;
+          setVideoTimeSynced(video, expected);
+          window.setTimeout(() => { isApplyingSync = false; }, 0);
+        }
       }
     }
-    setBadge($("wpSyncBadge"), "Paused", "wp-badge-warn");
+    setBadge(
+      $("wpSyncBadge"),
+      roomState.paused_for_buffering ? "Buffering" : "Paused",
+      "wp-badge-warn"
+    );
   }
 }
 
 function snapToAuthoritative(showToastMsg) {
   const video = $("wpVideo");
   if (!video || !roomState) return;
+  cancelPendingBufferingReport();
   const expected = getExpectedPositionSec();
   const nominalRate = Number(roomState.playback_rate || 1) || 1;
   isApplyingSync = true;
   suppressLocalUntil = performance.now() + SUPPRESS_MS;
+  postResumeGraceUntil = performance.now() + POST_RESUME_GRACE_MS;
   try { video.playbackRate = nominalRate; } catch (_) {}
-  try { video.currentTime = expected; } catch (_) {}
+  if (Number.isFinite(expected) && Math.abs((video.currentTime || 0) - expected) > DRIFT_SYNCED_SEC) {
+    setVideoTimeSynced(video, expected);
+  }
   if (roomState.is_playing) {
     void video.play().catch(() => { showAutoplayOverlay(true); });
   } else {
@@ -752,8 +861,14 @@ function syncTick() {
   const video = $("wpVideo");
   const driftLabel = $("wpDriftLabel");
   if (!video || !roomState) return;
+  if (lastBufferingSent) {
+    checkBufferingReady();
+  }
   if (!activeMediaId || !video.src) {
     if (driftLabel) driftLabel.textContent = "Sync --";
+    return;
+  }
+  if (isUserSeeking() || video.seeking) {
     return;
   }
 
@@ -764,19 +879,24 @@ function syncTick() {
   if (driftLabel) driftLabel.textContent = `Sync ±${Math.round(absDelta * 1000)}ms`;
 
   if (!roomState.is_playing) {
-    if (absDelta > DRIFT_SYNCED_SEC) {
-      // Keep paused clients close.
+    const alignThreshold = roomState.paused_for_buffering ? DRIFT_NUDGE_SEC : DRIFT_SYNCED_SEC;
+    if (absDelta > alignThreshold) {
+      // Keep paused clients close without flushing in-flight buffers during buffering pauses.
       isApplyingSync = true;
       suppressLocalUntil = performance.now() + SUPPRESS_MS;
-      try { video.currentTime = expected; } catch (_) {}
+      setVideoTimeSynced(video, expected);
       try { video.playbackRate = nominalRate; } catch (_) {}
       window.setTimeout(() => { isApplyingSync = false; }, 0);
     }
-    setBadge($("wpSyncBadge"), "Paused", "wp-badge-warn");
+    setBadge(
+      $("wpSyncBadge"),
+      roomState.paused_for_buffering ? "Buffering" : "Paused",
+      "wp-badge-warn"
+    );
     return;
   }
 
-  if (video.paused) {
+  if (video.paused || video.readyState < 1) {
     setBadge($("wpSyncBadge"), "Syncing", "wp-badge-warn");
     return;
   }
@@ -804,26 +924,70 @@ function syncTick() {
     return;
   }
 
+  cancelPendingBufferingReport();
   isApplyingSync = true;
   suppressLocalUntil = performance.now() + SUPPRESS_MS;
+  postResumeGraceUntil = performance.now() + POST_RESUME_GRACE_MS;
   try { video.playbackRate = nominalRate; } catch (_) {}
-  try { video.currentTime = expected; } catch (_) {}
+  setVideoTimeSynced(video, expected);
   window.setTimeout(() => { isApplyingSync = false; }, 0);
   setBadge($("wpSyncBadge"), "Syncing", "wp-badge-warn");
 }
 
-function applyRoomState(next, { force = false } = {}) {
+function applyRoomState(next, { force = false, reason = "", actorParticipantId = "" } = {}) {
   if (!next || typeof next !== "object") return;
   const seq = Number(next.state_seq ?? next.seq ?? 0);
   if (!force && seq > 0 && seq < lastStateSeq) return;
   if (seq > 0) lastStateSeq = seq;
+
+  const prevPlaying = Boolean(roomState?.is_playing);
+  const prevPausedForBuffering = Boolean(roomState?.paused_for_buffering);
+  const prevMediaId = String(roomState?.active_media_id || roomState?.active_item_id || "");
+
+  stateReceivedPerfMs = performance.now();
   roomState = { ...(roomState || {}), ...next };
   updateTopMeta();
   updateControlUi();
   renderParticipants();
   renderQueue();
+
+  const nextMediaId = String(roomState?.active_media_id || roomState?.active_item_id || "");
+  const playbackChanged =
+    Boolean(roomState.is_playing) !== prevPlaying ||
+    Boolean(roomState.paused_for_buffering) !== prevPausedForBuffering ||
+    nextMediaId !== prevMediaId;
+
+  if (!force && reason === "buffering" && !playbackChanged) {
+    return;
+  }
+
+  const isSelfActor = Boolean(
+    actorParticipantId &&
+    session &&
+    String(actorParticipantId) === String(session.participant_id)
+  );
+  if (isSelfActor && !force && reason !== "buffering" && reason !== "select") {
+    if (reason === "seek" && pendingSeekTargetSec !== null) {
+      const echoedPos = Number(roomState.position_sec ?? roomState.effective_position_sec ?? NaN);
+      if (Number.isFinite(echoedPos) && Math.abs(echoedPos - pendingSeekTargetSec) <= 0.5) {
+        pendingSeekTargetSec = null;
+        localSeekLockUntil = Math.min(localSeekLockUntil, performance.now() + 250);
+      }
+    }
+    if (!roomState.is_playing) {
+      setBadge(
+        $("wpSyncBadge"),
+        roomState.paused_for_buffering ? "Buffering" : "Paused",
+        "wp-badge-warn"
+      );
+    } else if (!$("wpVideo")?.paused) {
+      setBadge($("wpSyncBadge"), "Synced", "wp-badge-ok");
+    }
+    return;
+  }
+
   ensureActiveMedia();
-  applyPlaybackState();
+  applyPlaybackState({ reason });
 }
 
 function handleWsMessage(raw) {
@@ -839,6 +1003,12 @@ function handleWsMessage(raw) {
     case "auth_ok": {
       reconnectAttempt = 0;
       clearReconnectTimer();
+      clearBufferingTimers();
+      lastBufferingSent = false;
+      userSeeking = false;
+      pendingSeekTargetSec = null;
+      localSeekLockUntil = 0;
+      programmaticSeekTarget = null;
       if (msg.participant_id || msg.role || msg.display_name) {
         saveSession({
           token: session.token,
@@ -860,8 +1030,12 @@ function handleWsMessage(raw) {
       break;
     }
     case "sync_state": {
-      if (msg.room_state) applyRoomState(msg.room_state);
-      else applyRoomState(msg, { force: false });
+      const meta = {
+        reason: String(msg.reason || ""),
+        actorParticipantId: String(msg.actor_participant_id || ""),
+      };
+      if (msg.room_state) applyRoomState(msg.room_state, meta);
+      else applyRoomState(msg, { force: false, ...meta });
       break;
     }
     case "pong": {
@@ -1004,6 +1178,14 @@ function connectWs() {
 function closeWs({ intentional = true } = {}) {
   intentionalClose = intentional;
   clearReconnectTimer();
+  clearBufferingTimers();
+  clearTimeout(seekSendTimer);
+  seekSendTimer = null;
+  lastBufferingSent = false;
+  userSeeking = false;
+  pendingSeekTargetSec = null;
+  localSeekLockUntil = 0;
+  programmaticSeekTarget = null;
   stopPing();
   stopSyncMonitor();
   if (ws) {
@@ -1012,18 +1194,131 @@ function closeWs({ intentional = true } = {}) {
   }
 }
 
+function getBufferedAheadSec(video) {
+  if (!video || !video.buffered || video.buffered.length === 0) return 0;
+  const t = Number(video.currentTime || 0);
+  if (!Number.isFinite(t)) return 0;
+  for (let i = 0; i < video.buffered.length; i += 1) {
+    const start = video.buffered.start(i);
+    const end = video.buffered.end(i);
+    if (t >= start - 0.15 && t <= end + 0.15) {
+      return Math.max(0, end - t);
+    }
+  }
+  return 0;
+}
+
+function hasEnoughBufferToResume(video) {
+  if (!video || !video.src || video.ended) return true;
+  if (video.readyState >= 4) return true;
+  if (video.readyState >= 3) {
+    const ahead = getBufferedAheadSec(video);
+    if (ahead >= BUFFERING_RESUME_AHEAD_SEC) return true;
+    const dur = Number(video.duration);
+    if (Number.isFinite(dur) && dur > 0 && dur - (Number(video.currentTime) || 0) <= 1.0) {
+      return true;
+    }
+    if (bufferingReportedAt > 0 && performance.now() - bufferingReportedAt >= BUFFERING_READY_FALLBACK_MS) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function cancelPendingBufferingReport() {
+  if (bufferingReportTimer) {
+    clearTimeout(bufferingReportTimer);
+    bufferingReportTimer = null;
+  }
+}
+
+function stopBufferingReadyPoll() {
+  if (bufferingReadyTimer) {
+    clearInterval(bufferingReadyTimer);
+    bufferingReadyTimer = null;
+  }
+}
+
+function clearBufferingTimers() {
+  cancelPendingBufferingReport();
+  stopBufferingReadyPoll();
+  bufferingReportedAt = 0;
+}
+
+function checkBufferingReady() {
+  if (!lastBufferingSent) {
+    stopBufferingReadyPoll();
+    return;
+  }
+  const video = $("wpVideo");
+  if (!video || !video.src || video.ended) {
+    reportBuffering(false);
+    return;
+  }
+  if (roomState && !roomState.is_playing && !roomState.paused_for_buffering) {
+    reportBuffering(false);
+    return;
+  }
+  if (hasEnoughBufferToResume(video)) {
+    reportBuffering(false);
+  }
+}
+
 function reportBuffering(isBuffering) {
+  const desired = Boolean(isBuffering);
+  if (!desired) {
+    cancelPendingBufferingReport();
+    stopBufferingReadyPoll();
+    bufferingReportedAt = 0;
+  }
   if (!session) return;
-  if (lastBufferingSent === isBuffering) return;
-  lastBufferingSent = isBuffering;
-  sendWs({ type: "buffering", is_buffering: Boolean(isBuffering) });
+  if (lastBufferingSent === desired) return;
+  lastBufferingSent = desired;
+  if (desired) {
+    bufferingReportedAt = performance.now();
+    stopBufferingReadyPoll();
+    bufferingReadyTimer = setInterval(checkBufferingReady, BUFFERING_CHECK_INTERVAL_MS);
+  }
+  sendWs({ type: "buffering", is_buffering: desired });
+}
+
+function scheduleBufferingReport() {
+  const video = $("wpVideo");
+  if (!session || !video || !video.src) return;
+  if (lastBufferingSent || bufferingReportTimer) return;
+  if (video.paused || video.ended || video.seeking || isApplyingSync || isUserSeeking()) return;
+  if (video.readyState >= 3) return;
+  if (!roomState || !roomState.is_playing) return;
+
+  const graceRemaining = Math.max(0, postResumeGraceUntil - performance.now());
+  const delay = Math.max(BUFFERING_REPORT_DELAY_MS, graceRemaining);
+  bufferingReportTimer = setTimeout(() => {
+    bufferingReportTimer = null;
+    const v = $("wpVideo");
+    if (!session || !v || !v.src) return;
+    if (v.paused || v.ended || v.seeking || isApplyingSync || isUserSeeking()) return;
+    if (v.readyState >= 3) return;
+    if (!roomState || !roomState.is_playing) return;
+    reportBuffering(true);
+  }, delay);
 }
 
 function sendSeekDebounced(positionSec) {
   clearTimeout(seekSendTimer);
+  const target = Number(positionSec);
+  if (!Number.isFinite(target) || target < 0) return;
   seekSendTimer = setTimeout(() => {
-    sendWs({ type: "seek", position_sec: Number(positionSec) });
+    seekSendTimer = null;
+    sendWs({ type: "seek", position_sec: target });
   }, SEEK_DEBOUNCE_MS);
+}
+
+function sendSeekImmediate(positionSec) {
+  clearTimeout(seekSendTimer);
+  seekSendTimer = null;
+  const target = Number(positionSec);
+  if (!Number.isFinite(target) || target < 0) return;
+  sendWs({ type: "seek", position_sec: target });
 }
 
 function bindVideoEvents() {
@@ -1036,26 +1331,54 @@ function bindVideoEvents() {
       snapToAuthoritative(true);
       return;
     }
+    cancelPendingBufferingReport();
+    postResumeGraceUntil = performance.now() + POST_RESUME_GRACE_MS;
     sendWs({ type: "play", position_sec: Number(video.currentTime || 0) });
     reportBuffering(false);
   });
 
   video.addEventListener("pause", () => {
+    cancelPendingBufferingReport();
     if (performance.now() < suppressLocalUntil || isApplyingSync) return;
     if (!canControl()) {
       snapToAuthoritative(true);
       return;
     }
+    reportBuffering(false);
     sendWs({ type: "pause", position_sec: Number(video.currentTime || 0) });
   });
 
-  video.addEventListener("seeked", () => {
+  video.addEventListener("seeking", () => {
     if (performance.now() < suppressLocalUntil || isApplyingSync) return;
+    if (isProgrammaticSeekEvent(video, { consume: false })) return;
+    if (!canControl()) return;
+    cancelPendingBufferingReport();
+    userSeeking = true;
+    const targetPos = Number(video.currentTime || 0);
+    pendingSeekTargetSec = targetPos;
+    localSeekLockUntil = performance.now() + LOCAL_SEEK_LOCK_MS;
+    sendSeekDebounced(targetPos);
+  });
+
+  video.addEventListener("seeked", () => {
+    if (lastBufferingSent) checkBufferingReady();
+    const wasProgrammatic = isProgrammaticSeekEvent(video, { consume: true });
+    if (performance.now() < suppressLocalUntil || isApplyingSync || wasProgrammatic) return;
     if (!canControl()) {
       snapToAuthoritative(true);
       return;
     }
-    sendSeekDebounced(Number(video.currentTime || 0));
+    userSeeking = false;
+    const targetPos = Number(video.currentTime || 0);
+    const shouldSend =
+      seekSendTimer !== null ||
+      pendingSeekTargetSec === null ||
+      Math.abs(targetPos - pendingSeekTargetSec) > 0.15;
+    pendingSeekTargetSec = targetPos;
+    localSeekLockUntil = performance.now() + 900;
+    if (shouldSend) {
+      sendSeekImmediate(targetPos);
+    }
   });
 
   video.addEventListener("ratechange", () => {
@@ -1073,21 +1396,41 @@ function bindVideoEvents() {
   });
 
   video.addEventListener("waiting", () => {
-    if (!video.src) return;
-    reportBuffering(true);
+    scheduleBufferingReport();
   });
   video.addEventListener("stalled", () => {
-    if (!video.src) return;
-    reportBuffering(true);
+    // Only treat network stall as buffering if playback is actually starved.
+    if (!video.paused && !video.ended && video.readyState < 3) {
+      scheduleBufferingReport();
+    }
   });
   video.addEventListener("playing", () => {
+    cancelPendingBufferingReport();
     reportBuffering(false);
   });
   video.addEventListener("canplay", () => {
-    if (!video.paused) reportBuffering(false);
+    if (video.readyState >= 3) cancelPendingBufferingReport();
+    if (lastBufferingSent) checkBufferingReady();
+  });
+  video.addEventListener("canplaythrough", () => {
+    cancelPendingBufferingReport();
+    if (lastBufferingSent) reportBuffering(false);
+  });
+  video.addEventListener("progress", () => {
+    if (lastBufferingSent) checkBufferingReady();
+  });
+  video.addEventListener("timeupdate", () => {
+    const pos = Number(video.currentTime || 0);
+    if (!video.paused && Number.isFinite(pos) && Math.abs(pos - lastTimeUpdatePos) > 0.05) {
+      lastTimeUpdatePos = pos;
+      cancelPendingBufferingReport();
+      if (lastBufferingSent) reportBuffering(false);
+    }
   });
 
   video.addEventListener("ended", () => {
+    clearBufferingTimers();
+    reportBuffering(false);
     if (!canControl() || !roomState || !activeMediaId) return;
     if (lastAutoAdvancedFrom === activeMediaId) return;
     const queue = Array.isArray(roomState.queue) ? roomState.queue : [];

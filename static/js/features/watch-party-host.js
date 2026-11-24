@@ -7,7 +7,16 @@ import { renderQrSvg } from "/static/js/ui/qr.js";
 const SUPPRESS_MS = 450;
 const SEEK_DEBOUNCE_MS = 150;
 const HOST_QUEUE_LIMIT = 50;
-const HOST_DRIFT_THRESHOLD_SEC = 0.5;
+const HOST_DRIFT_THRESHOLD_SEC = 1.5;
+const HOST_SEEK_ALIGN_SEC = 0.45;
+const HOST_BUFFERING_REPORT_DELAY_MS = 650;
+const HOST_BUFFERING_RESUME_AHEAD_SEC = 1.5;
+const HOST_BUFFERING_CHECK_INTERVAL_MS = 300;
+const HOST_BUFFERING_READY_FALLBACK_MS = 1500;
+const HOST_POST_RESUME_GRACE_MS = 1200;
+const HOST_LOCAL_ACTION_LOCK_MS = 1500;
+const HOST_PING_BURST_COUNT = 3;
+const HOST_PING_BURST_GAP_MS = 250;
 const HOST_RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 15000];
 const HOST_NO_RECONNECT_CODES = new Set([4001, 4003, 4004, 4005]);
 
@@ -25,9 +34,25 @@ let suppressUntil = 0;
 let isApplyingSync = false;
 let hostSyncTimer = null;
 let hostPingTimer = null;
+let hostPingBurstTimers = [];
 let hostReconnectTimer = null;
 let hostReconnectAttempt = 0;
 let hostIntentionalClose = false;
+let hostClockOffsetMs = 0;
+let hostClockSamples = 0;
+let hostStateReceivedPerfMs = 0;
+let hostLastStateSeq = -1;
+let hostLastBufferingSent = false;
+let hostBufferingReportTimer = null;
+let hostBufferingReadyTimer = null;
+let hostBufferingReportedAt = 0;
+let hostPostResumeGraceUntil = 0;
+let hostUserSeeking = false;
+let hostPendingSeekTarget = null;
+let hostLocalActionLockUntil = 0;
+let hostProgrammaticSeekTarget = null;
+let hostProgrammaticSeekUntil = 0;
+let hostLastTimeUpdatePos = -1;
 let hostDeps = null;
 let hostCinemaSelectedHandler = null;
 
@@ -78,6 +103,26 @@ function clearHostReconnectTimer() {
   }
 }
 
+function cancelHostPendingBuffering() {
+  if (hostBufferingReportTimer) {
+    clearTimeout(hostBufferingReportTimer);
+    hostBufferingReportTimer = null;
+  }
+}
+
+function stopHostBufferingReadyPoll() {
+  if (hostBufferingReadyTimer) {
+    clearInterval(hostBufferingReadyTimer);
+    hostBufferingReadyTimer = null;
+  }
+}
+
+function clearHostBufferingTimers() {
+  cancelHostPendingBuffering();
+  stopHostBufferingReadyPoll();
+  hostBufferingReportedAt = 0;
+}
+
 function stopHostTimers() {
   if (hostSyncTimer) {
     clearTimeout(hostSyncTimer);
@@ -87,22 +132,52 @@ function stopHostTimers() {
     clearInterval(hostPingTimer);
     hostPingTimer = null;
   }
+  for (const t of hostPingBurstTimers) clearTimeout(t);
+  hostPingBurstTimers = [];
+  clearHostBufferingTimers();
+}
+
+function sendHostPing() {
+  if (hostWs && hostWs.readyState === WebSocket.OPEN) {
+    hostWsSend({ type: "ping", client_time_ms: Date.now() });
+  }
 }
 
 function startHostPing() {
   stopHostTimers();
-  hostWsSend({ type: "ping", client_time_ms: Date.now() });
-  hostPingTimer = setInterval(() => {
-    if (hostWs && hostWs.readyState === WebSocket.OPEN) {
-      hostWsSend({ type: "ping", client_time_ms: Date.now() });
-    }
-  }, 15000);
+  sendHostPing();
+  for (let i = 1; i < HOST_PING_BURST_COUNT; i += 1) {
+    const t = setTimeout(sendHostPing, i * HOST_PING_BURST_GAP_MS);
+    hostPingBurstTimers.push(t);
+  }
+  hostPingTimer = setInterval(sendHostPing, 15000);
+}
+
+function handleHostPong(msg) {
+  const now = Date.now();
+  const clientTime = Number(msg.client_time_ms);
+  const serverTime = Number(msg.server_time_ms);
+  if (!Number.isFinite(clientTime) || !Number.isFinite(serverTime)) return;
+  const rtt = Math.max(0, now - clientTime);
+  const sampleOffset = serverTime - (clientTime + rtt / 2);
+  if (hostClockSamples === 0) {
+    hostClockOffsetMs = sampleOffset;
+  } else {
+    const alpha = rtt < 150 ? 0.25 : 0.1;
+    hostClockOffsetMs = hostClockOffsetMs + alpha * (sampleOffset - hostClockOffsetMs);
+  }
+  hostClockSamples += 1;
 }
 
 function closeHostWs({ intentional = true } = {}) {
   hostIntentionalClose = Boolean(intentional);
   clearHostReconnectTimer();
   stopHostTimers();
+  hostLastBufferingSent = false;
+  hostUserSeeking = false;
+  hostPendingSeekTarget = null;
+  hostLocalActionLockUntil = 0;
+  hostProgrammaticSeekTarget = null;
   if (hostWs) {
     const sock = hostWs;
     hostWs = null;
@@ -151,42 +226,249 @@ function syncAddActiveBtnVisibility() {
   addBtn.hidden = !activeId || queuedIds.includes(activeId);
 }
 
+function isHostUserSeeking() {
+  return Boolean(
+    hostUserSeeking ||
+    hostSyncTimer !== null ||
+    performance.now() < hostLocalActionLockUntil
+  );
+}
+
+function setHostVideoTimeSynced(video, targetPos) {
+  if (!video || !Number.isFinite(targetPos)) return;
+  let clamped = Math.max(0, targetPos);
+  if (Number.isFinite(video.duration) && video.duration > 0) {
+    clamped = Math.min(video.duration, clamped);
+  }
+  hostProgrammaticSeekTarget = clamped;
+  hostProgrammaticSeekUntil = performance.now() + 8000;
+  try { video.currentTime = clamped; } catch (_) {}
+}
+
+function isHostProgrammaticSeekEvent(video, { consume = false } = {}) {
+  if (hostProgrammaticSeekTarget === null) return false;
+  if (performance.now() > hostProgrammaticSeekUntil) {
+    hostProgrammaticSeekTarget = null;
+    return false;
+  }
+  const pos = Number(video?.currentTime ?? NaN);
+  if (Number.isFinite(pos) && Math.abs(pos - hostProgrammaticSeekTarget) <= 1.5) {
+    if (consume) hostProgrammaticSeekTarget = null;
+    return true;
+  }
+  hostProgrammaticSeekTarget = null;
+  return false;
+}
+
+function getHostBufferedAheadSec(video) {
+  if (!video || !video.buffered || video.buffered.length === 0) return 0;
+  const t = Number(video.currentTime || 0);
+  if (!Number.isFinite(t)) return 0;
+  for (let i = 0; i < video.buffered.length; i += 1) {
+    const start = video.buffered.start(i);
+    const end = video.buffered.end(i);
+    if (t >= start - 0.15 && t <= end + 0.15) {
+      return Math.max(0, end - t);
+    }
+  }
+  return 0;
+}
+
+function hasHostEnoughBuffer(video) {
+  if (!video || !video.src || video.ended) return true;
+  if (video.readyState >= 4) return true;
+  if (video.readyState >= 3) {
+    const ahead = getHostBufferedAheadSec(video);
+    if (ahead >= HOST_BUFFERING_RESUME_AHEAD_SEC) return true;
+    const dur = Number(video.duration);
+    if (Number.isFinite(dur) && dur > 0 && dur - (Number(video.currentTime) || 0) <= 1.0) {
+      return true;
+    }
+    if (
+      hostBufferingReportedAt > 0 &&
+      performance.now() - hostBufferingReportedAt >= HOST_BUFFERING_READY_FALLBACK_MS
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function checkHostBufferingReady() {
+  if (!hostLastBufferingSent) {
+    stopHostBufferingReadyPoll();
+    return;
+  }
+  const video = hostCinemaVideo();
+  if (!hostSyncActive || !video || !video.src || video.ended) {
+    reportHostBuffering(false);
+    return;
+  }
+  if (hostState && !hostState.is_playing && !hostState.paused_for_buffering) {
+    reportHostBuffering(false);
+    return;
+  }
+  if (hasHostEnoughBuffer(video)) {
+    reportHostBuffering(false);
+  }
+}
+
+function reportHostBuffering(isBuffering) {
+  const desired = Boolean(isBuffering);
+  if (!desired) {
+    cancelHostPendingBuffering();
+    stopHostBufferingReadyPoll();
+    hostBufferingReportedAt = 0;
+  }
+  if (!hostSyncActive) {
+    hostLastBufferingSent = false;
+    return;
+  }
+  if (hostLastBufferingSent === desired) return;
+  hostLastBufferingSent = desired;
+  if (desired) {
+    hostBufferingReportedAt = performance.now();
+    stopHostBufferingReadyPoll();
+    hostBufferingReadyTimer = setInterval(checkHostBufferingReady, HOST_BUFFERING_CHECK_INTERVAL_MS);
+  }
+  hostWsSend({ type: "buffering", is_buffering: desired });
+}
+
+function scheduleHostBufferingReport() {
+  const video = hostCinemaVideo();
+  if (!hostSyncActive || !video || !video.src) return;
+  if (hostLastBufferingSent || hostBufferingReportTimer) return;
+  if (video.paused || video.ended || video.seeking || isApplyingSync || isHostUserSeeking()) return;
+  if (video.readyState >= 3) return;
+  if (hostState && !hostState.is_playing) return;
+
+  const graceRemaining = Math.max(0, hostPostResumeGraceUntil - performance.now());
+  const delay = Math.max(HOST_BUFFERING_REPORT_DELAY_MS, graceRemaining);
+  hostBufferingReportTimer = setTimeout(() => {
+    hostBufferingReportTimer = null;
+    const v = hostCinemaVideo();
+    if (!hostSyncActive || !v || !v.src) return;
+    if (v.paused || v.ended || v.seeking || isApplyingSync || isHostUserSeeking()) return;
+    if (v.readyState >= 3) return;
+    if (hostState && !hostState.is_playing) return;
+    reportHostBuffering(true);
+  }, delay);
+}
+
+function sendHostSeekDebounced(positionSec) {
+  if (hostSyncTimer) clearTimeout(hostSyncTimer);
+  const target = Number(positionSec);
+  if (!Number.isFinite(target) || target < 0) return;
+  hostSyncTimer = setTimeout(() => {
+    hostSyncTimer = null;
+    if (!hostSyncActive) return;
+    hostWsSend({ type: "seek", position_sec: target });
+  }, SEEK_DEBOUNCE_MS);
+}
+
+function sendHostSeekImmediate(positionSec) {
+  if (hostSyncTimer) {
+    clearTimeout(hostSyncTimer);
+    hostSyncTimer = null;
+  }
+  const target = Number(positionSec);
+  if (!hostSyncActive || !Number.isFinite(target) || target < 0) return;
+  hostWsSend({ type: "seek", position_sec: target });
+}
+
 function bindHostCinemaSync(video) {
   if (!video || video.__wpHostCinemaSyncBound) return;
   video.__wpHostCinemaSyncBound = true;
   video.addEventListener("play", () => {
     if (!hostSyncActive || isApplyingSync || performance.now() < suppressUntil) return;
+    cancelHostPendingBuffering();
+    hostPostResumeGraceUntil = performance.now() + HOST_POST_RESUME_GRACE_MS;
+    hostLocalActionLockUntil = performance.now() + 900;
     hostWsSend({ type: "play", position_sec: Number(video.currentTime || 0) });
+    reportHostBuffering(false);
   });
   video.addEventListener("pause", () => {
+    cancelHostPendingBuffering();
     if (!hostSyncActive || isApplyingSync || performance.now() < suppressUntil) return;
+    hostLocalActionLockUntil = performance.now() + 900;
+    reportHostBuffering(false);
     hostWsSend({ type: "pause", position_sec: Number(video.currentTime || 0) });
   });
-  video.addEventListener("seeked", () => {
+  video.addEventListener("seeking", () => {
     if (!hostSyncActive || isApplyingSync || performance.now() < suppressUntil) return;
-    if (hostSyncTimer) clearTimeout(hostSyncTimer);
-    hostSyncTimer = setTimeout(() => {
-      if (!hostSyncActive) return;
-      hostWsSend({ type: "seek", position_sec: Number(video.currentTime || 0) });
-    }, SEEK_DEBOUNCE_MS);
+    if (isHostProgrammaticSeekEvent(video, { consume: false })) return;
+    cancelHostPendingBuffering();
+    hostUserSeeking = true;
+    const targetPos = Number(video.currentTime || 0);
+    hostPendingSeekTarget = targetPos;
+    hostLocalActionLockUntil = performance.now() + HOST_LOCAL_ACTION_LOCK_MS;
+    sendHostSeekDebounced(targetPos);
+  });
+  video.addEventListener("seeked", () => {
+    if (hostLastBufferingSent) checkHostBufferingReady();
+    const wasProgrammatic = isHostProgrammaticSeekEvent(video, { consume: true });
+    if (!hostSyncActive || isApplyingSync || performance.now() < suppressUntil || wasProgrammatic) return;
+    hostUserSeeking = false;
+    const targetPos = Number(video.currentTime || 0);
+    const shouldSend =
+      hostSyncTimer !== null ||
+      hostPendingSeekTarget === null ||
+      Math.abs(targetPos - hostPendingSeekTarget) > 0.15;
+    hostPendingSeekTarget = targetPos;
+    hostLocalActionLockUntil = performance.now() + 900;
+    if (shouldSend) {
+      sendHostSeekImmediate(targetPos);
+    }
   });
   video.addEventListener("ratechange", () => {
     if (!hostSyncActive || isApplyingSync || performance.now() < suppressUntil) return;
     const rate = Number(video.playbackRate || 1);
     if (!Number.isFinite(rate) || rate <= 0) return;
+    hostLocalActionLockUntil = performance.now() + 700;
     hostWsSend({ type: "rate", rate });
   });
   video.addEventListener("waiting", () => {
     if (!hostSyncActive) return;
-    hostWsSend({ type: "buffering", is_buffering: true });
+    scheduleHostBufferingReport();
   });
   video.addEventListener("stalled", () => {
     if (!hostSyncActive) return;
-    hostWsSend({ type: "buffering", is_buffering: true });
+    // Only treat network stall as buffering if playback is actually starved.
+    if (!video.paused && !video.ended && video.readyState < 3) {
+      scheduleHostBufferingReport();
+    }
   });
   video.addEventListener("playing", () => {
     if (!hostSyncActive) return;
-    hostWsSend({ type: "buffering", is_buffering: false });
+    cancelHostPendingBuffering();
+    reportHostBuffering(false);
+  });
+  video.addEventListener("canplay", () => {
+    if (!hostSyncActive) return;
+    if (video.readyState >= 3) cancelHostPendingBuffering();
+    if (hostLastBufferingSent) checkHostBufferingReady();
+  });
+  video.addEventListener("canplaythrough", () => {
+    if (!hostSyncActive) return;
+    cancelHostPendingBuffering();
+    if (hostLastBufferingSent) reportHostBuffering(false);
+  });
+  video.addEventListener("progress", () => {
+    if (!hostSyncActive) return;
+    if (hostLastBufferingSent) checkHostBufferingReady();
+  });
+  video.addEventListener("timeupdate", () => {
+    if (!hostSyncActive) return;
+    const pos = Number(video.currentTime || 0);
+    if (!video.paused && Number.isFinite(pos) && Math.abs(pos - hostLastTimeUpdatePos) > 0.05) {
+      hostLastTimeUpdatePos = pos;
+      cancelHostPendingBuffering();
+      if (hostLastBufferingSent) reportHostBuffering(false);
+    }
+  });
+  video.addEventListener("ended", () => {
+    clearHostBufferingTimers();
+    reportHostBuffering(false);
   });
 }
 
@@ -195,13 +477,27 @@ function getHostExpectedPosition(roomState, fallbackSec = 0) {
     roomState?.effective_position_sec !== undefined &&
     roomState?.effective_position_sec !== null &&
     Number.isFinite(Number(roomState.effective_position_sec));
-  const raw = hasEffective
+  const base = hasEffective
     ? Number(roomState.effective_position_sec)
     : Number(roomState?.position_sec ?? fallbackSec);
-  return Number.isFinite(raw) ? Math.max(0, raw) : Math.max(0, Number(fallbackSec) || 0);
+  let expected = Number.isFinite(base) ? Math.max(0, base) : Math.max(0, Number(fallbackSec) || 0);
+  if (roomState?.is_playing) {
+    const rate = Number(roomState.playback_rate || 1) || 1;
+    const refTimeMs = hasEffective
+      ? Number(roomState.server_time_ms || 0)
+      : Number(roomState.state_updated_at_ms || roomState.server_time_ms || 0);
+    let elapsed = 0;
+    if (hostClockSamples > 0 && Number.isFinite(refTimeMs) && refTimeMs > 0) {
+      elapsed = Math.max(0, (Date.now() + hostClockOffsetMs - refTimeMs) / 1000);
+    } else if (hasEffective && hostStateReceivedPerfMs > 0) {
+      elapsed = Math.max(0, (performance.now() - hostStateReceivedPerfMs) / 1000);
+    }
+    expected = expected + elapsed * rate;
+  }
+  return Math.max(0, expected);
 }
 
-function applyCinemaPlaybackState(roomState) {
+function applyCinemaPlaybackState(roomState, { reason = "", allowSeek = true } = {}) {
   const video = hostCinemaVideo();
   if (!video || !roomState) return;
   const rate = Number(roomState.playback_rate || 1) || 1;
@@ -212,8 +508,9 @@ function applyCinemaPlaybackState(roomState) {
   const duration = Number(video.duration);
   const target = Number.isFinite(duration) && duration > 0 ? Math.min(expected, duration) : expected;
 
+  const seekThreshold = reason === "seek" ? HOST_SEEK_ALIGN_SEC : HOST_DRIFT_THRESHOLD_SEC;
   const needRate = Math.abs((Number(video.playbackRate) || 1) - rate) > 0.01;
-  const needSeek = Math.abs(currentTime - target) > HOST_DRIFT_THRESHOLD_SEC;
+  const needSeek = allowSeek && Math.abs(currentTime - target) > seekThreshold;
   const needPlay = shouldPlay && !currentlyPlaying;
   const needPause = !shouldPlay && currentlyPlaying;
 
@@ -221,43 +518,58 @@ function applyCinemaPlaybackState(roomState) {
     return;
   }
 
+  cancelHostPendingBuffering();
   isApplyingSync = true;
   suppressUntil = performance.now() + SUPPRESS_MS;
+  if (needSeek || needPlay) {
+    hostPostResumeGraceUntil = performance.now() + HOST_POST_RESUME_GRACE_MS;
+  }
   if (needRate) {
     try { video.playbackRate = rate; } catch (_) {}
   }
   if (needSeek) {
-    try { video.currentTime = target; } catch (_) {}
+    setHostVideoTimeSynced(video, target);
   }
   if (needPlay) {
     const p = video.play?.();
     if (p && typeof p.catch === "function") p.catch(() => {});
   } else if (needPause) {
+    if (!roomState.paused_for_buffering) {
+      reportHostBuffering(false);
+    }
     try { video.pause(); } catch (_) {}
   }
   window.setTimeout(() => { isApplyingSync = false; }, 0);
 }
 
-function applyCinemaSyncState(roomState) {
+function applyCinemaSyncState(roomState, opts = {}) {
   const video = hostCinemaVideo();
   if (!video || !roomState) return;
   const nextActiveId = roomState.active_media_id ? String(roomState.active_media_id) : null;
   if (nextActiveId && nextActiveId !== String(state.cinemaActiveId || "")) {
+    clearHostBufferingTimers();
+    hostLastBufferingSent = false;
+    hostProgrammaticSeekTarget = null;
     hostPlayCinema(nextActiveId, {
       autoplay: Boolean(roomState.is_playing),
       scroll: false,
       fromWatchParty: true,
     })
-      .then(() => applyCinemaPlaybackState(roomState))
+      .then(() => applyCinemaPlaybackState(roomState, opts))
       .catch(() => {});
     return;
   }
-  applyCinemaPlaybackState(roomState);
+  applyCinemaPlaybackState(roomState, opts);
 }
 
 function handleHostPermanentDisconnect(message) {
   clearHostReconnectTimer();
   stopHostTimers();
+  hostLastBufferingSent = false;
+  hostUserSeeking = false;
+  hostPendingSeekTarget = null;
+  hostLocalActionLockUntil = 0;
+  hostProgrammaticSeekTarget = null;
   if (hostSyncActive) {
     hostSyncActive = false;
     setHostSyncToggle(false);
@@ -336,12 +648,24 @@ function handleHostWsMessage(raw) {
   try { msg = JSON.parse(raw); } catch (_) { return; }
   if (!msg || typeof msg.type !== "string") return;
 
+  if (msg.type === "pong") {
+    handleHostPong(msg);
+    return;
+  }
   if (msg.type === "auth_ok") {
     hostReconnectAttempt = 0;
     clearHostReconnectTimer();
+    clearHostBufferingTimers();
+    hostLastBufferingSent = false;
+    hostUserSeeking = false;
+    hostPendingSeekTarget = null;
+    hostLocalActionLockUntil = 0;
+    hostProgrammaticSeekTarget = null;
     hostParticipantId = String(msg.participant_id || hostParticipantId || "");
     if (msg.room_state) {
+      hostStateReceivedPerfMs = performance.now();
       hostState = msg.room_state;
+      hostLastStateSeq = Number(hostState.state_seq ?? hostState.seq ?? -1);
       hostControlMode = String(hostState.control_mode || "host_only");
       hostWaitForBuffering = Boolean(hostState.wait_for_buffering);
       renderHostParticipants(hostState.participants);
@@ -355,8 +679,12 @@ function handleHostWsMessage(raw) {
   if (msg.type === "sync_state") {
     const prevState = hostState;
     const roomState = msg.room_state || null;
-    hostState = roomState;
     if (roomState) {
+      const seq = Number(roomState.state_seq ?? roomState.seq ?? 0);
+      if (seq > 0 && seq < hostLastStateSeq) return;
+      if (seq > 0) hostLastStateSeq = seq;
+      hostStateReceivedPerfMs = performance.now();
+      hostState = roomState;
       hostControlMode = String(roomState.control_mode || "host_only");
       hostWaitForBuffering = Boolean(roomState.wait_for_buffering);
       renderHostParticipants(roomState.participants);
@@ -370,24 +698,55 @@ function handleHostWsMessage(raw) {
         metaStatus.textContent = `${hostRoomCode ? `Room ${hostRoomCode}` : ""} • ${label}`.trim();
       }
       if (hostSyncActive) {
-        if (hostControlMode === "everyone") {
-          applyCinemaSyncState(roomState);
+        const reason = String(msg.reason || "");
+        const actorId = String(msg.actor_participant_id || "");
+        const isSelfActor = Boolean(actorId && hostParticipantId && actorId === String(hostParticipantId));
+        const bufferingPauseChanged =
+          Boolean(roomState.paused_for_buffering) !== Boolean(prevState?.paused_for_buffering);
+        const playStateChanged =
+          Boolean(roomState.is_playing) !== Boolean(prevState?.is_playing);
+        const nextActiveId = roomState.active_media_id ? String(roomState.active_media_id) : null;
+        const trackChanged = Boolean(nextActiveId && nextActiveId !== String(state.cinemaActiveId || ""));
+
+        if (reason === "buffering" && !bufferingPauseChanged && !playStateChanged && !trackChanged) {
+          // Participant buffering indicator update only — never disturb host playback.
+        } else if (isSelfActor && reason !== "buffering" && reason !== "select") {
+          // Echo of this host tab's own play/pause/seek/rate command — never fight local video.
+          if (reason === "seek" && hostPendingSeekTarget !== null) {
+            const echoedPos = Number(roomState.position_sec ?? roomState.effective_position_sec ?? NaN);
+            if (Number.isFinite(echoedPos) && Math.abs(echoedPos - hostPendingSeekTarget) <= 0.5) {
+              hostPendingSeekTarget = null;
+              hostLocalActionLockUntil = Math.min(hostLocalActionLockUntil, performance.now() + 250);
+            }
+          }
+        } else if (bufferingPauseChanged) {
+          // Wait-for-buffering paused or resumed the room: pause without seeking; resume without gratuitous seek.
+          applyCinemaSyncState(roomState, {
+            reason,
+            allowSeek: !roomState.paused_for_buffering,
+          });
+        } else if (hostControlMode === "everyone") {
+          if (!isHostUserSeeking() || reason === "select" || reason === "seek") {
+            applyCinemaSyncState(roomState, { reason });
+          }
         } else {
+          // In host_only mode, only apply genuine remote host changes (e.g. another host tab or queue Play Now).
           const video = hostCinemaVideo();
-          const bufferingPauseChanged =
-            Boolean(roomState.paused_for_buffering) !== Boolean(prevState?.paused_for_buffering);
-          const nextActiveId = roomState.active_media_id ? String(roomState.active_media_id) : null;
-          const trackChanged = Boolean(nextActiveId && nextActiveId !== String(state.cinemaActiveId || ""));
-          const playStateChanged = Boolean(video && Boolean(roomState.is_playing) !== !video.paused);
+          const videoPlayMismatch = Boolean(video && Boolean(roomState.is_playing) !== !video.paused);
           const expectedPos = getHostExpectedPosition(roomState, video?.currentTime ?? 0);
+          const seekThresh = reason === "seek" ? HOST_SEEK_ALIGN_SEC : HOST_DRIFT_THRESHOLD_SEC;
           const posDrifted = Boolean(
-            video && Math.abs((Number(video.currentTime) || 0) - expectedPos) > HOST_DRIFT_THRESHOLD_SEC
+            video &&
+            !isHostUserSeeking() &&
+            Math.abs((Number(video.currentTime) || 0) - expectedPos) > seekThresh
           );
           const rateChanged = Boolean(
-            video && Math.abs((Number(video.playbackRate) || 1) - (Number(roomState.playback_rate || 1) || 1)) > 0.01
+            video &&
+            !isHostUserSeeking() &&
+            Math.abs((Number(video.playbackRate) || 1) - (Number(roomState.playback_rate || 1) || 1)) > 0.01
           );
-          if (bufferingPauseChanged || trackChanged || playStateChanged || posDrifted || rateChanged) {
-            applyCinemaSyncState(roomState);
+          if (trackChanged || (!isHostUserSeeking() && (videoPlayMismatch || posDrifted || rateChanged))) {
+            applyCinemaSyncState(roomState, { reason });
           }
         }
       }

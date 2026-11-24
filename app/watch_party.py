@@ -74,6 +74,7 @@ _REACTION_RATE_COUNT = 10
 _REACTION_RATE_WINDOW_SEC = 5.0
 _WS_SEND_TIMEOUT_SEC = 2.0
 _WS_CLOSE_TIMEOUT_SEC = 2.0
+_MAX_BUFFERING_WAIT_SEC = 15.0
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -348,6 +349,7 @@ class Participant:
     ever_connected: bool = False
     kicked: bool = False
     buffering: bool = False
+    buffering_since_mono: float = 0.0
     websocket: Any = None
     joined_at: float = field(default_factory=time.time)
     last_seen_mono: float = field(default_factory=time.monotonic)
@@ -498,6 +500,8 @@ class WatchPartyService:
         self._pin_attempts: dict[tuple[str, str], deque[float]] = {}
         self._join_attempts: dict[str, deque[float]] = {}
         self._reaper_task: asyncio.Task[None] | None = None
+        self._buffering_timeout_sec: float = _MAX_BUFFERING_WAIT_SEC
+        self._buffering_tasks: dict[str, asyncio.Task[Any]] = {}
 
     # -- settings ---------------------------------------------------------
 
@@ -610,10 +614,12 @@ class WatchPartyService:
         room.closed = True
         room.closed_reason = reason
         self.rooms.pop(room.room_code, None)
+        self._cancel_buffering_timeout_locked(room.room_code)
         for participant in room.participants.values():
             participant.token_digest = b""
             participant.connected = False
             participant.buffering = False
+            participant.buffering_since_mono = 0.0
             participant.websocket = None
 
     def _prune_expired_rooms(self) -> list[str]:
@@ -1154,6 +1160,7 @@ class WatchPartyService:
             room.position_sec = 0.0
             room.is_playing = False
             room.paused_for_buffering = False
+            self._clear_all_buffering_locked(room)
             room.state_updated_mono = now_mono
             room.state_updated_at = now_wall
             room.state_seq += 1
@@ -1284,6 +1291,12 @@ class WatchPartyService:
                 and bool(wait_for_buffering) != room.wait_for_buffering
             ):
                 room.wait_for_buffering = bool(wait_for_buffering)
+                if not room.wait_for_buffering and room.paused_for_buffering:
+                    room.is_playing = True
+                    room.paused_for_buffering = False
+                    room.state_updated_mono = now_mono
+                    room.state_updated_at = now_wall
+                    self._cancel_buffering_timeout_locked(room.room_code)
                 room.state_seq += 1
 
             if new_queue is not None:
@@ -1717,6 +1730,7 @@ class WatchPartyService:
             participant.websocket = None
             participant.connected = False
             participant.buffering = False
+            participant.buffering_since_mono = 0.0
             participant.last_seen_mono = time.monotonic()
             room.last_activity_mono = participant.last_seen_mono
             presence = self._presence_payload(room, "left", participant)
@@ -1728,10 +1742,81 @@ class WatchPartyService:
 
     # -- buffering coordination ------------------------------------------
 
+    def _cancel_buffering_timeout_locked(self, room_code: str) -> None:
+        task = self._buffering_tasks.pop(room_code, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _clear_all_buffering_locked(self, room: WatchPartyRoom) -> None:
+        for participant in room.participants.values():
+            participant.buffering = False
+            participant.buffering_since_mono = 0.0
+        self._cancel_buffering_timeout_locked(room.room_code)
+
+    def _schedule_buffering_timeout_locked(
+        self, room_code: str, delay: float | None = None
+    ) -> None:
+        timeout = self._buffering_timeout_sec if delay is None else max(0.05, float(delay))
+        if timeout <= 0:
+            return
+        existing = self._buffering_tasks.get(room_code)
+        if existing is not None and not existing.done() and delay is None:
+            return
+        self._cancel_buffering_timeout_locked(room_code)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(
+            self._expire_stale_buffering(room_code, timeout),
+            name=f"watch-party-buffer-timeout-{room_code}",
+        )
+        self._buffering_tasks[room_code] = task
+
+    async def _expire_stale_buffering(self, room_code: str, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+
+        current_task = asyncio.current_task()
+        room_to_broadcast: WatchPartyRoom | None = None
+        with self._lock:
+            if self._buffering_tasks.get(room_code) is current_task:
+                self._buffering_tasks.pop(room_code, None)
+            room = self._get_room_locked(room_code)
+            if room is None:
+                return
+            now_mono = time.monotonic()
+            cleared_any = False
+            earliest_remaining: float | None = None
+            for participant in room.connected_participants():
+                if not participant.buffering:
+                    continue
+                elapsed = max(0.0, now_mono - participant.buffering_since_mono)
+                if elapsed >= self._buffering_timeout_sec - 0.05:
+                    participant.buffering = False
+                    participant.buffering_since_mono = 0.0
+                    cleared_any = True
+                else:
+                    rem = self._buffering_timeout_sec - elapsed
+                    if earliest_remaining is None or rem < earliest_remaining:
+                        earliest_remaining = rem
+            resumed = self._maybe_resume_after_buffering_locked(room)
+            if earliest_remaining is not None:
+                self._schedule_buffering_timeout_locked(room_code, delay=earliest_remaining)
+            if cleared_any or resumed:
+                room_to_broadcast = room
+
+        if room_to_broadcast is not None:
+            await self._broadcast_sync_state(room_to_broadcast, reason="buffering")
+
     def _maybe_resume_after_buffering_locked(self, room: WatchPartyRoom) -> bool:
+        connected = room.connected_participants()
+        if not any(participant.buffering for participant in connected):
+            self._cancel_buffering_timeout_locked(room.room_code)
         if not room.paused_for_buffering:
             return False
-        connected = room.connected_participants()
         if not connected:
             return False
         if any(participant.buffering for participant in connected):
@@ -1752,10 +1837,19 @@ class WatchPartyService:
         buffering: bool,
     ) -> bool:
         now_wall, now_mono = self._now()
-        participant.buffering = bool(buffering)
+        desired = bool(buffering)
         participant.last_seen_mono = now_mono
         room.last_activity_mono = now_mono
-        if participant.buffering:
+        if desired:
+            # Never mark peers as buffering when the room is manually paused.
+            if not room.is_playing and not room.paused_for_buffering:
+                participant.buffering = False
+                participant.buffering_since_mono = 0.0
+                return False
+            if not participant.buffering:
+                participant.buffering_since_mono = now_mono
+            participant.buffering = True
+            self._schedule_buffering_timeout_locked(room.room_code)
             if room.wait_for_buffering and room.is_playing:
                 room.position_sec = room.effective_position(now_mono)
                 room.is_playing = False
@@ -1765,6 +1859,8 @@ class WatchPartyService:
                 room.state_seq += 1
                 return True
             return False
+        participant.buffering = False
+        participant.buffering_since_mono = 0.0
         return self._maybe_resume_after_buffering_locked(room)
 
     async def _broadcast_sync_state(
@@ -1773,9 +1869,10 @@ class WatchPartyService:
         *,
         reason: str,
         target: Any | None = None,
+        actor_participant_id: str | None = None,
     ) -> dict[str, Any]:
         state = self._serialize_room_state(room)
-        payload = {
+        payload: dict[str, Any] = {
             "type": "sync_state",
             "reason": reason,
             "room_state": state,
@@ -1783,6 +1880,8 @@ class WatchPartyService:
             "is_playing": state["is_playing"],
             "position_sec": state["effective_position_sec"],
         }
+        if actor_participant_id is not None:
+            payload["actor_participant_id"] = actor_participant_id
         if target is not None:
             await self._ws_send(target, payload)
         else:
@@ -2028,13 +2127,24 @@ class WatchPartyService:
             if current.active_duration_sec is not None and current.active_duration_sec > 0:
                 position = min(float(current.active_duration_sec), position)
             current.position_sec = position
+            was_paused_for_buffering = current.paused_for_buffering
             current.is_playing = True
             current.paused_for_buffering = False
+            if was_paused_for_buffering:
+                self._clear_all_buffering_locked(current)
+            else:
+                actor.buffering = False
+                actor.buffering_since_mono = 0.0
+                if not any(p.buffering for p in current.connected_participants()):
+                    self._cancel_buffering_timeout_locked(current.room_code)
             current.state_updated_mono = now_mono
             current.state_updated_at = now_wall
             current.state_seq += 1
             current.last_activity_mono = now_mono
-        await self._broadcast_sync_state(current, reason="play")
+            actor_id = actor.participant_id
+        await self._broadcast_sync_state(
+            current, reason="play", actor_participant_id=actor_id
+        )
 
     async def _handle_pause(
         self,
@@ -2060,10 +2170,14 @@ class WatchPartyService:
             current.state_updated_mono = now_mono
             current.is_playing = False
             current.paused_for_buffering = False
+            self._clear_all_buffering_locked(current)
             current.state_updated_at = now_wall
             current.state_seq += 1
             current.last_activity_mono = now_mono
-        await self._broadcast_sync_state(current, reason="pause")
+            actor_id = actor.participant_id
+        await self._broadcast_sync_state(
+            current, reason="pause", actor_participant_id=actor_id
+        )
 
     async def _handle_seek(
         self,
@@ -2083,11 +2197,23 @@ class WatchPartyService:
             if current.active_duration_sec is not None and current.active_duration_sec > 0:
                 position = min(float(current.active_duration_sec), position)
             current.position_sec = position
+            if current.paused_for_buffering:
+                current.is_playing = True
+                current.paused_for_buffering = False
+                self._clear_all_buffering_locked(current)
+            else:
+                actor.buffering = False
+                actor.buffering_since_mono = 0.0
+                if not any(p.buffering for p in current.connected_participants()):
+                    self._cancel_buffering_timeout_locked(current.room_code)
             current.state_updated_mono = now_mono
             current.state_updated_at = now_wall
             current.state_seq += 1
             current.last_activity_mono = now_mono
-        await self._broadcast_sync_state(current, reason="seek")
+            actor_id = actor.participant_id
+        await self._broadcast_sync_state(
+            current, reason="seek", actor_participant_id=actor_id
+        )
 
     async def _handle_rate(
         self,
@@ -2110,7 +2236,10 @@ class WatchPartyService:
             current.state_updated_at = now_wall
             current.state_seq += 1
             current.last_activity_mono = now_mono
-        await self._broadcast_sync_state(current, reason="rate")
+            actor_id = actor.participant_id
+        await self._broadcast_sync_state(
+            current, reason="rate", actor_participant_id=actor_id
+        )
 
     async def _handle_select_item(
         self,
@@ -2137,7 +2266,10 @@ class WatchPartyService:
                 now_mono=now_mono,
             )
             current.last_activity_mono = now_mono
-        await self._broadcast_sync_state(current, reason="select")
+            actor_id = actor.participant_id
+        await self._broadcast_sync_state(
+            current, reason="select", actor_participant_id=actor_id
+        )
 
     async def _handle_queue_update(
         self,
@@ -2271,6 +2403,13 @@ class WatchPartyService:
                 )
                 if wait_for_buffering != current.wait_for_buffering:
                     current.wait_for_buffering = wait_for_buffering
+                    if not current.wait_for_buffering and current.paused_for_buffering:
+                        now_wall, now_mono = self._now()
+                        current.is_playing = True
+                        current.paused_for_buffering = False
+                        current.state_updated_mono = now_mono
+                        current.state_updated_at = now_wall
+                        self._cancel_buffering_timeout_locked(current.room_code)
                     current.state_seq += 1
             if "title" in payload:
                 clean_title = _clean_text(payload.get("title"), field_name="Room title", max_length=120)
@@ -2367,11 +2506,14 @@ class WatchPartyService:
             previous = actor.buffering
             changed = self._set_buffering_locked(current, actor, buffering)
             flag_changed = previous != actor.buffering
+            actor_id = actor.participant_id
 
         # Broadcast on any buffering change so other clients see the updated
         # participant list, even when playback itself did not pause/resume.
         if changed or flag_changed:
-            await self._broadcast_sync_state(current, reason="buffering")
+            await self._broadcast_sync_state(
+                current, reason="buffering", actor_participant_id=actor_id
+            )
 
     async def _handle_chat_message(
         self,
@@ -2637,6 +2779,13 @@ class WatchPartyService:
 
         with self._lock:
             room_codes = list(self.rooms.keys())
+            buffering_tasks = list(self._buffering_tasks.values())
+            self._buffering_tasks.clear()
+        for buf_task in buffering_tasks:
+            if not buf_task.done():
+                buf_task.cancel()
+        if buffering_tasks:
+            await asyncio.gather(*buffering_tasks, return_exceptions=True)
         if room_codes:
             await asyncio.gather(
                 *(

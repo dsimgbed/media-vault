@@ -1512,3 +1512,222 @@ def test_watch_party_v0131_client_clock_host_sync_qr_and_strict_stream_headers(t
         assert "http://" not in qr_without_svg_ns and "https://" not in qr_without_svg_ns
 
 
+def test_buffering_recovery_manual_overrides_actor_ids_and_stale_timeout(tmp_path: Path):
+    settings, app = _make_client(tmp_path)
+    db = app.state.db
+    _insert_media(
+        db,
+        tmp_path,
+        media_id="m1",
+        filename="movie.mp4",
+        payload=b"VIDEO" * 32,
+        mime_type="video/mp4",
+        duration_sec=300.0,
+    )
+    _insert_media(
+        db,
+        tmp_path,
+        media_id="m2",
+        filename="sequel.mp4",
+        payload=b"VIDEO2" * 32,
+        mime_type="video/mp4",
+        duration_sec=200.0,
+    )
+
+    with TestClient(app) as client:
+        room = _create_room(
+            client,
+            media_ids=["m1", "m2"],
+            wait_for_buffering=True,
+            initial_is_playing=False,
+        )
+        code = room["room_code"]
+        with client.websocket_connect(f"/api/watch-party/{code}/ws?wp_token={room['host_token']}") as host:
+            host_hello = _recv(host, "auth_ok")
+            host_pid = host_hello["participant_id"]
+            guest = _join(client, code, name="Slow Peer").json()
+            guest_pid = guest["participant_id"]
+            with client.websocket_connect(f"/api/watch-party/{code}/ws") as guest_ws:
+                guest_ws.send_json({"type": "auth", "token": guest["guest_token"]})
+                assert _recv(guest_ws, "auth_ok")["type"] == "auth_ok"
+                assert _recv(host, "presence")["event"] == "join"
+
+                # 1. Buffering reports while manually paused are ignored and never stick.
+                guest_ws.send_json({"type": "buffering", "is_buffering": True})
+                guest_ws.send_json({"type": "ping", "client_time_ms": 1})
+                assert _recv(guest_ws, "pong")["type"] == "pong"
+                paused_view = _room_view(client, code)["room_state"]
+                assert paused_view["is_playing"] is False
+                assert paused_view["paused_for_buffering"] is False
+                assert all(not p["is_buffering"] for p in paused_view["participants"])
+
+                # 2. Control sync_state broadcasts carry actor_participant_id.
+                host.send_json({"type": "play", "position_sec": 12.0})
+                h_play = _recv(host, "sync_state")
+                g_play = _recv(guest_ws, "sync_state")
+                assert h_play["actor_participant_id"] == host_pid
+                assert g_play["actor_participant_id"] == host_pid
+                assert h_play["room_state"]["is_playing"] is True
+
+                host.send_json({"type": "seek", "position_sec": 25.0})
+                h_seek = _recv(host, "sync_state")
+                g_seek = _recv(guest_ws, "sync_state")
+                assert h_seek["actor_participant_id"] == host_pid
+                assert g_seek["actor_participant_id"] == host_pid
+                assert h_seek["room_state"]["position_sec"] == pytest.approx(25.0, abs=0.05)
+
+                host.send_json({"type": "rate", "rate": 1.25})
+                assert _recv(host, "sync_state")["actor_participant_id"] == host_pid
+                assert _recv(guest_ws, "sync_state")["actor_participant_id"] == host_pid
+
+                # 3. Guest buffers -> room pauses for buffering; explicit host play clears stuck state.
+                guest_ws.send_json({"type": "buffering", "is_buffering": True})
+                h_buf = _recv(host, "sync_state")
+                g_buf = _recv(guest_ws, "sync_state")
+                assert h_buf["actor_participant_id"] == guest_pid
+                assert g_buf["room_state"]["paused_for_buffering"] is True
+                assert g_buf["room_state"]["is_playing"] is False
+
+                host.send_json({"type": "play", "position_sec": 26.0})
+                h_override = _recv(host, "sync_state")
+                g_override = _recv(guest_ws, "sync_state")
+                assert h_override["room_state"]["is_playing"] is True
+                assert h_override["room_state"]["paused_for_buffering"] is False
+                assert all(not p["is_buffering"] for p in g_override["room_state"]["participants"])
+
+                # 4. Explicit seek during paused_for_buffering clears stuck buffering and resumes.
+                guest_ws.send_json({"type": "buffering", "is_buffering": True})
+                assert _recv(host, "sync_state")["room_state"]["paused_for_buffering"] is True
+                assert _recv(guest_ws, "sync_state")["room_state"]["paused_for_buffering"] is True
+
+                host.send_json({"type": "seek", "position_sec": 60.0})
+                h_seek2 = _recv(host, "sync_state")
+                g_seek2 = _recv(guest_ws, "sync_state")
+                assert h_seek2["room_state"]["is_playing"] is True
+                assert h_seek2["room_state"]["paused_for_buffering"] is False
+                assert h_seek2["room_state"]["position_sec"] == pytest.approx(60.0, abs=0.05)
+                assert all(not p["is_buffering"] for p in g_seek2["room_state"]["participants"])
+
+                # 5. Manual pause clears all buffering flags cleanly.
+                guest_ws.send_json({"type": "buffering", "is_buffering": True})
+                assert _recv(host, "sync_state")["room_state"]["paused_for_buffering"] is True
+                assert _recv(guest_ws, "sync_state")["room_state"]["paused_for_buffering"] is True
+
+                host.send_json({"type": "pause", "position_sec": 61.0})
+                h_pause = _recv(host, "sync_state")
+                g_pause = _recv(guest_ws, "sync_state")
+                assert h_pause["actor_participant_id"] == host_pid
+                assert h_pause["room_state"]["is_playing"] is False
+                assert h_pause["room_state"]["paused_for_buffering"] is False
+                assert all(not p["is_buffering"] for p in g_pause["room_state"]["participants"])
+
+                # 6. Disabling wait_for_buffering via WS resumes a room paused for buffering.
+                host.send_json({"type": "play", "position_sec": 61.0})
+                _recv(host, "sync_state")
+                _recv(guest_ws, "sync_state")
+                guest_ws.send_json({"type": "buffering", "is_buffering": True})
+                assert _recv(host, "sync_state")["room_state"]["paused_for_buffering"] is True
+                assert _recv(guest_ws, "sync_state")["room_state"]["paused_for_buffering"] is True
+
+                host.send_json({"type": "update_settings", "wait_for_buffering": False})
+                h_off = _recv(host, "sync_state")
+                g_off = _recv(guest_ws, "sync_state")
+                assert h_off["room_state"]["wait_for_buffering"] is False
+                assert h_off["room_state"]["paused_for_buffering"] is False
+                assert g_off["room_state"]["is_playing"] is True
+
+                # 7. Disabling wait_for_buffering via HTTP PATCH also resumes a buffering-paused room.
+                host.send_json({"type": "update_settings", "wait_for_buffering": True})
+                _recv(host, "sync_state")
+                _recv(guest_ws, "sync_state")
+                guest_ws.send_json({"type": "buffering", "is_buffering": False})
+                _recv(host, "sync_state")
+                _recv(guest_ws, "sync_state")
+                guest_ws.send_json({"type": "buffering", "is_buffering": True})
+                assert _recv(host, "sync_state")["room_state"]["paused_for_buffering"] is True
+                assert _recv(guest_ws, "sync_state")["room_state"]["paused_for_buffering"] is True
+
+                patched = client.patch(
+                    f"/api/watch-party/rooms/{code}",
+                    json={"wait_for_buffering": False},
+                )
+                assert patched.status_code == 200
+                h_patch = _recv(host, "sync_state")
+                g_patch = _recv(guest_ws, "sync_state")
+                assert h_patch["room_state"]["is_playing"] is True
+                assert g_patch["room_state"]["paused_for_buffering"] is False
+
+                # 8. Server-side stale buffering timeout auto-recovers even if client never clears.
+                wp = app.state.watch_party
+                wp._buffering_timeout_sec = 0.15
+                host.send_json({"type": "update_settings", "wait_for_buffering": True})
+                _recv(host, "sync_state")
+                _recv(guest_ws, "sync_state")
+                guest_ws.send_json({"type": "buffering", "is_buffering": False})
+                _recv(host, "sync_state")
+                _recv(guest_ws, "sync_state")
+
+                guest_ws.send_json({"type": "buffering", "is_buffering": True})
+                assert _recv(host, "sync_state")["room_state"]["paused_for_buffering"] is True
+                assert _recv(guest_ws, "sync_state")["room_state"]["paused_for_buffering"] is True
+
+                # Without any further message from guest, timeout clears buffering and resumes.
+                h_auto = _recv(host, "sync_state")
+                g_auto = _recv(guest_ws, "sync_state")
+                assert h_auto["reason"] == "buffering"
+                assert h_auto["room_state"]["is_playing"] is True
+                assert h_auto["room_state"]["paused_for_buffering"] is False
+                assert all(not p["is_buffering"] for p in g_auto["room_state"]["participants"])
+
+                # 9. Selecting another media item clears buffering and includes actor_participant_id.
+                host.send_json({"type": "select_item", "media_id": "m2"})
+                h_sel = _recv(host, "sync_state")
+                g_sel = _recv(guest_ws, "sync_state")
+                assert h_sel["actor_participant_id"] == host_pid
+                assert g_sel["room_state"]["active_media_id"] == "m2"
+
+
+def test_watch_party_client_buffering_and_seek_regressions(tmp_path: Path):
+    wp_js = (STATIC_DIR / "js" / "watch-party.js").read_text(encoding="utf-8")
+    host_js = (STATIC_DIR / "js" / "features" / "watch-party-host.js").read_text(encoding="utf-8")
+
+    # Standalone client: debounced buffering, paused-state recovery, seek protection, echo skip.
+    for token in (
+        "BUFFERING_REPORT_DELAY_MS",
+        "BUFFERING_RESUME_AHEAD_SEC",
+        "POST_RESUME_GRACE_MS",
+        "checkBufferingReady",
+        'addEventListener("canplaythrough"',
+        'addEventListener("seeking"',
+        'addEventListener("seeked"',
+        "isUserSeeking()",
+        "setVideoTimeSynced",
+        "isProgrammaticSeekEvent",
+        "actor_participant_id",
+        'reason === "buffering" && !playbackChanged',
+    ):
+        assert token in wp_js, token
+    # Ensure canplay is NOT gated on `!video.paused` (which caused the wait-for-buffering deadlock).
+    assert 'addEventListener("canplay", () => {\n    if (!video.paused)' not in wp_js
+
+    # Host Cinema bridge: clock offset, debounced buffering, paused-state recovery, seek protection, echo skip.
+    for token in (
+        "HOST_BUFFERING_REPORT_DELAY_MS",
+        "HOST_BUFFERING_RESUME_AHEAD_SEC",
+        "HOST_POST_RESUME_GRACE_MS",
+        "handleHostPong",
+        "hostClockOffsetMs",
+        "checkHostBufferingReady",
+        'addEventListener("canplaythrough"',
+        'addEventListener("seeking"',
+        'addEventListener("seeked"',
+        "isHostUserSeeking()",
+        "setHostVideoTimeSynced",
+        "isHostProgrammaticSeekEvent",
+        "actor_participant_id",
+        'reason === "buffering" && !bufferingPauseChanged',
+    ):
+        assert token in host_js, token
+
+
+
